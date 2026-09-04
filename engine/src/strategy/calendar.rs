@@ -66,6 +66,70 @@ pub fn calendar_for(region: EquityRegion) -> EquitySessionCalendar {
     }
 }
 impl EquitySessionCalendar {
+    /// Returns the active or next conservative exit boundary in exchange-local
+    /// time. Unsupported calendar dates deliberately fail closed.
+    pub fn exit_deadline_at(&self, timestamp_ms: u64) -> Option<u64> {
+        let (day, local_minute) = local_day_and_minute(timestamp_ms)?;
+        let (date_key, weekday) = date_and_weekday(day)?;
+        if !self.is_trading_date(date_key, weekday) {
+            return self.next_exit_deadline_after(day);
+        }
+
+        let morning_boundary = self.morning_auction_start();
+        let morning_close = self.windows.first()?.close_minute;
+        let afternoon_boundary = self
+            .has_afternoon_session(date_key)
+            .then(|| self.windows.get(1).map(|window| window.open_minute))
+            .flatten();
+
+        if local_minute < morning_boundary {
+            return timestamp_at_local_minute(day, morning_boundary);
+        }
+        if local_minute < morning_close {
+            return timestamp_at_local_minute(day, morning_boundary);
+        }
+        if let Some(afternoon_boundary) = afternoon_boundary {
+            if local_minute < afternoon_boundary {
+                return timestamp_at_local_minute(day, afternoon_boundary);
+            }
+            if local_minute < self.effective_final_close_minute(date_key) {
+                return timestamp_at_local_minute(day, afternoon_boundary);
+            }
+        }
+        self.next_exit_deadline_after(day)
+    }
+
+    fn morning_auction_start(&self) -> u16 {
+        match self.region {
+            EquityRegion::AShare => 555,
+            EquityRegion::HongKong => 540,
+        }
+    }
+
+    fn has_afternoon_session(&self, date_key: u32) -> bool {
+        self.windows
+            .get(1)
+            .is_some_and(|window| self.effective_final_close_minute(date_key) > window.open_minute)
+    }
+
+    fn is_trading_date(&self, date_key: u32, weekday: u8) -> bool {
+        Self::calendar_snapshot_supported(date_key) && weekday <= 5 && !self.is_holiday(date_key)
+    }
+
+    fn next_exit_deadline_after(&self, day: i64) -> Option<u64> {
+        for offset in 1..=366 {
+            let candidate_day = day.checked_add(offset)?;
+            let (date_key, weekday) = date_and_weekday(candidate_day)?;
+            if !Self::calendar_snapshot_supported(date_key) {
+                return None;
+            }
+            if self.is_trading_date(date_key, weekday) {
+                return timestamp_at_local_minute(candidate_day, self.morning_auction_start());
+            }
+        }
+        None
+    }
+
     /// Converts a UTC timestamp to the exchange-local Gregorian date key YYYYMMDD.
     pub fn date_key_from_timestamp(timestamp_ms: u64) -> u32 {
         let days = ((timestamp_ms / 1_000) + 8 * 3_600) / 86_400;
@@ -289,6 +353,22 @@ fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
 mod tests {
     use super::*;
 
+    fn timestamp_for_local(year: i32, month: u32, day: u32, minute: u16) -> u64 {
+        let days = days_from_civil(year, month, day);
+        ((days * 86_400 + i64::from(minute) * 60 - 8 * 3_600) * 1_000) as u64
+    }
+
+    fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+        let year = i64::from(year) - i64::from(month <= 2);
+        let era = if year >= 0 { year } else { year - 399 } / 400;
+        let yoe = year - era * 400;
+        let month = i64::from(month);
+        let day = i64::from(day);
+        let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe - 719_468
+    }
+
     #[test]
     fn a_share_calendar_has_distinct_morning_and_afternoon_windows() {
         assert_eq!(
@@ -382,4 +462,75 @@ mod tests {
     fn date_key_uses_china_local_time() {
         assert_eq!(EquitySessionCalendar::date_key_from_timestamp(0), 19700101);
     }
+
+    #[test]
+    fn exit_deadline_keeps_active_morning_boundary_and_uses_afternoon_reopen() {
+        let morning = timestamp_for_local(2026, 1, 5, 600);
+        assert_eq!(
+            A_SHARE_CALENDAR.exit_deadline_at(morning),
+            Some(timestamp_for_local(2026, 1, 5, 555))
+        );
+
+        let lunch = timestamp_for_local(2026, 1, 5, 700);
+        assert_eq!(
+            A_SHARE_CALENDAR.exit_deadline_at(lunch),
+            Some(timestamp_for_local(2026, 1, 5, 780))
+        );
+    }
+
+    #[test]
+    fn exit_deadline_advances_across_weekends_holidays_and_half_days() {
+        let friday_night = timestamp_for_local(2026, 1, 9, 1_000);
+        assert_eq!(
+            A_SHARE_CALENDAR.exit_deadline_at(friday_night),
+            Some(timestamp_for_local(2026, 1, 12, 555))
+        );
+
+        let holiday = timestamp_for_local(2026, 1, 1, 700);
+        assert_eq!(
+            A_SHARE_CALENDAR.exit_deadline_at(holiday),
+            Some(timestamp_for_local(2026, 1, 2, 555))
+        );
+
+        let hong_kong_half_day_after_close = timestamp_for_local(2026, 2, 16, 730);
+        assert_eq!(
+            HONG_KONG_CALENDAR.exit_deadline_at(hong_kong_half_day_after_close),
+            Some(timestamp_for_local(2026, 2, 20, 540))
+        );
+    }
+
+    #[test]
+    fn exit_deadline_does_not_invent_unsupported_sessions() {
+        assert_eq!(
+            A_SHARE_CALENDAR.exit_deadline_at(timestamp_for_local(2027, 1, 4, 600)),
+            None
+        );
+    }
+}
+
+fn local_day_and_minute(timestamp_ms: u64) -> Option<(i64, u16)> {
+    let local_seconds = (timestamp_ms / 1_000).checked_add(8 * 3_600)?;
+    let days = local_seconds / 86_400;
+    let day = i64::try_from(days).ok()?;
+    let minute = u16::try_from((local_seconds % 86_400) / 60).ok()?;
+    Some((day, minute))
+}
+
+fn date_and_weekday(days_since_epoch: i64) -> Option<(u32, u8)> {
+    let (year, month, day) = civil_from_days(days_since_epoch);
+    let year = u32::try_from(year).ok()?;
+    let date_key = year
+        .checked_mul(10_000)?
+        .checked_add(month.checked_mul(100)?)?
+        .checked_add(day)?;
+    let weekday = u8::try_from((days_since_epoch + 3).rem_euclid(7) + 1).ok()?;
+    Some((date_key, weekday))
+}
+
+fn timestamp_at_local_minute(days_since_epoch: i64, local_minute: u16) -> Option<u64> {
+    let local_seconds = days_since_epoch
+        .checked_mul(86_400)?
+        .checked_add(i64::from(local_minute).checked_mul(60)?)?;
+    let utc_seconds = local_seconds.checked_sub(8 * 3_600)?;
+    u64::try_from(utc_seconds.checked_mul(1_000)?).ok()
 }
