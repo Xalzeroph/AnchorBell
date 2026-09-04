@@ -34,10 +34,11 @@ use crate::{
     runtime::io::{spawn_line_writer, write_json_atomic, AsyncLineWriter},
     strategy::{
         calendar::{calendar_for, EquitySessionCalendar},
-        profile_for, side_adverse_selection_bps,
+        decide_maker_exit, profile_for, side_adverse_selection_bps,
         universe::instrument_for,
-        AdaptiveThreshold, AnchorCurrency, AnchorMakerStrategy, DataQualityStatus, SignalInput,
-        VenueSessionState,
+        AdaptiveThreshold, AnchorCurrency, AnchorMakerStrategy, DataQualityStatus, DualFlattenPlan,
+        ExitBook, ExitConstraints, ExitWorkingOrder, FundingRateKind, FundingSchedule,
+        FundingScheduleStatus, MakerExitDecision, MakerExitInput, SignalInput, VenueSessionState,
     },
 };
 
@@ -542,6 +543,8 @@ struct BookState {
     bid_quantity: i64,
     ask_price_ticks: i64,
     ask_quantity: i64,
+    /// The book clock is deliberately not inferred from mark updates.
+    observed_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -552,6 +555,14 @@ struct WorkingOrder {
     remaining_quantity: i64,
     reduce_only: bool,
     placed_at_ms: u64,
+    cancel_requested_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ExitConstraintSource {
+    /// Baseline paper assumptions, never presented as downloaded filters.
+    Simulated,
+    Explicit(ExitConstraints),
 }
 
 #[derive(Debug, Clone)]
@@ -580,6 +591,8 @@ struct PaperSymbolState {
     fills: u64,
     winning_fills: u64,
     losing_fills: u64,
+    exit_cutoff: bool,
+    exit_session_plan: Option<DualFlattenPlan>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -764,6 +777,7 @@ pub struct PaperModelAssumptions {
     pub market_to_decision_ms: u64,
     pub decision_to_exchange_ms: u64,
     pub cancel_to_exchange_ms: u64,
+    pub exit_constraints: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -801,6 +815,7 @@ pub struct PaperEngine {
     threshold_scale_ppm: i64,
     position_allocations: BTreeMap<String, PositionAllocation>,
     capital_usdt_ticks: Option<i64>,
+    exit_constraints: BTreeMap<String, ExitConstraintSource>,
     states: BTreeMap<String, PaperSymbolState>,
     next_client_id: u64,
     event_count: u64,
@@ -866,6 +881,8 @@ impl PaperEngine {
                         fills: 0,
                         winning_fills: 0,
                         losing_fills: 0,
+                        exit_cutoff: false,
+                        exit_session_plan: None,
                     },
                 )
             })
@@ -884,6 +901,10 @@ impl PaperEngine {
                 )
             })
             .collect();
+        let exit_constraints = states
+            .keys()
+            .map(|symbol| (symbol.clone(), ExitConstraintSource::Simulated))
+            .collect();
         Ok(Self {
             strategy: AnchorMakerStrategy::new(entry_threshold_bps, 0),
             strategy_variant: PaperStrategyVariant::M4Statistical,
@@ -899,6 +920,7 @@ impl PaperEngine {
             threshold_scale_ppm: 1_000_000,
             position_allocations,
             capital_usdt_ticks: None,
+            exit_constraints,
             states,
             next_client_id: 1,
             event_count: 0,
@@ -964,6 +986,34 @@ impl PaperEngine {
         Ok(self)
     }
 
+    /// Supply actual exchange or fixture filters. Unlike the baseline paper
+    /// assumptions, this timestamp is retained and may expire in the exit core.
+    pub fn set_exit_constraints(
+        &mut self,
+        symbol: &str,
+        constraints: ExitConstraints,
+    ) -> Result<(), PaperError> {
+        let symbol = normalize_symbol(symbol)
+            .filter(|symbol| self.states.contains_key(symbol))
+            .ok_or(PaperError::InvalidConfig(
+                "exit constraints require a configured symbol",
+            ))?;
+        if constraints.min_price <= 0
+            || constraints.max_price < constraints.min_price
+            || constraints.price_tick <= 0
+            || constraints.min_quantity <= 0
+            || constraints.max_quantity < constraints.min_quantity
+            || constraints.quantity_step <= 0
+            || constraints.min_notional <= 0
+            || 10_i128.checked_pow(constraints.quantity_scale).is_none()
+        {
+            return Err(PaperError::InvalidConfig("invalid exit constraints"));
+        }
+        self.exit_constraints
+            .insert(symbol, ExitConstraintSource::Explicit(constraints));
+        Ok(())
+    }
+
     pub fn on_event(&mut self, event: BinanceMarketEvent) -> Vec<PaperRecord> {
         self.on_event_ref(&event)
     }
@@ -973,12 +1023,15 @@ impl PaperEngine {
     /// symbol strings or payload fields.
     pub fn on_event_ref(&mut self, event: &BinanceMarketEvent) -> Vec<PaperRecord> {
         self.event_count = self.event_count.saturating_add(1);
-        self.last_event_at_ms = event_time_ms(event);
-        match event {
+        let timestamp_ms = event_time_ms(event);
+        self.last_event_at_ms = timestamp_ms;
+        let mut records = self.complete_pending_cancels(timestamp_ms);
+        records.extend(match event {
             BinanceMarketEvent::BookTicker(ticker) => self.on_book_ticker(ticker),
             BinanceMarketEvent::MarkPrice(mark) => self.on_mark_price(mark),
             BinanceMarketEvent::AggTrade(trade) => self.on_agg_trade(trade),
-        }
+        });
+        records
     }
 
     pub fn refresh_anchors(&mut self, anchors: BTreeMap<String, PaperAnchor>, timestamp_ms: u64) {
@@ -996,6 +1049,12 @@ impl PaperEngine {
                     || (candidate_day == current_day && !current_anchor_after_close))
                 && anchor_refresh_allowed(&symbol, timestamp_ms)
             {
+                // A completed exit session is reopened only by an explicit new
+                // trading-day anchor while flat and without a tracked order.
+                if candidate_day > current_day && state.position == 0 && state.working.is_none() {
+                    state.exit_cutoff = false;
+                    state.exit_session_plan = None;
+                }
                 state.anchor = anchor;
             }
         }
@@ -1005,8 +1064,19 @@ impl PaperEngine {
         let symbols = self.states.keys().cloned().collect::<Vec<_>>();
         symbols
             .into_iter()
-            .flat_map(|symbol| self.cancel_symbol(&symbol, timestamp_ms, detail))
+            .flat_map(|symbol| self.teardown_symbol(&symbol, timestamp_ms, detail))
             .collect()
+    }
+
+    /// Clock-driven exit processing used by replay ticks. It only records
+    /// decisions/cancel acknowledgements; fills remain aggregate-trade facts.
+    pub fn evaluate_exits_at(&mut self, timestamp_ms: u64) -> Result<Vec<PaperRecord>, PaperError> {
+        let mut records = self.complete_pending_cancels(timestamp_ms);
+        let symbols = self.states.keys().cloned().collect::<Vec<_>>();
+        for symbol in symbols {
+            records.extend(self.evaluate_exit_symbol(&symbol, timestamp_ms));
+        }
+        Ok(records)
     }
 
     pub fn summary(&self) -> PaperSummary {
@@ -1251,6 +1321,7 @@ impl PaperEngine {
                 market_to_decision_ms: self.realism.latency.market_to_decision_ms,
                 decision_to_exchange_ms: self.realism.latency.decision_to_exchange_ms,
                 cancel_to_exchange_ms: self.realism.latency.cancel_to_exchange_ms,
+                exit_constraints: "simulation: price_step=1, quantity_step=1, minimum_quantity=1, minimum_notional=1 quote tick; explicit constraints retain their source timestamp".to_owned(),
             },
         }
     }
@@ -1305,6 +1376,7 @@ impl PaperEngine {
                 bid_quantity: ticker.bid_quantity.0,
                 ask_price_ticks: ticker.ask_price.0,
                 ask_quantity: ticker.ask_quantity.0,
+                observed_at_ms: ticker.event_time_ms,
             });
             let mid = (i128::from(ticker.bid_price.0) + i128::from(ticker.ask_price.0)) / 2;
             if mid > 0 && ticker.ask_price.0 >= ticker.bid_price.0 {
@@ -1484,7 +1556,222 @@ impl PaperEngine {
         )]
     }
 
+    fn exit_constraints_for(
+        &self,
+        symbol: &str,
+        max_position: i64,
+        now_ms: u64,
+    ) -> Option<ExitConstraints> {
+        match self.exit_constraints.get(symbol).copied()? {
+            ExitConstraintSource::Simulated => Some(ExitConstraints {
+                min_price: 1,
+                // This is deliberately finite; paper does not claim fetched filters.
+                max_price: i64::MAX,
+                price_tick: 1,
+                min_quantity: 1,
+                max_quantity: max_position,
+                quantity_step: 1,
+                min_notional: 1,
+                quantity_scale: self.quantity_scale,
+                observed_at_ms: now_ms,
+                max_age_ms: 0,
+            }),
+            ExitConstraintSource::Explicit(value) => Some(value),
+        }
+    }
+
+    fn exit_plan_for(
+        state: &PaperSymbolState,
+        symbol: &str,
+        now_ms: u64,
+        live_risk_gates: bool,
+    ) -> DualFlattenPlan {
+        let equity_open_at_ms = profile_for(symbol)
+            .and_then(|profile| calendar_for(profile.region).exit_deadline_at(now_ms));
+        let funding = if state.next_funding_time_ms > 0 {
+            // A received schedule remains meaningful at its deadline even when
+            // replay has already passed it, so do not turn it into "unknown".
+            FundingSchedule {
+                next_funding_at_ms: Some(state.next_funding_time_ms),
+                funding_interval_hours: None,
+                estimated_rate_ppm: state.latest_funding_rate_e8,
+                rate_kind: FundingRateKind::Regular,
+                status: FundingScheduleStatus::Scheduled,
+                observed_at_ms: state.last_mark_time_ms,
+            }
+        } else if !live_risk_gates && now_ms < 10_000_000_000 {
+            // A missing epoch fixture is explicitly simulated as no-funding;
+            // positive supplied deadlines are always honored above.
+            FundingSchedule::no_event(None, None, FundingRateKind::Regular, now_ms)
+                .expect("no-event funding schedule is structurally valid")
+        } else {
+            FundingSchedule::new(None, None, None, FundingRateKind::Unknown, now_ms)
+                .expect("unknown funding schedule is structurally valid")
+        };
+        DualFlattenPlan::new(
+            now_ms,
+            equity_open_at_ms,
+            funding,
+            30 * 60 * 1_000,
+            FUNDING_FLATTEN_LEAD_MS,
+        )
+        .expect("fixed nonzero flatten windows")
+    }
+
+    /// Returns `Some` when the shared core owns this tick; `None` leaves the
+    /// legacy entry alpha path untouched while trading is still admissible.
+    fn evaluate_exit_symbol(&mut self, symbol: &str, timestamp_ms: u64) -> Vec<PaperRecord> {
+        let allocation = self.position_allocations.get(symbol);
+        let max_position = allocation
+            .map(|allocation| allocation.max_position)
+            .unwrap_or(self.max_position);
+        let constraints = self.exit_constraints_for(symbol, max_position, timestamp_ms);
+        let (input, cutoff) = {
+            let state = self.states.get_mut(symbol).expect("symbol state exists");
+            let current_plan =
+                Self::exit_plan_for(state, symbol, timestamp_ms, self.live_risk_gates);
+            if current_plan.phase_at(timestamp_ms, true) != crate::strategy::FlattenPhase::Trading {
+                state.exit_cutoff = true;
+                state.exit_session_plan = Some(current_plan);
+            }
+            let plan = state.exit_session_plan.unwrap_or(current_plan);
+            let working = match state.working {
+                None => ExitWorkingOrder::None,
+                Some(order) if order.cancel_requested_at_ms.is_some() => ExitWorkingOrder::Pending,
+                Some(order) => ExitWorkingOrder::Confirmed {
+                    side: order.side,
+                    price: order.price_ticks,
+                    remaining: order.remaining_quantity,
+                    reduce_only: order.reduce_only,
+                },
+            };
+            let book = state.book.map(|book| ExitBook {
+                bid: book.bid_price_ticks,
+                ask: book.ask_price_ticks,
+                observed_at_ms: book.observed_at_ms,
+            });
+            (
+                MakerExitInput {
+                    symbol: state.symbol_id,
+                    position: state.position,
+                    position_confirmed: true,
+                    now_ms: timestamp_ms,
+                    max_book_age_ms: 5_000,
+                    plan,
+                    book,
+                    constraints,
+                    working,
+                },
+                state.exit_cutoff,
+            )
+        };
+        let pending_residual = input.position != 0
+            && matches!(input.working, ExitWorkingOrder::Pending)
+            && input.plan.phase_at(timestamp_ms, true)
+                == crate::strategy::FlattenPhase::ResidualExposure;
+        let decision = decide_maker_exit(input);
+        match decision {
+            MakerExitDecision::Trading if !cutoff => Vec::new(),
+            MakerExitDecision::Trading
+            | MakerExitDecision::Flat
+            | MakerExitDecision::KeepWorking => Vec::new(),
+            MakerExitDecision::WaitForReconciliation if pending_residual => {
+                let state = &self.states[symbol];
+                vec![self.record(
+                    symbol,
+                    state,
+                    timestamp_ms,
+                    RecordFields {
+                        kind: "residual_exposure",
+                        client_id: None,
+                        side: None,
+                        price_ticks: None,
+                        quantity: Some(state.position.checked_abs().unwrap_or(i64::MAX)),
+                        detail: Some("hard deadline reached while cancellation is pending"),
+                    },
+                )]
+            }
+            MakerExitDecision::WaitForReconciliation => Vec::new(),
+            MakerExitDecision::Submit(intent) => {
+                self.place_symbol(symbol, intent, timestamp_ms, true)
+            }
+            MakerExitDecision::CancelWorking => {
+                self.cancel_symbol(symbol, timestamp_ms, "shared maker exit cancellation")
+            }
+            MakerExitDecision::ResidualExposure => {
+                let risk_increasing = self.states[symbol]
+                    .working
+                    .is_some_and(|order| !order.reduce_only);
+                let mut records = if risk_increasing {
+                    self.cancel_symbol(
+                        symbol,
+                        timestamp_ms,
+                        "hard deadline cancels risk-increasing order",
+                    )
+                } else {
+                    Vec::new()
+                };
+                let state = &self.states[symbol];
+                records.push(self.record(
+                    symbol,
+                    state,
+                    timestamp_ms,
+                    RecordFields {
+                        kind: "residual_exposure",
+                        client_id: None,
+                        side: None,
+                        price_ticks: None,
+                        quantity: Some(state.position.checked_abs().unwrap_or(i64::MAX)),
+                        detail: Some("hard deadline reached; no replacement order submitted"),
+                    },
+                ));
+                records
+            }
+            MakerExitDecision::Blocked(reason) => {
+                let mut records = if self.states[symbol].working.is_some() {
+                    self.cancel_symbol(symbol, timestamp_ms, "shared maker exit blocked")
+                } else {
+                    Vec::new()
+                };
+                let state = &self.states[symbol];
+                records.push(self.record(
+                    symbol,
+                    state,
+                    timestamp_ms,
+                    RecordFields {
+                        kind: "exit_blocked",
+                        client_id: None,
+                        side: None,
+                        price_ticks: None,
+                        quantity: Some(state.position.checked_abs().unwrap_or(i64::MAX)),
+                        detail: Some(match reason {
+                            crate::strategy::ExitBlockReason::InvalidInput => "invalid exit input",
+                            crate::strategy::ExitBlockReason::InvalidBook => "invalid exit book",
+                            crate::strategy::ExitBlockReason::StaleBook => "stale exit book",
+                            crate::strategy::ExitBlockReason::MissingConstraints => {
+                                "missing exit constraints"
+                            }
+                            crate::strategy::ExitBlockReason::InvalidConstraints => {
+                                "invalid exit constraints"
+                            }
+                            crate::strategy::ExitBlockReason::StaleConstraints => {
+                                "stale exit constraints"
+                            }
+                            crate::strategy::ExitBlockReason::Dust => "exit residual is dust",
+                        }),
+                    },
+                ));
+                records
+            }
+        }
+    }
+
     fn rebalance_symbol(&mut self, symbol: &str, timestamp_ms: u64) -> Vec<PaperRecord> {
+        let exit_records = self.evaluate_exit_symbol(symbol, timestamp_ms);
+        let exit_active = self.states[symbol].exit_cutoff || !exit_records.is_empty();
+        if exit_active {
+            return exit_records;
+        }
         let allocation = self.position_allocations.get(symbol);
         let max_position = allocation
             .map(|allocation| allocation.max_position)
@@ -1626,13 +1913,11 @@ impl PaperEngine {
         if same_order {
             return Vec::new();
         }
-        let mut records = if has_working {
-            self.cancel_symbol(symbol, timestamp_ms, "quote replacement")
-        } else {
-            Vec::new()
-        };
-        records.extend(self.place_symbol(symbol, desired, timestamp_ms, reduce_only));
-        records
+        if has_working {
+            // A replacement waits for the modeled cancel acknowledgement.
+            return self.cancel_symbol(symbol, timestamp_ms, "quote replacement");
+        }
+        self.place_symbol(symbol, desired, timestamp_ms, reduce_only)
     }
 
     fn place_symbol(
@@ -1672,6 +1957,7 @@ impl PaperEngine {
             remaining_quantity: intent.quantity,
             reduce_only,
             placed_at_ms: timestamp_ms,
+            cancel_requested_at_ms: None,
         });
         self.order_count = self.order_count.saturating_add(1);
         let state = self.states.get(symbol).expect("symbol state exists");
@@ -1695,12 +1981,27 @@ impl PaperEngine {
     }
 
     fn cancel_symbol(&mut self, symbol: &str, timestamp_ms: u64, detail: &str) -> Vec<PaperRecord> {
-        let canceled = self
-            .states
-            .get_mut(symbol)
-            .and_then(|state| state.working.take());
-        let Some(order) = canceled else {
-            return Vec::new();
+        let cancel_delay_ms = self.realism.latency.cancel_to_exchange_ms;
+        let order = {
+            let Some(state) = self.states.get_mut(symbol) else {
+                return Vec::new();
+            };
+            let Some(order) = state.working else {
+                return Vec::new();
+            };
+            if order.cancel_requested_at_ms.is_some() {
+                return Vec::new();
+            }
+            if cancel_delay_ms == 0 {
+                state.working.take().expect("working order was checked")
+            } else {
+                state
+                    .working
+                    .as_mut()
+                    .expect("working order was checked")
+                    .cancel_requested_at_ms = Some(timestamp_ms);
+                order
+            }
         };
         let state = self.states.get(symbol).expect("symbol state exists");
         vec![self.record(
@@ -1708,7 +2009,81 @@ impl PaperEngine {
             state,
             timestamp_ms,
             RecordFields {
-                kind: "order_canceled",
+                kind: if cancel_delay_ms == 0 {
+                    "order_canceled"
+                } else {
+                    "cancel_requested"
+                },
+                client_id: Some(order.client_id),
+                side: Some(order.side),
+                price_ticks: Some(order.price_ticks),
+                quantity: Some(order.remaining_quantity),
+                detail: Some(detail),
+            },
+        )]
+    }
+
+    fn complete_pending_cancels(&mut self, timestamp_ms: u64) -> Vec<PaperRecord> {
+        let cancel_delay_ms = self.realism.latency.cancel_to_exchange_ms;
+        if cancel_delay_ms == 0 {
+            return Vec::new();
+        }
+        let symbols = self.states.keys().cloned().collect::<Vec<_>>();
+        let mut completed = Vec::new();
+        for symbol in symbols {
+            let Some(order) = self.states.get(&symbol).and_then(|state| state.working) else {
+                continue;
+            };
+            let Some(requested_at_ms) = order.cancel_requested_at_ms else {
+                continue;
+            };
+            let acknowledged_at_ms = requested_at_ms.saturating_add(cancel_delay_ms);
+            if timestamp_ms < acknowledged_at_ms {
+                continue;
+            }
+            let order = self
+                .states
+                .get_mut(&symbol)
+                .and_then(|state| state.working.take())
+                .expect("pending cancellation retained its working order");
+            let state = &self.states[&symbol];
+            completed.push(self.record(
+                &symbol,
+                state,
+                acknowledged_at_ms,
+                RecordFields {
+                    kind: "order_canceled",
+                    client_id: Some(order.client_id),
+                    side: Some(order.side),
+                    price_ticks: Some(order.price_ticks),
+                    quantity: Some(order.remaining_quantity),
+                    detail: Some("modeled cancel acknowledgement"),
+                },
+            ));
+        }
+        completed
+    }
+
+    fn teardown_symbol(
+        &mut self,
+        symbol: &str,
+        timestamp_ms: u64,
+        detail: &str,
+    ) -> Vec<PaperRecord> {
+        let order = self
+            .states
+            .get_mut(symbol)
+            .and_then(|state| state.working.take());
+        let Some(order) = order else {
+            return Vec::new();
+        };
+        let state = &self.states[symbol];
+        vec![self.record(
+            symbol,
+            state,
+            timestamp_ms,
+            RecordFields {
+                kind: "order_teardown",
                 client_id: Some(order.client_id),
                 side: Some(order.side),
                 price_ticks: Some(order.price_ticks),
@@ -2897,6 +3272,259 @@ mod tests {
     }
 
     #[test]
+    fn funding_reduction_places_passive_exit_without_a_fill_until_a_compatible_trade() {
+        let mut engine = engine().with_live_risk_gates();
+        feed(
+            &mut engine,
+            br#"{"e":"markPriceUpdate","E":1,"s":"CXMTUSDT","p":"100","i":"100","T":600000,"r":"0"}"#,
+        );
+        feed(
+            &mut engine,
+            br#"{"e":"bookTicker","u":1,"E":2,"T":2,"s":"CXMTUSDT","b":"98","B":"10","a":"99","A":"10"}"#,
+        );
+        feed(
+            &mut engine,
+            br#"{"e":"aggTrade","E":3,"s":"CXMTUSDT","a":1,"p":"98","q":"3","T":3,"m":true}"#,
+        );
+        assert_eq!(engine.summary().current_absolute_position, 3);
+
+        feed(
+            &mut engine,
+            br#"{"e":"bookTicker","u":2,"E":299999,"T":299999,"s":"CXMTUSDT","b":"9880","B":"10","a":"9890","A":"10"}"#,
+        );
+        let before = engine.summary().fill_count;
+        let records = engine.evaluate_exits_at(300_000).unwrap();
+        assert!(
+            records.iter().any(|record| record.kind == "order_placed"
+                && record.side.as_deref() == Some("SELL")
+                && record.price_ticks == Some(9890)),
+            "records: {records:?}"
+        );
+        assert_eq!(engine.summary().fill_count, before);
+
+        let not_aggressive = feed(
+            &mut engine,
+            br#"{"e":"aggTrade","E":300002,"s":"CXMTUSDT","a":2,"p":"9890","q":"3","T":300002,"m":true}"#,
+        );
+        assert!(not_aggressive.is_empty());
+        let filled = feed(
+            &mut engine,
+            br#"{"e":"aggTrade","E":300003,"s":"CXMTUSDT","a":3,"p":"9890","q":"3","T":300003,"m":false}"#,
+        );
+        assert_eq!(filled[0].kind, "fill");
+        assert_eq!(engine.summary().current_absolute_position, 0);
+    }
+
+    #[test]
+    fn event_driven_reduction_quotes_long_exit_at_ask() {
+        let mut engine = engine().with_live_risk_gates();
+        feed(
+            &mut engine,
+            br#"{"e":"markPriceUpdate","E":1,"s":"CXMTUSDT","p":"100","i":"100","T":600000,"r":"0"}"#,
+        );
+        feed(
+            &mut engine,
+            br#"{"e":"bookTicker","u":1,"E":2,"T":2,"s":"CXMTUSDT","b":"98","B":"10","a":"99","A":"10"}"#,
+        );
+        feed(
+            &mut engine,
+            br#"{"e":"aggTrade","E":3,"s":"CXMTUSDT","a":1,"p":"98","q":"10","T":3,"m":true}"#,
+        );
+        assert_eq!(engine.summary().current_absolute_position, 10);
+        let records = feed(
+            &mut engine,
+            br#"{"e":"bookTicker","u":2,"E":300000,"T":300000,"s":"CXMTUSDT","b":"9880","B":"10","a":"9890","A":"10"}"#,
+        );
+        assert!(
+            records.iter().any(|record| record.kind == "order_placed"
+                && record.side.as_deref() == Some("SELL")
+                && record.price_ticks == Some(9_890)),
+            "records: {records:?}"
+        );
+        assert_eq!(engine.summary().fill_count, 1);
+    }
+
+    fn set_exit_fixture(engine: &mut PaperEngine, position: i64, book_time_ms: u64) {
+        let state = engine.states.get_mut("CXMTUSDT").unwrap();
+        state.position = position;
+        state.next_funding_time_ms = 600_000;
+        state.last_mark_time_ms = 1;
+        state.book = Some(BookState {
+            bid_price_ticks: 9_880,
+            bid_quantity: 20,
+            ask_price_ticks: 9_890,
+            ask_quantity: 20,
+            observed_at_ms: book_time_ms,
+        });
+    }
+
+    #[test]
+    fn exit_core_uses_bid_for_short_and_rejects_stale_book_without_fills() {
+        let mut short_engine = engine().with_live_risk_gates();
+        set_exit_fixture(&mut short_engine, -3, 300_000);
+        let short = short_engine.evaluate_exits_at(300_000).unwrap();
+        assert!(short.iter().any(|record| record.kind == "order_placed"
+            && record.side.as_deref() == Some("BUY")
+            && record.price_ticks == Some(9_880)));
+        assert_eq!(short_engine.summary().fill_count, 0);
+
+        let mut stale = engine().with_live_risk_gates();
+        set_exit_fixture(&mut stale, 3, 294_999);
+        stale.states.get_mut("CXMTUSDT").unwrap().last_mark_time_ms = 300_000;
+        let records = stale.evaluate_exits_at(300_000).unwrap();
+        assert!(records.iter().any(|record| record.kind == "exit_blocked"));
+        assert!(!records.iter().any(|record| record.kind == "order_placed"));
+        assert_eq!(stale.summary().fill_count, 0);
+    }
+
+    #[test]
+    fn explicit_exit_constraints_keep_their_timestamp_and_expire() {
+        let mut engine = engine().with_live_risk_gates();
+        set_exit_fixture(&mut engine, 3, 300_000);
+        engine
+            .set_exit_constraints(
+                "CXMTUSDT",
+                ExitConstraints {
+                    min_price: 1,
+                    max_price: 20_000,
+                    price_tick: 1,
+                    min_quantity: 1,
+                    max_quantity: 100,
+                    quantity_step: 1,
+                    min_notional: 1,
+                    quantity_scale: 0,
+                    observed_at_ms: 1,
+                    max_age_ms: 10,
+                },
+            )
+            .unwrap();
+        let records = engine.evaluate_exits_at(300_000).unwrap();
+        assert!(records.iter().any(|record| record.kind == "exit_blocked"));
+        assert!(!records.iter().any(|record| record.kind == "order_placed"));
+        assert_eq!(engine.summary().fill_count, 0);
+    }
+
+    #[test]
+    fn exit_core_handles_i64_min_and_keeps_safe_partial_reduce_order() {
+        let mut invalid = engine().with_live_risk_gates();
+        set_exit_fixture(&mut invalid, i64::MIN, 300_000);
+        let records = invalid.evaluate_exits_at(300_000).unwrap();
+        assert!(records.iter().any(|record| record.kind == "exit_blocked"));
+        assert_eq!(invalid.summary().fill_count, 0);
+
+        let mut retained = engine().with_live_risk_gates();
+        set_exit_fixture(&mut retained, 3, 300_000);
+        retained.states.get_mut("CXMTUSDT").unwrap().working = Some(WorkingOrder {
+            client_id: 9,
+            side: Side::Sell,
+            price_ticks: 9_890,
+            remaining_quantity: 2,
+            reduce_only: true,
+            placed_at_ms: 299_999,
+            cancel_requested_at_ms: None,
+        });
+        assert!(retained.evaluate_exits_at(300_000).unwrap().is_empty());
+        assert_eq!(
+            retained.states["CXMTUSDT"]
+                .working
+                .unwrap()
+                .remaining_quantity,
+            2
+        );
+    }
+
+    #[test]
+    fn hard_deadline_reports_residual_and_never_replaces_risk_increasing_order() {
+        let mut engine = engine().with_live_risk_gates();
+        set_exit_fixture(&mut engine, 3, 600_000);
+        engine.states.get_mut("CXMTUSDT").unwrap().working = Some(WorkingOrder {
+            client_id: 10,
+            side: Side::Buy,
+            price_ticks: 9_880,
+            remaining_quantity: 3,
+            reduce_only: false,
+            placed_at_ms: 1,
+            cancel_requested_at_ms: None,
+        });
+        let records = engine.evaluate_exits_at(600_000).unwrap();
+        assert!(records.iter().any(|record| record.kind == "order_canceled"));
+        assert!(records
+            .iter()
+            .any(|record| record.kind == "residual_exposure"));
+        assert!(!records.iter().any(|record| record.kind == "order_placed"));
+        assert_eq!(engine.summary().current_absolute_position, 3);
+        assert_eq!(engine.summary().fill_count, 0);
+    }
+
+    #[test]
+    fn hard_deadline_reports_residual_while_cancel_reconciliation_is_pending() {
+        let mut engine = engine().with_live_risk_gates().with_realism(
+            crate::backtest::realism::RealisticFillModel {
+                queue: crate::backtest::realism::QueueModel::default(),
+                latency: crate::backtest::realism::LatencyModel {
+                    market_to_decision_ms: 0,
+                    decision_to_exchange_ms: 0,
+                    cancel_to_exchange_ms: 1,
+                },
+            },
+        );
+        set_exit_fixture(&mut engine, 3, 600_000);
+        engine.states.get_mut("CXMTUSDT").unwrap().working = Some(WorkingOrder {
+            client_id: 12,
+            side: Side::Buy,
+            price_ticks: 9_880,
+            remaining_quantity: 3,
+            reduce_only: false,
+            placed_at_ms: 1,
+            cancel_requested_at_ms: Some(600_000),
+        });
+        let records = engine.evaluate_exits_at(600_000).unwrap();
+        assert!(records
+            .iter()
+            .any(|record| record.kind == "residual_exposure"));
+        assert!(!records.iter().any(|record| record.kind == "order_placed"));
+        assert_eq!(engine.summary().current_absolute_position, 3);
+        assert_eq!(engine.summary().fill_count, 0);
+    }
+
+    #[test]
+    fn cancel_latency_keeps_compatible_fills_possible_until_acknowledged() {
+        let mut engine = engine().with_live_risk_gates().with_realism(
+            crate::backtest::realism::RealisticFillModel {
+                queue: crate::backtest::realism::QueueModel::default(),
+                latency: crate::backtest::realism::LatencyModel {
+                    market_to_decision_ms: 0,
+                    decision_to_exchange_ms: 0,
+                    cancel_to_exchange_ms: 10,
+                },
+            },
+        );
+        set_exit_fixture(&mut engine, 3, 300_000);
+        engine.states.get_mut("CXMTUSDT").unwrap().working = Some(WorkingOrder {
+            client_id: 11,
+            side: Side::Buy,
+            price_ticks: 9_880,
+            remaining_quantity: 2,
+            reduce_only: false,
+            placed_at_ms: 1,
+            cancel_requested_at_ms: None,
+        });
+        let requested = engine.evaluate_exits_at(300_000).unwrap();
+        assert!(requested
+            .iter()
+            .any(|record| record.kind == "cancel_requested"));
+        let fill = feed(
+            &mut engine,
+            br#"{"e":"aggTrade","E":300005,"s":"CXMTUSDT","a":99,"p":"9880","q":"1","T":300005,"m":true}"#,
+        );
+        assert!(fill.iter().any(|record| record.kind == "fill"));
+        let acknowledged = engine.evaluate_exits_at(300_010).unwrap();
+        assert!(acknowledged
+            .iter()
+            .any(|record| record.kind == "order_canceled"));
+    }
+
+    #[test]
     fn funding_deadline_cancels_new_risk_before_settlement() {
         let mut engine = engine().with_live_risk_gates();
         feed(
@@ -2973,7 +3601,7 @@ mod tests {
         let path = std::env::temp_dir().join("anchorbell-paper-replay-eof.jsonl");
         std::fs::write(
             &path,
-            "{\"e\":\"markPriceUpdate\",\"E\":1,\"s\":\"CXMTUSDT\",\"p\":\"100\",\"i\":\"100\",\"T\":1000,\"r\":\"0\"}\n{\"e\":\"bookTicker\",\"u\":1,\"E\":2,\"T\":2,\"s\":\"CXMTUSDT\",\"b\":\"98\",\"B\":\"10\",\"a\":\"99\",\"A\":\"10\"}\n",
+            "{\"e\":\"markPriceUpdate\",\"E\":1,\"s\":\"CXMTUSDT\",\"p\":\"100\",\"i\":\"100\",\"T\":600000,\"r\":\"0\"}\n{\"e\":\"bookTicker\",\"u\":1,\"E\":2,\"T\":2,\"s\":\"CXMTUSDT\",\"b\":\"98\",\"B\":\"10\",\"a\":\"99\",\"A\":\"10\"}\n",
         )
         .unwrap();
         let result = replay_jsonl(&path, None, anchors(), 0, 0, 100, 100, 10, 20, 0, 0).unwrap();

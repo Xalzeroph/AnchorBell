@@ -90,6 +90,14 @@ pub fn decide_maker_exit(input: MakerExitInput) -> MakerExitDecision {
         None => return MakerExitDecision::Blocked(ExitBlockReason::InvalidInput),
     };
 
+    if phase == FlattenPhase::Trading {
+        return if input.plan.funding.status == FundingScheduleStatus::Unknown {
+            MakerExitDecision::Blocked(ExitBlockReason::InvalidInput)
+        } else {
+            MakerExitDecision::Trading
+        };
+    }
+
     if position_quantity == 0 {
         return match input.working {
             ExitWorkingOrder::None => MakerExitDecision::Flat,
@@ -100,14 +108,6 @@ pub fn decide_maker_exit(input: MakerExitInput) -> MakerExitDecision {
 
     if phase == FlattenPhase::ResidualExposure {
         return MakerExitDecision::ResidualExposure;
-    }
-
-    if phase == FlattenPhase::Trading {
-        return if input.plan.funding.status == FundingScheduleStatus::Unknown {
-            MakerExitDecision::Blocked(ExitBlockReason::InvalidInput)
-        } else {
-            MakerExitDecision::Trading
-        };
     }
 
     let quote = match desired_quote(&input) {
@@ -500,6 +500,49 @@ mod tests {
             999,
             None,
             FundingSchedule::new(None, None, None, FundingRateKind::Unknown, 999).unwrap(),
+            1_800_000,
+            9_000,
+        )
+        .unwrap();
+        assert_eq!(
+            decide_maker_exit(value),
+            MakerExitDecision::Blocked(ExitBlockReason::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn pre_window_entries_follow_known_or_unknown_funding_before_flat_reconciliation() {
+        let mut value = input();
+        value.position = 0;
+        value.plan = DualFlattenPlan::new(
+            1_000,
+            None,
+            FundingSchedule::new(
+                Some(20_000),
+                Some(8),
+                Some(100),
+                FundingRateKind::Regular,
+                1_000,
+            )
+            .unwrap(),
+            1_800_000,
+            9_000,
+        )
+        .unwrap();
+        assert_eq!(decide_maker_exit(value), MakerExitDecision::Trading);
+
+        value.working = ExitWorkingOrder::Confirmed {
+            side: Side::Buy,
+            price: 9_880,
+            remaining: 1,
+            reduce_only: false,
+        };
+        assert_eq!(decide_maker_exit(value), MakerExitDecision::Trading);
+
+        value.plan = DualFlattenPlan::new(
+            1_000,
+            None,
+            FundingSchedule::new(None, None, None, FundingRateKind::Unknown, 1_000).unwrap(),
             1_800_000,
             9_000,
         )
