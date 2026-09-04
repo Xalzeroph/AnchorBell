@@ -71,6 +71,9 @@ impl EquitySessionCalendar {
     pub fn exit_deadline_at(&self, timestamp_ms: u64) -> Option<u64> {
         let (day, local_minute) = local_day_and_minute(timestamp_ms)?;
         let (date_key, weekday) = date_and_weekday(day)?;
+        if !Self::calendar_snapshot_supported(date_key) {
+            return None;
+        }
         if !self.is_trading_date(date_key, weekday) {
             return self.next_exit_deadline_after(day);
         }
@@ -92,7 +95,7 @@ impl EquitySessionCalendar {
             if local_minute < afternoon_boundary {
                 return timestamp_at_local_minute(day, afternoon_boundary);
             }
-            if local_minute < self.effective_final_close_minute(date_key) {
+            if local_minute < self.active_final_close_minute(date_key) {
                 return timestamp_at_local_minute(day, afternoon_boundary);
             }
         }
@@ -110,6 +113,13 @@ impl EquitySessionCalendar {
         self.windows
             .get(1)
             .is_some_and(|window| self.effective_final_close_minute(date_key) > window.open_minute)
+    }
+
+    fn active_final_close_minute(&self, date_key: u32) -> u16 {
+        match self.region {
+            EquityRegion::HongKong if self.effective_final_close_minute(date_key) == 960 => 970,
+            _ => self.effective_final_close_minute(date_key),
+        }
     }
 
     fn is_trading_date(&self, date_key: u32, weekday: u8) -> bool {
@@ -504,6 +514,19 @@ mod tests {
         assert_eq!(
             A_SHARE_CALENDAR.exit_deadline_at(timestamp_for_local(2027, 1, 4, 600)),
             None
+        );
+        assert_eq!(
+            A_SHARE_CALENDAR.exit_deadline_at(timestamp_for_local(2025, 12, 31, 700)),
+            None
+        );
+    }
+
+    #[test]
+    fn exit_deadline_keeps_hong_kong_closing_auction_on_afternoon_boundary() {
+        let closing_auction = timestamp_for_local(2026, 1, 5, 965);
+        assert_eq!(
+            HONG_KONG_CALENDAR.exit_deadline_at(closing_auction),
+            Some(timestamp_for_local(2026, 1, 5, 780))
         );
     }
 }
