@@ -27,7 +27,7 @@ P4 的“真实 Binance Testnet 证据”不能由本地单元测试伪造。202
 ## Non-negotiable invariants
 
 1. 任何开仓都必须经过 maker-only policy、risk gate 和有效 anchor 校验。
-2. session 结束前必须撤单并平仓。
+2. session 风险截止前必须停止开仓并尝试被动减仓；未成交残余必须明确报告。
 3. stale market data、invalid anchor、未知订单状态和恢复失败都不能增加风险。
 4. 交易热路径不得同步写 SQLite、JSONL 或其他磁盘介质。
 5. 凭证只能来自受控运行时输入，不能进入代码、日志、issue、commit 或回放数据。

@@ -1,6 +1,6 @@
 # Maker 退出安全设计（安全核心第一批）
 
-状态：用户已确认方案，正在按实现计划开发与离线验证。
+状态：已在 `codex/safety-core` 完成实现与离线验证；尚未连接交易账户、部署或执行真实订单。
 
 基线：`dadc1ec6ba4627efbd5a47e8354ef5a0f10c8dfa`。
 目标分支：`codex/safety-core`。

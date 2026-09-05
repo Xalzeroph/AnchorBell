@@ -113,7 +113,8 @@ fill quality, or permission to place orders.
 - Default environment: testnet.
 - Production requires an explicit configuration change.
 - Post-only is mandatory for entry orders.
-- The session risk gate must flatten before the underlying market reopens.
+- The session risk gate targets passive reduction before the earliest equity-open
+  or funding deadline and reports any unfilled residual exposure.
 - Stale market data, invalid anchors, position caps, or lifecycle rejects halt
   new entries.
 - Backtest results must record assumptions; they are not live performance claims.
