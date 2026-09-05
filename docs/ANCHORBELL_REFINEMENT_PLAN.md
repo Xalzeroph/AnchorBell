@@ -6,7 +6,7 @@
 
 ## 0. 文档状态
 
-- 当前轮次：Round 13
+- 当前轮次：Round 16（M9 设计冻结；尚未实现/验证）
 - 日期：2026-09-05
 - 当前实验基线：M6 第一版完整矩阵模拟盘（已退出）
 - 最近输出目录：target\\simulation-batch-20260904-M6-10000cny
@@ -25,6 +25,9 @@
 - Round 11 状态：实盘等价性、多时间尺度控制、机制可识别模拟校准、黑天鹅生存与安全域内多目标收益优化完成第十一轮联合打磨
 - Round 12 状态：固定外部锚均值回归核心假设的可证伪实验、Price Discovery 对照、Orderbook-EWMA 机制识别与经济可交易性判定协议完成；尚未修改 engine 代码，尚未启动新实验
 - Round 13 状态：P0 正确性落地。阈值诊断拆分为 `warming_up`、`insufficient_data`、`invalid_input`、`model_failure`、`ready`；预热采用保守先验并显式记录；运行时新增 maker-only reduce-only flatten 与最终结算状态；重复 R1-R7 不进入默认矩阵；GNU 工作区测试通过。
+- Round 14 状态：可审计研究方法纯函数、类型化锚点/规则、episode 竞争风险、cluster bootstrap、X0–X6 状态机与 GNU 工具链落地。
+- Round 15 状态：Price Discovery、self-excluded LOB、post-fill edge、因果对照、survival 和总判定计算器接入运行产物。
+- Round 16 状态：M9 完整数学与工程规格冻结；代码、校准、消融和实盘验证尚未开始，不授予交易权限。
 
 ## 1. 不可变原则
 
@@ -4133,3 +4136,24 @@ Round 12 的最终原则是：官方收盘锚可以固定，研究假设不能�
 - 每个 simulation-batch run 生成 validation-methods-summary.json，与共享行情、evidence summary、各策略 ledger 分离。
 
 因此“方法”已经全部实现；真实数据不足时的 Unavailable/Indeterminate 是方法的正确结果，不是未实现，也不代表核心假设成立。
+
+## 153. Round 16 设计冻结：M9 期限约束因果残差—联合成交收益—分布鲁棒 MPC
+
+完整规格见 [M9_DEADLINE_CAUSAL_RESIDUAL_DRO_MPC.md](M9_DEADLINE_CAUSAL_RESIDUAL_DRO_MPC.md)。本轮只冻结设计，不声称已经实现、回测或具备实盘权限。
+
+M9 是 M8 的严格子策略，不通过降低阈值制造交易。它新增四个可独立消融的层：统一 FairValueVersion 的因果残差、fill/markout/exit 联合结果分布、建仓时同步求解的期限退出计划、覆盖模型/队列/延迟/跳跃不确定性的分布鲁棒安全优化。
+
+不可变核心继续由事件顺序、行情真相、AnchorContract/PriceMode、交易所规则、订单状态机、会计守恒和运行 digest 构成；M9 只能读取 M9DecisionContext 并输出 M9Decision、OrderIntent 和 ExitPlan。公平价值、状态后验、联合结果、风险半径和候选动作属于可变研究层，必须版本化且不得反写核心。
+
+优化采用字典序：先验证数据/单位/规则和会计，再验证所有规定压力场景下的安全退出，再要求扣费净收益下置信界为正，最后才在可行集中最大化最坏情形期望对数增长。NO_ACTION 永远是合法默认动作；求解超时、模型不可识别或证书失败时不得下单。
+
+每个 entry 必须携带最迟退出、库存轨迹、撤改单规则、资金费/开盘边界和期限残余仓位上限。shutdown 必须先停止新增风险，同时保留行情与执行通道直至撤单、退出和对账完成；不得先关闭事件源再发注定无法成交的 maker 平仓单。
+
+正常 M9 继续严格 maker-only。若未来需要灾难主动减仓，必须作为独立、预注册、人工批准的 EmergencyExecutionPolicy 实现，不能藏在 M9 或历史模拟中。
+当前证据不能作为 M9 收益先验：r7 仅 4 次成交，flat_at_end=false，queue_ahead=0、延迟为零且 build identity unknown。旧结果 capital_usdt_ticks=140,000,000,000 显示 1400.00000000 USDT；若 net_pnl_ticks 使用同一 1e8 金额刻度，5,704,463 ticks 约为 **0.05704463 USDT**，而非 5.70 USDT。会计单位合同复核前不得据此计算收益率。
+
+M9 的晋级门固定为 X0 构建可复现、X1 市场/规则/单位/会计真相、X2 完整闭环、X3 联合分布校准、X4 对 M8 的扣费净增益下界为正、X5 尾部与退出压力合格、X6 多日多状态并通过多重选择修正。任一前置门失败，先修真实性，不优化收益。
+
+统计单位是独立交易日/闭市会话与 closure episode，不是事件条数。消融矩阵 M9-A0 至 M9-A9 分别验证统一参考、有限期残差、Null-RW/Jump 对手、联合成交收益、队列持久、期限退出、DRO 定尺、组合相关暴露和在线降级；M9-Full 最后验证交互效果。
+
+本轮明确拒绝固定收益承诺。200% 只能是情景分析刻度，不能作为标签、调参目标或晋级门。M9 的完成定义是：可重放、可解释、可对账、有风险证书、有外样本增益证据、失效时可安全降级。
