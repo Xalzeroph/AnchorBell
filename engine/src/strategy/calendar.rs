@@ -359,6 +359,33 @@ fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
     (year as i32, month as u32, day as u32)
 }
 
+fn local_day_and_minute(timestamp_ms: u64) -> Option<(i64, u16)> {
+    let local_seconds = (timestamp_ms / 1_000).checked_add(8 * 3_600)?;
+    let days = local_seconds / 86_400;
+    let day = i64::try_from(days).ok()?;
+    let minute = u16::try_from((local_seconds % 86_400) / 60).ok()?;
+    Some((day, minute))
+}
+
+fn date_and_weekday(days_since_epoch: i64) -> Option<(u32, u8)> {
+    let (year, month, day) = civil_from_days(days_since_epoch);
+    let year = u32::try_from(year).ok()?;
+    let date_key = year
+        .checked_mul(10_000)?
+        .checked_add(month.checked_mul(100)?)?
+        .checked_add(day)?;
+    let weekday = u8::try_from((days_since_epoch + 3).rem_euclid(7) + 1).ok()?;
+    Some((date_key, weekday))
+}
+
+fn timestamp_at_local_minute(days_since_epoch: i64, local_minute: u16) -> Option<u64> {
+    let local_seconds = days_since_epoch
+        .checked_mul(86_400)?
+        .checked_add(i64::from(local_minute).checked_mul(60)?)?;
+    let utc_seconds = local_seconds.checked_sub(8 * 3_600)?;
+    u64::try_from(utc_seconds.checked_mul(1_000)?).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,31 +556,4 @@ mod tests {
             Some(timestamp_for_local(2026, 1, 5, 780))
         );
     }
-}
-
-fn local_day_and_minute(timestamp_ms: u64) -> Option<(i64, u16)> {
-    let local_seconds = (timestamp_ms / 1_000).checked_add(8 * 3_600)?;
-    let days = local_seconds / 86_400;
-    let day = i64::try_from(days).ok()?;
-    let minute = u16::try_from((local_seconds % 86_400) / 60).ok()?;
-    Some((day, minute))
-}
-
-fn date_and_weekday(days_since_epoch: i64) -> Option<(u32, u8)> {
-    let (year, month, day) = civil_from_days(days_since_epoch);
-    let year = u32::try_from(year).ok()?;
-    let date_key = year
-        .checked_mul(10_000)?
-        .checked_add(month.checked_mul(100)?)?
-        .checked_add(day)?;
-    let weekday = u8::try_from((days_since_epoch + 3).rem_euclid(7) + 1).ok()?;
-    Some((date_key, weekday))
-}
-
-fn timestamp_at_local_minute(days_since_epoch: i64, local_minute: u16) -> Option<u64> {
-    let local_seconds = days_since_epoch
-        .checked_mul(86_400)?
-        .checked_add(i64::from(local_minute).checked_mul(60)?)?;
-    let utc_seconds = local_seconds.checked_sub(8 * 3_600)?;
-    u64::try_from(utc_seconds.checked_mul(1_000)?).ok()
 }

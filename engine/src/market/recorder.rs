@@ -56,43 +56,6 @@ impl From<io::Error> for RecorderError {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn writes_one_json_record_per_line() {
-        let mut output = Vec::new();
-        let mut recorder = JsonlRecorder::new(&mut output);
-        recorder
-            .append(RecordedMarketMessage {
-                received_at_ms: 10,
-                payload: "{}".to_string(),
-            })
-            .unwrap();
-        recorder.finish().unwrap();
-        assert!(String::from_utf8(output).unwrap().ends_with("\n"));
-    }
-
-    #[test]
-    fn rejects_out_of_order_receipts() {
-        let mut recorder = JsonlRecorder::new(Vec::new());
-        recorder
-            .append(RecordedMarketMessage {
-                received_at_ms: 10,
-                payload: "{}".to_string(),
-            })
-            .unwrap();
-        assert!(matches!(
-            recorder.append(RecordedMarketMessage {
-                received_at_ms: 9,
-                payload: "{}".to_string(),
-            }),
-            Err(RecorderError::OutOfOrder { .. })
-        ));
-    }
-}
-
 /// Serializes parsed Binance events for both live recording and replay.
 ///
 /// The event timestamp remains the exchange timestamp; the optional receipt
@@ -142,4 +105,41 @@ pub fn market_event_to_json(
         value["_anchorbell_received_at_ms"] = serde_json::json!(received_at_ms);
     }
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn writes_one_json_record_per_line() {
+        let mut output = Vec::new();
+        let mut recorder = JsonlRecorder::new(&mut output);
+        recorder
+            .append(RecordedMarketMessage {
+                received_at_ms: 10,
+                payload: "{}".to_string(),
+            })
+            .unwrap();
+        recorder.finish().unwrap();
+        assert!(String::from_utf8(output).unwrap().ends_with("\n"));
+    }
+
+    #[test]
+    fn rejects_out_of_order_receipts() {
+        let mut recorder = JsonlRecorder::new(Vec::new());
+        recorder
+            .append(RecordedMarketMessage {
+                received_at_ms: 10,
+                payload: "{}".to_string(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recorder.append(RecordedMarketMessage {
+                received_at_ms: 9,
+                payload: "{}".to_string(),
+            }),
+            Err(RecorderError::OutOfOrder { .. })
+        ));
+    }
 }

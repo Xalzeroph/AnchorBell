@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -338,7 +338,7 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn find_binary(repo: &PathBuf, name: &str) -> Result<PathBuf, String> {
+fn find_binary(repo: &Path, name: &str) -> Result<PathBuf, String> {
     for profile in [
         "target-review\\debug",
         "target-next\\debug",
@@ -353,7 +353,7 @@ fn find_binary(repo: &PathBuf, name: &str) -> Result<PathBuf, String> {
     Err(format!("未找到 {name}.exe，请先完成项目编译"))
 }
 
-fn resolve_repo_path(repo: &PathBuf, value: Option<String>, default: &str) -> PathBuf {
+fn resolve_repo_path(repo: &Path, value: Option<String>, default: &str) -> PathBuf {
     let candidate = PathBuf::from(value.unwrap_or_else(|| default.to_owned()));
     if candidate.is_absolute() {
         candidate
@@ -362,7 +362,7 @@ fn resolve_repo_path(repo: &PathBuf, value: Option<String>, default: &str) -> Pa
     }
 }
 
-fn create_run_dir(repo: &PathBuf, mode: &str) -> Result<PathBuf, String> {
+fn create_run_dir(repo: &Path, mode: &str) -> Result<PathBuf, String> {
     let path = repo
         .join("target")
         .join("ui-runs")
@@ -610,7 +610,7 @@ async fn start_runtime(body: Vec<u8>, state: &DashboardState) -> (u16, &'static 
                 .arg("--anchors")
                 .arg(anchors)
                 .arg("--records")
-                .arg(&run_dir.join("records.jsonl"))
+                .arg(run_dir.join("records.jsonl"))
                 .arg("--price-scale")
                 .arg("8")
                 .arg("--quantity-scale")

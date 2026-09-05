@@ -199,6 +199,23 @@ impl ExecutionSupervisor {
         Ok(())
     }
 
+    /// Checks whether exits may be evaluated without manufacturing an entry intent.
+    pub fn evaluate_exit(&self, symbol: &str) -> GateDecision {
+        if !self
+            .symbols
+            .contains_key(symbol.trim().to_ascii_uppercase().as_str())
+        {
+            return GateDecision::Halt(GateReason::UnknownSymbol);
+        }
+        if self.unknown_remote_state {
+            return GateDecision::Halt(GateReason::UnknownRemoteState);
+        }
+        match self.state {
+            SupervisorState::Healthy | SupervisorState::Flattening => GateDecision::Allow,
+            _ => GateDecision::Halt(GateReason::NotHealthy),
+        }
+    }
+
     pub fn confirm_flattened(&mut self) -> Result<(), GateReason> {
         if self.state != SupervisorState::Flattening
             || self.symbols.values().any(|value| value.position != 0)
@@ -343,19 +360,22 @@ fn parse_quantity_ticks(value: &str, scale: u32) -> Option<i64> {
     if whole.is_empty()
         || !whole.bytes().all(|byte| byte.is_ascii_digit())
         || !fraction.bytes().all(|byte| byte.is_ascii_digit())
-        || fraction.len() > scale as usize
+        || (fraction.len() > scale as usize
+            && fraction.as_bytes()[scale as usize..]
+                .iter()
+                .any(|byte| *byte != b'0'))
     {
         return None;
     }
     let multiplier = 10_i128.checked_pow(scale)?;
     let whole_value = whole.parse::<i128>().ok()?.checked_mul(multiplier)?;
-    let fraction_value = if fraction.is_empty() {
+    let significant_fraction = &fraction[..fraction.len().min(scale as usize)];
+    let fraction_value = if significant_fraction.is_empty() {
         0
     } else {
-        fraction
-            .parse::<i128>()
-            .ok()?
-            .checked_mul(10_i128.checked_pow(scale.saturating_sub(fraction.len() as u32))?)?
+        significant_fraction.parse::<i128>().ok()?.checked_mul(
+            10_i128.checked_pow(scale.saturating_sub(significant_fraction.len() as u32))?,
+        )?
     };
     let value = whole_value.checked_add(fraction_value)?;
     let signed = if negative { -value } else { value };
@@ -471,8 +491,22 @@ mod tests {
     fn parses_signed_decimal_position_at_configured_scale() {
         assert_eq!(parse_quantity_ticks("2.5", 1), Some(25));
         assert_eq!(parse_quantity_ticks("-0.125", 3), Some(-125));
-        assert_eq!(parse_quantity_ticks("2.50", 1), None);
+        assert_eq!(parse_quantity_ticks("2.50", 1), Some(25));
+        assert_eq!(parse_quantity_ticks("2.51", 1), None);
         assert_eq!(parse_quantity_ticks("999999999999999999999", 8), None);
+    }
+
+    #[test]
+    fn exit_evaluation_runs_without_an_entry_intent_and_while_flattening() {
+        let mut value = ready(supervisor());
+        assert_eq!(value.evaluate_exit("CXMTUSDT"), GateDecision::Allow);
+        value.begin_flatten().unwrap();
+        assert_eq!(value.evaluate_exit("CXMTUSDT"), GateDecision::Allow);
+        value.on_disconnect();
+        assert_eq!(
+            value.evaluate_exit("CXMTUSDT"),
+            GateDecision::Halt(GateReason::NotHealthy)
+        );
     }
 
     #[test]

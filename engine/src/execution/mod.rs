@@ -27,6 +27,7 @@ pub mod signing;
 #[path = "spot.rs"]
 pub mod spot;
 pub mod supervisor;
+pub mod trading_permission;
 pub mod user_data;
 
 pub use order_ws::{BinanceOrderWebSocket, OrderTransportError};
@@ -72,6 +73,7 @@ pub use spot::{SpotDemoEndpoints, SpotOrderWire};
 pub use supervisor::{
     ExecutionSupervisor, GateDecision, GateReason, SupervisorConfig, SupervisorState, LIVE_SYMBOLS,
 };
+pub use trading_permission::TradingPermission;
 pub use user_data::{
     parse_user_data_message, AccountUpdate, BinanceUserDataStream, OrderUpdate, PositionUpdate,
     UserDataError, UserDataEvent,

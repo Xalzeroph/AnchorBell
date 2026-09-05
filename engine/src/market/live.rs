@@ -56,6 +56,7 @@ pub enum BinanceMarketFeed {
 }
 
 impl BinanceMarketConfig {
+    #[allow(clippy::too_many_arguments)]
     pub fn for_symbols<S: AsRef<str>>(
         market_ws_base: impl Into<String>,
         symbols: &[S],
