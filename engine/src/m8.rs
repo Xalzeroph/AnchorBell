@@ -2,6 +2,8 @@
 //! Pure strategy math: no exchange, simulator, or persistence dependency.
 use serde::Serialize;
 
+const PICO_BPS_SCALE: i128 = 1_000_000_000_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum FundingAction {
     NoAction,
@@ -33,10 +35,15 @@ pub struct M8Input {
     pub next_funding_ms: Option<u64>,
     pub funding_rate_status: FundingRateStatus,
     pub fee_ppm: i64,
+    /// Compatibility display fields; exact calculations use pico-bps.
     pub volatility_bps: i64,
     pub spread_bps: i64,
     pub model_uncertainty_bps: i64,
     pub liquidation_buffer_bps: i64,
+    pub volatility_pico_bps: i64,
+    pub spread_pico_bps: i64,
+    pub model_uncertainty_pico_bps: i64,
+    pub liquidation_buffer_pico_bps: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -50,21 +57,61 @@ pub struct M8Decision {
     pub total_cost_bps: i64,
     pub net_edge_bps: i64,
     pub safety_margin_bps: i64,
+    pub anchor_edge_pico_bps: i64,
+    pub funding_carry_pico_bps: i64,
+    pub total_cost_pico_bps: i64,
+    pub net_edge_pico_bps: i64,
+    pub safety_margin_pico_bps: i64,
     pub reason: &'static str,
 }
 
-fn bps(num: i64, den: i64) -> i64 {
+fn pico_bps(num: i64, den: i64) -> i64 {
     if num <= 0 || den <= 0 {
         return 0;
     }
-    ((i128::from(num) * 10_000) / i128::from(den)).clamp(0, i128::from(i64::MAX)) as i64
+    ((i128::from(num) * 10_000 * PICO_BPS_SCALE) / i128::from(den)).clamp(0, i128::from(i64::MAX))
+        as i64
+}
+
+fn pico_to_bps(value: i64) -> i64 {
+    if value == 0 {
+        return 0;
+    }
+    let magnitude = i128::from(value.unsigned_abs());
+    let rounded =
+        ((magnitude + PICO_BPS_SCALE / 2) / PICO_BPS_SCALE).clamp(0, i128::from(i64::MAX)) as i64;
+    if value >= 0 {
+        rounded
+    } else {
+        rounded.saturating_neg()
+    }
+}
+
+fn bps_to_pico(value: i64) -> i64 {
+    (i128::from(value).saturating_mul(PICO_BPS_SCALE))
+        .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
+
+fn ppm_to_pico_bps(ppm: i64) -> i64 {
+    if ppm <= 0 {
+        return 0;
+    }
+    (i128::from(ppm) * PICO_BPS_SCALE / 100).clamp(0, i128::from(i64::MAX)) as i64
+}
+
+fn exact_or_bps(pico: i64, bps: i64) -> i64 {
+    if pico != 0 {
+        pico
+    } else {
+        bps_to_pico(bps)
+    }
 }
 
 fn signed_edge(anchor: i64, mid: i64) -> (i8, i64) {
     if mid < anchor {
-        (1, bps(anchor - mid, mid))
+        (1, pico_bps(anchor - mid, mid))
     } else if mid > anchor {
-        (-1, bps(mid - anchor, mid))
+        (-1, pico_bps(mid - anchor, mid))
     } else {
         (0, 0)
     }
@@ -72,7 +119,10 @@ fn signed_edge(anchor: i64, mid: i64) -> (i8, i64) {
 
 fn funding_carry(side: i8, rate_e8: Option<i64>) -> i64 {
     rate_e8
-        .map(|rate| -(i64::from(side)) * rate / 10_000)
+        .map(|rate| {
+            ((-i128::from(side) * i128::from(rate) * PICO_BPS_SCALE) / 10_000)
+                .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+        })
         .unwrap_or(0)
 }
 
@@ -87,6 +137,11 @@ pub fn decide(input: M8Input) -> M8Decision {
         total_cost_bps: i64::MAX,
         net_edge_bps: i64::MIN,
         safety_margin_bps: 0,
+        anchor_edge_pico_bps: 0,
+        funding_carry_pico_bps: 0,
+        total_cost_pico_bps: i64::MAX,
+        net_edge_pico_bps: i64::MIN,
+        safety_margin_pico_bps: 0,
         reason: "invalid_or_unknown_state",
     };
     if input.anchor_ticks <= 0
@@ -99,6 +154,10 @@ pub fn decide(input: M8Input) -> M8Decision {
         || input.spread_bps < 0
         || input.model_uncertainty_bps < 0
         || input.liquidation_buffer_bps < 0
+        || input.volatility_pico_bps < 0
+        || input.spread_pico_bps < 0
+        || input.model_uncertainty_pico_bps < 0
+        || input.liquidation_buffer_pico_bps < 0
     {
         return zero;
     }
@@ -108,27 +167,47 @@ pub fn decide(input: M8Input) -> M8Decision {
     {
         return zero;
     }
-    let (signal_side, anchor_edge) = signed_edge(input.anchor_ticks, input.mid_ticks);
+    let (signal_side, anchor_edge_pico) = signed_edge(input.anchor_ticks, input.mid_ticks);
+    let anchor_edge = pico_to_bps(anchor_edge_pico);
     let held_side = input.position.signum() as i8;
     let side = if held_side != 0 {
         held_side
     } else {
         signal_side
     };
-    let carry = funding_carry(side, input.funding_rate_e8);
-    let costs = ((input.fee_ppm.saturating_mul(2) + 99) / 100)
-        .saturating_add(input.volatility_bps)
-        .saturating_add(input.spread_bps / 2)
-        .saturating_add(input.model_uncertainty_bps)
-        .saturating_add(input.liquidation_buffer_bps);
-    let net = anchor_edge.saturating_add(carry).saturating_sub(costs);
+    let carry_pico = funding_carry(side, input.funding_rate_e8);
+    let carry = pico_to_bps(carry_pico);
+    let volatility_pico = exact_or_bps(input.volatility_pico_bps, input.volatility_bps).max(0);
+    let spread_pico = exact_or_bps(input.spread_pico_bps, input.spread_bps).max(0);
+    let uncertainty_pico = exact_or_bps(
+        input.model_uncertainty_pico_bps,
+        input.model_uncertainty_bps,
+    )
+    .max(0);
+    let liquidation_buffer_pico = exact_or_bps(
+        input.liquidation_buffer_pico_bps,
+        input.liquidation_buffer_bps,
+    )
+    .max(0);
+    let costs_pico = ppm_to_pico_bps(input.fee_ppm.saturating_mul(2))
+        .saturating_add(volatility_pico)
+        .saturating_add(spread_pico / 2)
+        .saturating_add(uncertainty_pico)
+        .saturating_add(liquidation_buffer_pico);
+    let costs = pico_to_bps(costs_pico);
+    let net_pico = anchor_edge_pico
+        .saturating_add(carry_pico)
+        .saturating_sub(costs_pico);
+    let net = pico_to_bps(net_pico);
     let remaining = input
         .next_funding_ms
         .unwrap_or(0)
         .saturating_sub(input.now_ms);
     let near_funding = remaining <= 5 * 60 * 1_000;
-    let safety = costs.saturating_add(5);
-    if input.position != 0 && (net <= 0 || input.funding_rate_status == FundingRateStatus::Special)
+    let safety_pico = costs_pico.saturating_add(bps_to_pico(5));
+    let safety = pico_to_bps(safety_pico);
+    if input.position != 0
+        && (net_pico <= 0 || input.funding_rate_status == FundingRateStatus::Special)
     {
         return M8Decision {
             action: FundingAction::Exit,
@@ -140,10 +219,15 @@ pub fn decide(input: M8Input) -> M8Decision {
             total_cost_bps: costs,
             net_edge_bps: net,
             safety_margin_bps: safety,
+            anchor_edge_pico_bps: anchor_edge_pico,
+            funding_carry_pico_bps: carry_pico,
+            total_cost_pico_bps: costs_pico,
+            net_edge_pico_bps: net_pico,
+            safety_margin_pico_bps: safety_pico,
             reason: "held_edge_not_compensating_funding_or_special",
         };
     }
-    if signal_side == 0 || anchor_edge <= 0 {
+    if signal_side == 0 || anchor_edge_pico <= 0 {
         return M8Decision {
             action: FundingAction::NoAction,
             allow_entry: false,
@@ -154,10 +238,15 @@ pub fn decide(input: M8Input) -> M8Decision {
             total_cost_bps: costs,
             net_edge_bps: net,
             safety_margin_bps: safety,
+            anchor_edge_pico_bps: anchor_edge_pico,
+            funding_carry_pico_bps: carry_pico,
+            total_cost_pico_bps: costs_pico,
+            net_edge_pico_bps: net_pico,
+            safety_margin_pico_bps: safety_pico,
             reason: "anchor_edge_not_observable",
         };
     }
-    if near_funding && carry > 0 && net > safety {
+    if near_funding && carry_pico > 0 && net_pico > safety_pico {
         return M8Decision {
             action: FundingAction::Collect,
             allow_entry: true,
@@ -168,10 +257,15 @@ pub fn decide(input: M8Input) -> M8Decision {
             total_cost_bps: costs,
             net_edge_bps: net,
             safety_margin_bps: safety,
+            anchor_edge_pico_bps: anchor_edge_pico,
+            funding_carry_pico_bps: carry_pico,
+            total_cost_pico_bps: costs_pico,
+            net_edge_pico_bps: net_pico,
+            safety_margin_pico_bps: safety_pico,
             reason: "carry_and_anchor_edge_cover_tail_cost",
         };
     }
-    if net > safety {
+    if net_pico > safety_pico {
         return M8Decision {
             action: FundingAction::Tolerate,
             allow_entry: true,
@@ -182,6 +276,11 @@ pub fn decide(input: M8Input) -> M8Decision {
             total_cost_bps: costs,
             net_edge_bps: net,
             safety_margin_bps: safety,
+            anchor_edge_pico_bps: anchor_edge_pico,
+            funding_carry_pico_bps: carry_pico,
+            total_cost_pico_bps: costs_pico,
+            net_edge_pico_bps: net_pico,
+            safety_margin_pico_bps: safety_pico,
             reason: "anchor_edge_covers_funding_and_cost",
         };
     }
@@ -195,6 +294,11 @@ pub fn decide(input: M8Input) -> M8Decision {
         total_cost_bps: costs,
         net_edge_bps: net,
         safety_margin_bps: safety,
+        anchor_edge_pico_bps: anchor_edge_pico,
+        funding_carry_pico_bps: carry_pico,
+        total_cost_pico_bps: costs_pico,
+        net_edge_pico_bps: net_pico,
+        safety_margin_pico_bps: safety_pico,
         reason: "funding_or_tail_cost_exceeds_conservative_edge",
     }
 }
@@ -218,6 +322,10 @@ mod tests {
             spread_bps: 1,
             model_uncertainty_bps: 1,
             liquidation_buffer_bps: 1,
+            volatility_pico_bps: 1_000_000_000_000,
+            spread_pico_bps: 1_000_000_000_000,
+            model_uncertainty_pico_bps: 1_000_000_000_000,
+            liquidation_buffer_pico_bps: 1_000_000_000_000,
         }
     }
     #[test]

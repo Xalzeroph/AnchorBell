@@ -50,6 +50,7 @@ struct Args {
     output_root: PathBuf,
     capital_usdt: i64,
     duration_secs: u64,
+    include_m9: bool,
 }
 
 fn main() {
@@ -70,6 +71,17 @@ fn main() {
             .await
             .unwrap_or_else(|error| fail(format!("batch health bootstrap failed: {error}")));
         let run_id = format!("batch-{}-{}", args.policy_id, timestamp_ms());
+        let include_m9 = args.include_m9;
+        let strategies = if include_m9 {
+            (1..=9).map(|n| format!("m{n}")).collect()
+        } else {
+            (1..=8).map(|n| format!("m{n}")).collect()
+        };
+        let experiment_plan = if include_m9 {
+            anchorbell_engine::simulation::experiment_plan::ExperimentPlan::m1_to_m9()
+        } else {
+            anchorbell_engine::simulation::experiment_plan::ExperimentPlan::m1_to_m8()
+        };
         let registry = RunRegistry::new(args.output_root.join("runs"));
         registry
             .create(
@@ -81,7 +93,7 @@ fn main() {
                     capital_currency: "USDT".into(),
                     capital_minor_units: args.capital_usdt,
                     universe: "frozen-close-ah".into(),
-                    strategies: (1..=8).map(|n| format!("m{n}")).collect(),
+                    strategies,
                     ablations: vec!["funding".into()],
                     checkpoint_interval_ms: 5_000,
                     max_stale_ms: 5_000,
@@ -146,7 +158,7 @@ fn main() {
             .unwrap_or_else(|error| {
                 fail(format!("cannot allocate simulation-batch capital: {error}"))
             });
-        let specs = anchorbell_engine::simulation::experiment_plan::ExperimentPlan::m1_to_m8()
+        let specs = experiment_plan
             .runtime_specs()
             .unwrap_or_else(|error| fail(format!("invalid experiment plan: {error}")))
             .into_iter()
@@ -230,6 +242,7 @@ fn parse_args() -> Result<Args, String> {
     let mut output_root = PathBuf::from("target\\simulation-batch-20260904-M7");
     let mut capital_usdt = 1_500_i64.checked_mul(100_000_000).unwrap();
     let mut duration_secs = 0;
+    let mut include_m9 = false;
     let mut args = env::args().skip(1);
     while let Some(flag) = args.next() {
         match flag.as_str() {
@@ -250,6 +263,7 @@ fn parse_args() -> Result<Args, String> {
             "--output-root" => output_root = PathBuf::from(next(&mut args, &flag)?),
             "--capital-usdt" => capital_usdt = parse_decimal(&next(&mut args, &flag)?, 8)?,
             "--duration-secs" => duration_secs = parse(&mut args, &flag)?,
+            "--include-m9" => include_m9 = true,
             "--help" | "-h" => {
                 print_usage();
                 process::exit(0);
@@ -268,6 +282,7 @@ fn parse_args() -> Result<Args, String> {
         output_root,
         capital_usdt,
         duration_secs,
+        include_m9,
     })
 }
 
@@ -409,9 +424,12 @@ fn terminate_simulation_batch_process(pid: u32) {
 }
 
 fn print_usage() {
-    eprintln!("usage: anchorbell_simulation_batch [--policy-id M6] --index-anchors [--environment production] [--symbols S1,S2] [--output-root PATH] [--capital-usdt N] [--duration-secs N]");
+    eprintln!("usage: anchorbell_simulation_batch [--policy-id M6] --index-anchors [--environment production] [--symbols S1,S2] [--output-root PATH] [--capital-usdt N] [--duration-secs N] [--include-m9]");
     eprintln!(
-        "defaults: shared feed + M1..M8; execution economics, queueing, latency, and refresh cadence are controlled by the unified runtime profile"
+        "defaults: shared feed + M1..M8; pass --include-m9 to opt into the separate M1..M9 plan"
+    );
+    eprintln!(
+        "execution economics, queueing, latency, and refresh cadence are controlled by the unified runtime profile"
     );
 }
 

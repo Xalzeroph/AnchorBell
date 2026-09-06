@@ -215,6 +215,7 @@ impl MethodRegistry {
         let m6 = MethodId::new("M6")?;
         let m7 = MethodId::new("M7")?;
         let m8 = MethodId::new("M8")?;
+        let m9 = MethodId::new("M9")?;
         registry.register(MethodSpec::root(m1.clone(), MethodLayer::Signal))?;
         registry.register(MethodSpec::child(
             m2.clone(),
@@ -245,6 +246,17 @@ impl MethodRegistry {
                 .requires_feature("funding_schedule")
                 .overrides("funding_entry_policy"),
         )?;
+        registry.register(
+            MethodSpec::child(m9, MethodLayer::Risk, m8)
+                .with_overlay("causal_residual")
+                .with_overlay("joint_fill_markout_exit")
+                .with_overlay("deadline_mpc")
+                .with_overlay("distributionally_robust_optimizer")
+                .requires_feature("versioned_fair_value")
+                .requires_feature("deadline_exit_plan")
+                .requires_feature("joint_outcome_forecast")
+                .requires_feature("robust_risk_certificate"),
+        )?;
         Ok(registry)
     }
 }
@@ -256,10 +268,11 @@ mod tests {
     #[test]
     fn resolves_incremental_chain_with_shared_features() {
         let registry = MethodRegistry::anchorbell_defaults().unwrap();
-        let resolved = registry.resolve(&MethodId::new("M8").unwrap()).unwrap();
-        assert_eq!(resolved.lineage.len(), 8);
+        let resolved = registry.resolve(&MethodId::new("M9").unwrap()).unwrap();
+        assert_eq!(resolved.lineage.len(), 9);
         assert_eq!(resolved.lineage[0].as_str(), "M1");
-        assert_eq!(resolved.lineage.last().unwrap().as_str(), "M8");
+        assert_eq!(resolved.lineage.last().unwrap().as_str(), "M9");
+        assert!(resolved.required_features.contains("deadline_exit_plan"));
         assert!(resolved
             .overlays
             .iter()

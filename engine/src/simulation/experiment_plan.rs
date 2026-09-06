@@ -56,6 +56,19 @@ impl ExperimentPlan {
         }
     }
 
+    /// The M1-M8 matrix plus the full M9 challenger. Kept separate so an
+    /// existing M1-M8 run cannot silently change its strategy population.
+    pub fn m1_to_m9() -> Self {
+        let mut plan = Self::m1_to_m8();
+        plan.plan_id = "m1-m9-single-ledger-ablation-matrix".into();
+        plan.experiments.push(ExperimentSpec {
+            label: "M9_full".into(),
+            strategy: "m9".into(),
+            ablations: vec![],
+        });
+        plan
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.schema_version != Self::SCHEMA_VERSION || self.plan_id.trim().is_empty() {
             return Err("invalid experiment plan identity");
@@ -93,6 +106,7 @@ impl ExperimentPlan {
                     "m6" => SimulationPolicyVariant::M6DynamicCapital,
                     "m7" => SimulationPolicyVariant::M7EvidenceGated,
                     "m8" => SimulationPolicyVariant::M8FundingAware,
+                    "m9" => SimulationPolicyVariant::M9DeadlineCausalDroMpc,
                     _ => return Err("unknown experiment strategy"),
                 };
                 Ok((experiment.label.clone(), variant))
@@ -109,5 +123,15 @@ mod tests {
         let plan = ExperimentPlan::m1_to_m8();
         assert_eq!(plan.experiments.len(), 9);
         assert_eq!(plan.runtime_specs().unwrap().len(), 9);
+    }
+
+    #[test]
+    fn m9_plan_is_explicit_and_keeps_m1_to_m8_stable() {
+        let plan = ExperimentPlan::m1_to_m9();
+        assert_eq!(plan.experiments.len(), 10);
+        assert_eq!(
+            plan.runtime_specs().unwrap().last().unwrap().1,
+            SimulationPolicyVariant::M9DeadlineCausalDroMpc
+        );
     }
 }

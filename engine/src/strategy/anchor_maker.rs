@@ -92,20 +92,7 @@ impl AnchorMakerStrategy {
         if floor_bps < 0 {
             return None;
         }
-        Some(AdaptiveThreshold {
-            floor_bps,
-            residual_volatility_bps: 0,
-            cost_bps: 0,
-            uncertainty_bps: 0,
-            deadline_risk_bps: 0,
-            safety_margin_bps: 0,
-            spread_bps: 0,
-            adverse_selection_bps: 0,
-            liquidity_bps: 0,
-            inventory_bps: 0,
-            statistical_bps: 0,
-            tail_risk_bps: 0,
-        })
+        AdaptiveThreshold::from_components(floor_bps, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
     }
 }
 

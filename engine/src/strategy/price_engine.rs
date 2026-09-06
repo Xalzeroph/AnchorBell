@@ -1,27 +1,52 @@
+const PICO_BPS_SCALE: i128 = 1_000_000_000_000;
+
 #[derive(Debug, Clone, Copy)]
 pub struct MakerPriceEngine {
     pub offset_bps: i64,
+    pub offset_pico_bps: i64,
 }
 
 impl MakerPriceEngine {
     pub fn new(offset_bps: i64) -> Self {
-        Self { offset_bps }
+        Self {
+            offset_bps,
+            offset_pico_bps: 0,
+        }
+    }
+
+    pub fn new_precise(offset_pico_bps: i64) -> Self {
+        Self {
+            offset_bps: ((i128::from(offset_pico_bps) + PICO_BPS_SCALE / 2) / PICO_BPS_SCALE)
+                .clamp(0, i128::from(i64::MAX)) as i64,
+            offset_pico_bps,
+        }
     }
 
     #[inline]
     pub fn buy_price(&self, index_price: i64) -> i64 {
-        scaled_price(index_price, -i128::from(self.offset_bps))
+        let offset = if self.offset_pico_bps != 0 {
+            i128::from(self.offset_pico_bps)
+        } else {
+            i128::from(self.offset_bps) * PICO_BPS_SCALE
+        };
+        scaled_price_precise(index_price, -offset)
     }
 
     #[inline]
     pub fn sell_price(&self, index_price: i64) -> i64 {
-        scaled_price(index_price, i128::from(self.offset_bps))
+        let offset = if self.offset_pico_bps != 0 {
+            i128::from(self.offset_pico_bps)
+        } else {
+            i128::from(self.offset_bps) * PICO_BPS_SCALE
+        };
+        scaled_price_precise(index_price, offset)
     }
 }
 
 #[inline]
-fn scaled_price(index_price: i64, offset_bps: i128) -> i64 {
-    let adjustment = i128::from(index_price) * offset_bps / 10_000;
+fn scaled_price_precise(index_price: i64, offset_pico_bps: i128) -> i64 {
+    let adjustment =
+        i128::from(index_price).saturating_mul(offset_pico_bps) / (10_000 * PICO_BPS_SCALE);
     (i128::from(index_price) + adjustment).clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 

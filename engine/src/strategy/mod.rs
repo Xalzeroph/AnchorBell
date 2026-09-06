@@ -5,6 +5,7 @@ pub mod capital;
 pub mod flatten;
 pub mod instrument_profile;
 pub mod inventory;
+pub mod m9;
 pub mod market_context;
 pub mod method_graph;
 pub mod price_engine;
@@ -25,6 +26,9 @@ pub use calendar::{
 pub use flatten::{DualFlattenPlan, FlattenPhase, FlattenReason};
 pub use instrument_profile::{profile_for, AnchorCurrency, InstrumentKind, InstrumentProfile};
 pub use inventory::InventoryState;
+pub use m9::{
+    decide as decide_m9, M9Action, M9Calibration, M9Decision, M9Input, M9Phase, M9_MODEL_VERSION,
+};
 pub use market_context::MarketContext;
 pub use method_graph::{
     MethodGraphError, MethodId, MethodLayer, MethodRegistry, MethodSpec, ResolvedMethod,
@@ -43,7 +47,8 @@ pub use risk_contracts::{
 pub use session::{ClosedSession, StaticAnchor};
 pub use signal_policy::{
     adaptive_intent_from_market, decide as decide_adaptive_signal, side_adverse_selection_bps,
-    AdaptiveThreshold, SignalBlockReason, SignalDecision, SignalInput,
+    side_adverse_selection_pico_bps, AdaptiveThreshold, SignalBlockReason, SignalDecision,
+    SignalInput,
 };
 pub use universe::{
     adr_excluded_instruments, all_instruments, catalog_instrument_for, catalog_instruments,

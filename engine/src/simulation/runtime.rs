@@ -40,11 +40,10 @@ use crate::{
     strategy::{
         calendar::{calendar_for, EquitySessionCalendar},
         capital::{dynamic_weights, CapitalRiskInput},
-        profile_for, side_adverse_selection_bps,
+        decide_m9, profile_for, side_adverse_selection_bps, side_adverse_selection_pico_bps,
         universe::instrument_for,
         AdaptiveThreshold, AnchorCurrency, AnchorMakerStrategy, DataQualityStatus,
-        FairValueEstimate, SignalInput,
-        VenueSessionState,
+        FairValueEstimate, M9Action, M9Calibration, M9Input, SignalInput, VenueSessionState,
     },
 };
 
@@ -81,6 +80,8 @@ pub enum SimulationPolicyVariant {
     M7EvidenceGated,
     /// M7 plus funding-aware carry/avoid/tolerate/exit control.
     M8FundingAware,
+    /// M8 funding control plus deadline-constrained causal residual DRO-MPC.
+    M9DeadlineCausalDroMpc,
 }
 
 impl SimulationPolicyVariant {
@@ -95,6 +96,7 @@ impl SimulationPolicyVariant {
             Self::M6DynamicCapital => "m6_dynamic_capital",
             Self::M7EvidenceGated => "m7_evidence_gated",
             Self::M8FundingAware => "m8_funding_aware",
+            Self::M9DeadlineCausalDroMpc => "m9_deadline_causal_dro_mpc",
         }
     }
 
@@ -643,8 +645,12 @@ struct SimulationSymbolState {
     ewma_spread_bps: i64,
     ewma_abs_return_micro_bps: i64,
     ewma_spread_micro_bps: i64,
+    ewma_abs_return_pico_bps: i64,
+    ewma_spread_pico_bps: i64,
     near_miss_count: u64,
     adaptive_relief_bps: i64,
+    adaptive_relief_micro_bps: i64,
+    adaptive_relief_pico_bps: i64,
     working: Option<WorkingOrder>,
     position: i64,
     average_entry_ticks: i64,
@@ -660,6 +666,7 @@ struct SimulationSymbolState {
     losing_fills: u64,
     pending_markouts: VecDeque<PendingMarkout>,
     ewma_adverse_markout_micro_bps: i64,
+    ewma_adverse_markout_pico_bps: i64,
     evaluated_markouts: u64,
     adverse_markouts: u64,
 }
@@ -776,7 +783,23 @@ pub struct ThresholdMetrics {
     pub inventory_bps: i64,
     pub statistical_bps: i64,
     pub tail_risk_bps: i64,
+    pub floor_pico_bps: i64,
+    pub residual_volatility_pico_bps: i64,
+    pub cost_pico_bps: i64,
+    pub uncertainty_pico_bps: i64,
+    pub deadline_risk_pico_bps: i64,
+    pub safety_margin_pico_bps: i64,
+    pub spread_pico_bps: i64,
+    pub adverse_selection_pico_bps: i64,
+    pub liquidity_pico_bps: i64,
+    pub inventory_pico_bps: i64,
+    pub statistical_pico_bps: i64,
+    pub tail_risk_pico_bps: i64,
     pub required_bps: Option<i64>,
+    /// Exact internal hurdle, in 1e-12 bps.
+    pub required_pico_bps: Option<i64>,
+    /// Compatibility diagnostic, rounded from pico-bps.
+    pub required_micro_bps: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -789,14 +812,15 @@ struct ThresholdDiagnostic {
 
 const FUNDING_FLATTEN_LEAD_MS: u64 = 5 * 60 * 1_000;
 const MICRO_BPS_SCALE: i64 = 1_000_000;
+const PICO_BPS_SCALE: i64 = 1_000_000_000_000;
 const EWMA_PREVIOUS_WEIGHT_PPM: i64 = 700_000;
 const EWMA_SAMPLE_WEIGHT_PPM: i64 = 300_000;
-const ADAPTIVE_RELIEF_MAX_BPS: i64 = 8;
-const ADAPTIVE_RELIEF_STEP_EVENTS: u64 = 100;
-const ADAPTIVE_NEAR_MISS_WINDOW_BPS: i64 = 8;
+const ADAPTIVE_RELIEF_MAX_PICO_BPS: i64 = 8 * PICO_BPS_SCALE;
+const ADAPTIVE_RELIEF_STEP_PICO_BPS: i64 = PICO_BPS_SCALE / 4;
+const ADAPTIVE_NEAR_MISS_WINDOW_PICO_BPS: i64 = 8 * PICO_BPS_SCALE;
 const MARKOUT_HORIZON_MS: u64 = 30 * 1_000;
-const THRESHOLD_PRIOR_VOLATILITY_BPS: i64 = 10;
-const THRESHOLD_PRIOR_SPREAD_BPS: i64 = 2;
+const THRESHOLD_PRIOR_VOLATILITY_PICO_BPS: i64 = 10 * PICO_BPS_SCALE;
+const THRESHOLD_PRIOR_SPREAD_PICO_BPS: i64 = 2 * PICO_BPS_SCALE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SimulationRiskState {
@@ -882,13 +906,28 @@ pub struct SymbolMetrics {
     pub ewma_spread_bps: i64,
     pub ewma_abs_return_micro_bps: i64,
     pub ewma_spread_micro_bps: i64,
+    pub ewma_abs_return_pico_bps: i64,
+    pub ewma_spread_pico_bps: i64,
     pub ewma_adverse_markout_bps: i64,
     pub ewma_adverse_markout_micro_bps: i64,
+    pub ewma_adverse_markout_pico_bps: i64,
     pub evaluated_markouts: u64,
     pub adverse_markouts: u64,
     pub adaptive_relief_bps: i64,
+    pub adaptive_relief_micro_bps: i64,
+    /// Exact adaptive relief, in 1e-12 bps.
+    pub adaptive_relief_pico_bps: i64,
     pub buy_edge_bps: Option<i64>,
     pub sell_edge_bps: Option<i64>,
+    /// Compatibility edge diagnostics in micro-bps.
+    pub buy_edge_micro_bps: Option<i64>,
+    pub sell_edge_micro_bps: Option<i64>,
+    /// Exact price edge diagnostics in pico-bps.
+    pub buy_edge_pico_bps: Option<i64>,
+    pub sell_edge_pico_bps: Option<i64>,
+    pub liquidity_ratio_bps: Option<i64>,
+    pub liquidity_penalty_bps: Option<i64>,
+    pub liquidity_fill_probability_bps: Option<u16>,
     pub fair_value_ticks: Option<i64>,
     pub fair_value_confidence_bps: Option<i64>,
     pub market_regime: Option<String>,
@@ -1047,12 +1086,17 @@ impl SimulationEngine {
                         ewma_spread_bps: 0,
                         ewma_abs_return_micro_bps: 0,
                         ewma_spread_micro_bps: 0,
+                        ewma_abs_return_pico_bps: 0,
+                        ewma_spread_pico_bps: 0,
                         ewma_adverse_markout_micro_bps: 0,
+                        ewma_adverse_markout_pico_bps: 0,
                         evaluated_markouts: 0,
                         adverse_markouts: 0,
                         pending_markouts: VecDeque::new(),
                         near_miss_count: 0,
                         adaptive_relief_bps: 0,
+                        adaptive_relief_micro_bps: 0,
+                        adaptive_relief_pico_bps: 0,
                         working: None,
                         position: 0,
                         average_entry_ticks: 0,
@@ -1220,7 +1264,7 @@ impl SimulationEngine {
         self.last_event_at_ms = event_time_ms(event);
         self.last_received_at_ms = received_at_ms;
         let mut records = self.settle_pending_cancels(received_at_ms);
-        records.extend(self.refresh_dynamic_allocations(received_at_ms));
+        records.extend(self.refresh_dynamic_allocations(self.last_event_at_ms));
         records.extend(match event {
             BinanceMarketEvent::BookTicker(ticker) => self.on_book_ticker(ticker),
             BinanceMarketEvent::MarkPrice(mark) => self.on_mark_price(mark, received_at_ms),
@@ -1589,9 +1633,11 @@ impl SimulationEngine {
                 let quote_quantity = state
                     .book
                     .map(|book| {
-                        requested_quantity
-                            .min(book.bid_quantity.max(1))
-                            .min(book.ask_quantity.max(1))
+                        liquidity_adjusted_quantity(
+                            requested_quantity,
+                            book.bid_quantity,
+                            book.ask_quantity,
+                        )
                     })
                     .unwrap_or(requested_quantity);
                 let (bid_price_ticks, ask_price_ticks) = state
@@ -1606,34 +1652,31 @@ impl SimulationEngine {
                     self.fee_ppm,
                     quote_quantity,
                     max_position,
-                    observed_at_ms,
+                    self.last_event_at_ms,
                 );
-                let threshold = threshold_diagnostic.threshold.map(|threshold| {
-                    apply_adaptive_relief(
-                        scale_threshold_non_fee(threshold, self.threshold_scale_ppm),
-                        state.adaptive_relief_bps,
-                    )
-                });
-                let calendar_state = calendar_state_for(symbol, observed_at_ms);
+                let threshold = threshold_diagnostic
+                    .threshold
+                    .map(|threshold| scale_threshold_non_fee(threshold, self.threshold_scale_ppm));
+                let calendar_state = calendar_state_for(symbol, self.last_event_at_ms);
                 let data_quality =
-                    data_quality_for(state, observed_at_ms, self.max_mark_index_gap_bps);
+                    data_quality_for(state, self.last_event_at_ms, self.max_mark_index_gap_bps);
                 let equity_entry_allowed = !self.live_risk_gates
-                    || simulation_session_allows_entry(symbol, observed_at_ms);
+                    || simulation_session_allows_entry(symbol, self.last_event_at_ms);
                 let funding_known = !self.live_risk_gates
-                    || (state.next_funding_time_ms > observed_at_ms
+                    || (state.next_funding_time_ms > self.last_event_at_ms
                         && state.latest_funding_rate_e8.is_some());
                 let anchor_allowed = state
                     .anchor
-                    .valid_at(observed_at_ms, self.max_anchor_age_ms)
+                    .valid_at(self.last_event_at_ms, self.max_anchor_age_ms)
                     && (!self.live_risk_gates
                         || state.anchor.observed_at_ms == 0
                         || simulation_anchor_usable(
                             symbol,
                             state.anchor.observed_at_ms,
-                            observed_at_ms,
+                            self.last_event_at_ms,
                         ));
                 let funding_decision =
-                    m8_funding_decision(state, observed_at_ms, max_position, self.fee_ppm);
+                    m8_funding_decision(state, self.last_event_at_ms, max_position, self.fee_ppm);
                 let funding_overlay = evaluate_funding_overlay(
                     funding_decision.action,
                     if state.latest_funding_rate_e8.is_some() {
@@ -1650,7 +1693,7 @@ impl SimulationEngine {
                     } else {
                         funding_entry_allowed_variant(
                             state,
-                            observed_at_ms,
+                            self.last_event_at_ms,
                             self.strategy_variant,
                             self.fee_ppm,
                         )
@@ -1684,26 +1727,35 @@ impl SimulationEngine {
                 } else {
                     SimulationRiskState::Trading
                 };
-                let anchor_age_ms = (state.anchor.observed_at_ms > 0)
-                    .then(|| observed_at_ms.saturating_sub(state.anchor.observed_at_ms));
-                // Freshness is measured from local receipt time; exchange event
-                // timestamps can legitimately differ from the host clock.
-                let mark_age_ms = (state.last_mark_received_at_ms > 0)
-                    .then(|| observed_at_ms.saturating_sub(state.last_mark_received_at_ms));
+                let anchor_age_ms = (state.anchor.observed_at_ms > 0).then(|| {
+                    self.last_event_at_ms
+                        .saturating_sub(state.anchor.observed_at_ms)
+                });
+                // Signal age is measured entirely on the exchange clock.
+                // Receipt timestamps remain transport telemetry only.
+                let mark_age_ms = (state.last_mark_time_ms > 0).then(|| {
+                    self.last_event_at_ms
+                        .saturating_sub(state.last_mark_time_ms)
+                });
                 let reference_ticks = fair_value
                     .map(|estimate| estimate.price.0)
                     .unwrap_or(state.anchor.close_price_ticks);
-                let buy_edge_bps =
-                    bid_price_ticks.and_then(|price| edge_bps(reference_ticks, price));
-                let sell_edge_bps =
-                    ask_price_ticks.and_then(|price| edge_bps(price, reference_ticks));
+                let buy_edge_pico_bps =
+                    bid_price_ticks.and_then(|price| edge_pico_bps(reference_ticks, price));
+                let sell_edge_pico_bps =
+                    ask_price_ticks.and_then(|price| edge_pico_bps(price, reference_ticks));
+                let buy_edge_bps = buy_edge_pico_bps.map(pico_bps_to_bps);
+                let sell_edge_bps = sell_edge_pico_bps.map(pico_bps_to_bps);
+                let buy_edge_micro_bps = buy_edge_pico_bps.map(pico_bps_to_micro);
+                let sell_edge_micro_bps = sell_edge_pico_bps.map(pico_bps_to_micro);
                 let entry_block_reason = entry_block_reason_for(
                     state,
                     risk_state,
                     threshold,
                     threshold_diagnostic.status,
-                    buy_edge_bps,
-                    sell_edge_bps,
+                    state.adaptive_relief_pico_bps,
+                    buy_edge_pico_bps,
+                    sell_edge_pico_bps,
                 );
 
                 SymbolMetrics {
@@ -1797,17 +1849,33 @@ impl SimulationEngine {
                     ewma_spread_bps: state.ewma_spread_bps,
                     ewma_abs_return_micro_bps: state.ewma_abs_return_micro_bps,
                     ewma_spread_micro_bps: state.ewma_spread_micro_bps,
-                    ewma_adverse_markout_bps: micro_bps_to_bps(
-                        state.ewma_adverse_markout_micro_bps,
+                    ewma_abs_return_pico_bps: state.ewma_abs_return_pico_bps,
+                    ewma_spread_pico_bps: state.ewma_spread_pico_bps,
+                    ewma_adverse_markout_bps: pico_bps_to_bps(state.ewma_adverse_markout_pico_bps),
+                    ewma_adverse_markout_micro_bps: pico_bps_to_micro(
+                        state.ewma_adverse_markout_pico_bps,
                     ),
-                    ewma_adverse_markout_micro_bps: state.ewma_adverse_markout_micro_bps,
+                    ewma_adverse_markout_pico_bps: state.ewma_adverse_markout_pico_bps,
                     evaluated_markouts: state.evaluated_markouts,
                     adverse_markouts: state.adverse_markouts,
                     adaptive_relief_bps: state.adaptive_relief_bps,
-                    buy_edge_bps: bid_price_ticks
-                        .and_then(|price| edge_bps(reference_ticks, price)),
-                    sell_edge_bps: ask_price_ticks
-                        .and_then(|price| edge_bps(price, reference_ticks)),
+                    adaptive_relief_micro_bps: state.adaptive_relief_micro_bps,
+                    adaptive_relief_pico_bps: state.adaptive_relief_pico_bps,
+                    buy_edge_bps,
+                    sell_edge_bps,
+                    buy_edge_micro_bps,
+                    sell_edge_micro_bps,
+                    buy_edge_pico_bps,
+                    sell_edge_pico_bps,
+                    liquidity_ratio_bps: state.book.map(|book| {
+                        liquidity_ratio_bps(quote_quantity, book.bid_quantity, book.ask_quantity)
+                    }),
+                    liquidity_penalty_bps: state.book.map(|book| {
+                        liquidity_penalty_bps(quote_quantity, book.bid_quantity, book.ask_quantity)
+                    }),
+                    liquidity_fill_probability_bps: state.book.map(|book| {
+                        fill_probability_bps(quote_quantity, book.bid_quantity, book.ask_quantity)
+                    }),
                     fair_value_ticks: fair_value.map(|estimate| estimate.price.0),
                     fair_value_confidence_bps: fair_value.map(|estimate| estimate.confidence_bps),
                     market_regime: fair_value.map(|estimate| estimate.regime.label().to_owned()),
@@ -1970,15 +2038,16 @@ impl SimulationEngine {
             });
             let mid = (i128::from(ticker.bid_price.0) + i128::from(ticker.ask_price.0)) / 2;
             if mid > 0 && ticker.ask_price.0 >= ticker.bid_price.0 {
-                let spread_micro_bps = ((i128::from(ticker.ask_price.0)
+                let spread_pico_bps = ((i128::from(ticker.ask_price.0)
                     - i128::from(ticker.bid_price.0))
                     * 10_000
-                    * i128::from(MICRO_BPS_SCALE)
+                    * i128::from(PICO_BPS_SCALE)
                     / mid)
                     .clamp(0, i128::from(i64::MAX)) as i64;
-                state.ewma_spread_micro_bps =
-                    ewma_micro(state.ewma_spread_micro_bps, spread_micro_bps);
-                state.ewma_spread_bps = micro_bps_to_bps(state.ewma_spread_micro_bps);
+                state.ewma_spread_pico_bps =
+                    ewma_scaled(state.ewma_spread_pico_bps, spread_pico_bps);
+                state.ewma_spread_micro_bps = pico_bps_to_micro(state.ewma_spread_pico_bps);
+                state.ewma_spread_bps = pico_bps_to_bps(state.ewma_spread_pico_bps);
             }
         } else {
             return Vec::new();
@@ -2004,13 +2073,14 @@ impl SimulationEngine {
                     state.market_pnl_ticks = state
                         .market_pnl_ticks
                         .saturating_add(clamp_i128(market_pnl));
-                    let change_micro_bps = (change.abs() * 10_000 * i128::from(MICRO_BPS_SCALE)
-                        / i128::from(previous))
-                    .clamp(0, i128::from(i64::MAX))
-                        as i64;
+                    let change_pico_bps =
+                        (change.abs() * 10_000 * i128::from(PICO_BPS_SCALE) / i128::from(previous))
+                            .clamp(0, i128::from(i64::MAX)) as i64;
+                    state.ewma_abs_return_pico_bps =
+                        ewma_scaled(state.ewma_abs_return_pico_bps, change_pico_bps);
                     state.ewma_abs_return_micro_bps =
-                        ewma_micro(state.ewma_abs_return_micro_bps, change_micro_bps);
-                    state.ewma_abs_return_bps = micro_bps_to_bps(state.ewma_abs_return_micro_bps);
+                        pico_bps_to_micro(state.ewma_abs_return_pico_bps);
+                    state.ewma_abs_return_bps = pico_bps_to_bps(state.ewma_abs_return_pico_bps);
                 }
             }
             let due = state.next_funding_time_ms > 0
@@ -2193,7 +2263,8 @@ impl SimulationEngine {
                 price_ticks: Some(order.price_ticks),
                 quantity: Some(quantity),
                 order_age_ms: Some(
-                    trade.trade_time_ms
+                    trade
+                        .trade_time_ms
                         .max(trade.event_time_ms)
                         .saturating_sub(order.placed_at_ms),
                 ),
@@ -2225,9 +2296,8 @@ impl SimulationEngine {
         let Some(book) = state.book else {
             return;
         };
-        let quantity = requested_quantity
-            .min(book.bid_quantity.max(1))
-            .min(book.ask_quantity.max(1));
+        let quantity =
+            liquidity_adjusted_quantity(requested_quantity, book.bid_quantity, book.ask_quantity);
         let Some(base_threshold) = dynamic_threshold_for(
             state,
             variant,
@@ -2240,43 +2310,52 @@ impl SimulationEngine {
         .map(|threshold| scale_threshold_non_fee(threshold, threshold_scale_ppm)) else {
             return;
         };
-        let Some(required_bps) = base_threshold.required_bps() else {
+        let Some(required_pico_bps) = base_threshold.required_pico_bps() else {
             return;
         };
-        let buy_edge = edge_bps(state.anchor.close_price_ticks, book.bid_price_ticks)
+        let buy_edge = edge_pico_bps(state.anchor.close_price_ticks, book.bid_price_ticks)
             .unwrap_or(0)
             .max(0);
-        let sell_edge = edge_bps(book.ask_price_ticks, state.anchor.close_price_ticks)
+        let sell_edge = edge_pico_bps(book.ask_price_ticks, state.anchor.close_price_ticks)
             .unwrap_or(0)
             .max(0);
         let best_edge = buy_edge.max(sell_edge);
-        let low_volatility = state.ewma_abs_return_micro_bps <= 2 * MICRO_BPS_SCALE;
+        let low_volatility = state.ewma_abs_return_pico_bps <= 2 * PICO_BPS_SCALE;
         let stable_inventory = state.position == 0;
-        let near_miss = best_edge < required_bps
-            && required_bps.saturating_sub(best_edge) <= ADAPTIVE_NEAR_MISS_WINDOW_BPS;
-        if low_volatility && stable_inventory && near_miss {
-            state.near_miss_count = state.near_miss_count.saturating_add(1);
-            if state.near_miss_count >= ADAPTIVE_RELIEF_STEP_EVENTS {
-                state.adaptive_relief_bps =
-                    (state.adaptive_relief_bps + 1).min(ADAPTIVE_RELIEF_MAX_BPS);
-                state.near_miss_count = 0;
-            }
+        let fresh_market = data_quality_for(state, timestamp_ms, self.max_mark_index_gap_bps)
+            == DataQualityStatus::Fresh;
+        let gap = i128::from(required_pico_bps)
+            .saturating_sub(i128::from(best_edge))
+            .max(0) as i64;
+        let eligible = low_volatility
+            && stable_inventory
+            && fresh_market
+            && gap > 0
+            && gap <= ADAPTIVE_NEAR_MISS_WINDOW_PICO_BPS;
+        let target_relief = if eligible {
+            gap.min(ADAPTIVE_RELIEF_MAX_PICO_BPS)
         } else {
-            state.near_miss_count = 0;
-            if !low_volatility
-                || !stable_inventory
-                || required_bps.saturating_sub(best_edge) > 2 * ADAPTIVE_NEAR_MISS_WINDOW_BPS
-            {
-                // Relief is a bounded controller state. `i64::saturating_sub`
-                // saturates only at MIN, so subtracting from zero previously
-                // produced negative relief values in metrics. Negative relief
-                // is not an economic state and also obscures controller health.
-                state.adaptive_relief_bps = state
-                    .adaptive_relief_bps
-                    .saturating_sub(1)
-                    .clamp(0, ADAPTIVE_RELIEF_MAX_BPS);
-            }
+            0
+        };
+        let current = state.adaptive_relief_pico_bps;
+        let next = if target_relief > current {
+            current
+                .saturating_add(ADAPTIVE_RELIEF_STEP_PICO_BPS)
+                .min(target_relief)
+        } else {
+            current
+                .saturating_sub(ADAPTIVE_RELIEF_STEP_PICO_BPS)
+                .max(target_relief)
         }
+        .clamp(0, ADAPTIVE_RELIEF_MAX_PICO_BPS);
+        state.adaptive_relief_pico_bps = next;
+        state.adaptive_relief_micro_bps = pico_bps_to_micro(next);
+        state.adaptive_relief_bps = pico_bps_to_bps(next);
+        state.near_miss_count = if eligible {
+            state.near_miss_count.saturating_add(1)
+        } else {
+            0
+        };
     }
 
     fn rebalance_symbol(&mut self, symbol: &str, timestamp_ms: u64) -> Vec<SimulationRecord> {
@@ -2368,6 +2447,16 @@ impl SimulationEngine {
                     });
                     (desired, true, state.working.is_some())
                 }
+            } else if strategy_variant == SimulationPolicyVariant::M9DeadlineCausalDroMpc {
+                let (intent, reduce_only, _reason) = m9_intent_for_state(
+                    state,
+                    timestamp_ms,
+                    max_position,
+                    requested_quantity,
+                    self.max_mark_index_gap_bps,
+                    self.fee_ppm,
+                );
+                (intent, reduce_only, state.working.is_some())
             } else {
                 let mark_index_ok = match (state.mark_price_ticks, state.index_price_ticks) {
                     (Some(mark), Some(index)) => {
@@ -2394,9 +2483,11 @@ impl SimulationEngine {
                 if !valid {
                     (None, false, state.working.is_some())
                 } else {
-                    let quantity = requested_quantity
-                        .min(book.bid_quantity.max(1))
-                        .min(book.ask_quantity.max(1));
+                    let quantity = liquidity_adjusted_quantity(
+                        requested_quantity,
+                        book.bid_quantity,
+                        book.ask_quantity,
+                    );
                     let quantity = if strategy_variant.uses_tail_guard() {
                         m5_quote_quantity(state, quantity)
                     } else {
@@ -2411,19 +2502,13 @@ impl SimulationEngine {
                         max_position,
                         timestamp_ms,
                     )
-                    .map(|threshold| {
-                        apply_adaptive_relief(
-                            scale_threshold_non_fee(threshold, self.threshold_scale_ppm),
-                            state.adaptive_relief_bps,
-                        )
-                    });
+                    .map(|threshold| scale_threshold_non_fee(threshold, self.threshold_scale_ppm));
+                    let m7_required_pico_bps = threshold
+                        .and_then(|value| value.required_pico_bps())
+                        .map(|required| required.saturating_sub(state.adaptive_relief_pico_bps))
+                        .unwrap_or(0);
                     let m7_blocked = strategy_variant == SimulationPolicyVariant::M7EvidenceGated
-                        && !m7_entry_admissible(
-                            state,
-                            threshold
-                                .and_then(|value| value.required_bps())
-                                .unwrap_or(0),
-                        );
+                        && !m7_entry_admissible(state, m7_required_pico_bps);
                     let intent = if strategy_variant == SimulationPolicyVariant::M0Fixed {
                         if m7_blocked {
                             None
@@ -2443,6 +2528,8 @@ impl SimulationEngine {
                             fill_probability_bps(quantity, book.bid_quantity, book.ask_quantity);
                         let (buy_micro_adverse_bps, sell_micro_adverse_bps) =
                             side_adverse_selection_bps(book.bid_quantity, book.ask_quantity);
+                        let (buy_pico_adverse_bps, sell_pico_adverse_bps) =
+                            side_adverse_selection_pico_bps(book.bid_quantity, book.ask_quantity);
                         let fair_value = fair_value_for_state(state);
                         let signal_reference = fair_value
                             .map(|estimate| estimate.price.0)
@@ -2465,7 +2552,10 @@ impl SimulationEngine {
                             max_position,
                             requested_quantity: quantity,
                             threshold,
+                            threshold_relief_micro_bps: state.adaptive_relief_micro_bps,
+                            threshold_relief_pico_bps: state.adaptive_relief_pico_bps,
                             inventory_skew_bps: 50,
+                            inventory_skew_pico_bps: 50 * PICO_BPS_SCALE,
                             buy_adverse_selection_bps: if strategy_variant.uses_microstructure() {
                                 buy_micro_adverse_bps
                             } else {
@@ -2473,6 +2563,20 @@ impl SimulationEngine {
                             },
                             sell_adverse_selection_bps: if strategy_variant.uses_microstructure() {
                                 sell_micro_adverse_bps
+                            } else {
+                                0
+                            },
+                            buy_adverse_selection_pico_bps: if strategy_variant
+                                .uses_microstructure()
+                            {
+                                buy_pico_adverse_bps
+                            } else {
+                                0
+                            },
+                            sell_adverse_selection_pico_bps: if strategy_variant
+                                .uses_microstructure()
+                            {
+                                sell_pico_adverse_bps
                             } else {
                                 0
                             },
@@ -2567,10 +2671,7 @@ impl SimulationEngine {
         {
             return Vec::new();
         }
-        let mid_ticks = book
-            .bid_price_ticks
-            .saturating_add(book.ask_price_ticks)
-            / 2;
+        let mid_ticks = book.bid_price_ticks.saturating_add(book.ask_price_ticks) / 2;
         let quote_distance_bps = bps_between(intent.price, mid_ticks);
         let queue_ahead_quantity = if state.local_book.is_valid() {
             state
@@ -2703,6 +2804,122 @@ impl SimulationEngine {
     }
 }
 
+fn m9_intent_for_state(
+    state: &SimulationSymbolState,
+    timestamp_ms: u64,
+    max_position: i64,
+    requested_quantity: i64,
+    max_mark_index_gap_bps: i64,
+    fee_ppm: i64,
+) -> (Option<OrderIntent>, bool, &'static str) {
+    let Some(book) = state.book else {
+        return (None, false, "m9_market_book_unavailable");
+    };
+    let Some(fair_value) = fair_value_for_state(state) else {
+        return (None, false, "m9_fair_value_unavailable");
+    };
+    let Some(deadline_ms) = funding_flatten_deadline(state.next_funding_time_ms) else {
+        return (None, false, "m9_deadline_unavailable");
+    };
+    let mark = state.mark_price_ticks.unwrap_or(0);
+    let index = state.index_price_ticks.unwrap_or(0);
+    let mark_index_ok = mark > 0
+        && index > 0
+        && (i128::from(mark) - i128::from(index)).abs() * 10_000
+            <= i128::from(max_mark_index_gap_bps.max(0)) * i128::from(index);
+    let data_valid = mark_index_ok
+        && data_quality_for(state, timestamp_ms, max_mark_index_gap_bps)
+            == DataQualityStatus::Fresh
+        && state.anchor.valid_at(timestamp_ms, u64::MAX);
+    let funding_valid =
+        state.next_funding_time_ms > timestamp_ms && state.latest_funding_rate_e8.is_some();
+    let queue_ahead = if state.local_book.is_valid() {
+        state
+            .local_book
+            .quantity_at(true, book.bid_price_ticks)
+            .max(state.local_book.quantity_at(false, book.ask_price_ticks))
+    } else {
+        book.bid_quantity.max(book.ask_quantity)
+    };
+    let mid = (book.bid_price_ticks + book.ask_price_ticks) / 2;
+    let decision = decide_m9(
+        M9Input {
+            now_ms: timestamp_ms,
+            deadline_ms,
+            fair_value_ticks: crate::strategy::PriceTicks(fair_value.price.0),
+            mid_ticks: crate::strategy::PriceTicks(mid),
+            bid_ticks: crate::strategy::PriceTicks(book.bid_price_ticks),
+            ask_ticks: crate::strategy::PriceTicks(book.ask_price_ticks),
+            mark_ticks: crate::strategy::PriceTicks(mark),
+            index_ticks: crate::strategy::PriceTicks(index),
+            bid_quantity: book.bid_quantity,
+            ask_quantity: book.ask_quantity,
+            queue_ahead_quantity: queue_ahead,
+            position: state.position,
+            max_position,
+            requested_quantity: requested_quantity
+                .min(book.bid_quantity.max(1))
+                .min(book.ask_quantity.max(1)),
+            volatility_bps: state.ewma_abs_return_bps.saturating_mul(3),
+            spread_bps: state.ewma_spread_bps,
+            funding_carry_bps: state
+                .latest_funding_rate_e8
+                .map(|rate| -rate / 10_000)
+                .unwrap_or(0),
+            fee_bps: ppm_to_bps(fee_ppm.saturating_mul(2)),
+            markout_bps: pico_bps_to_bps(state.ewma_adverse_markout_pico_bps),
+            volatility_pico_bps: state.ewma_abs_return_pico_bps.saturating_mul(3),
+            spread_pico_bps: state.ewma_spread_pico_bps,
+            funding_carry_pico_bps: state
+                .latest_funding_rate_e8
+                .map(|rate| {
+                    ((-i128::from(rate) * i128::from(PICO_BPS_SCALE)) / 10_000)
+                        .clamp(i128::from(i64::MIN), i128::from(i64::MAX))
+                        as i64
+                })
+                .unwrap_or(0),
+            fee_pico_bps: ppm_to_pico_bps(fee_ppm.saturating_mul(2)),
+            markout_pico_bps: state.ewma_adverse_markout_pico_bps,
+            data_valid,
+            funding_valid,
+        },
+        M9Calibration::bootstrap(),
+    );
+    let reduce_only = matches!(decision.action, M9Action::ReduceBuy | M9Action::ReduceSell);
+    let intent = match decision.action {
+        M9Action::BuyMaker => Some(OrderIntent {
+            symbol: state.symbol_id,
+            side: Side::Buy,
+            price: book.bid_price_ticks,
+            quantity: decision.quantity,
+            post_only: true,
+        }),
+        M9Action::SellMaker => Some(OrderIntent {
+            symbol: state.symbol_id,
+            side: Side::Sell,
+            price: book.ask_price_ticks,
+            quantity: decision.quantity,
+            post_only: true,
+        }),
+        M9Action::ReduceBuy => Some(OrderIntent {
+            symbol: state.symbol_id,
+            side: Side::Buy,
+            price: book.bid_price_ticks,
+            quantity: decision.quantity,
+            post_only: true,
+        }),
+        M9Action::ReduceSell => Some(OrderIntent {
+            symbol: state.symbol_id,
+            side: Side::Sell,
+            price: book.ask_price_ticks,
+            quantity: decision.quantity,
+            post_only: true,
+        }),
+        M9Action::NoAction => None,
+    };
+    (intent, reduce_only, decision.reason)
+}
+
 pub fn event_time_ms(event: &BinanceMarketEvent) -> u64 {
     match event {
         BinanceMarketEvent::BookTicker(value) => value.event_time_ms,
@@ -2749,6 +2966,10 @@ fn m8_funding_decision(
             spread_bps: 0,
             model_uncertainty_bps: 0,
             liquidation_buffer_bps: 5,
+            volatility_pico_bps: 0,
+            spread_pico_bps: 0,
+            model_uncertainty_pico_bps: 0,
+            liquidation_buffer_pico_bps: 5 * PICO_BPS_SCALE,
         });
     };
     crate::m8::decide(crate::m8::M8Input {
@@ -2775,6 +2996,13 @@ fn m8_funding_decision(
             state.index_price_ticks.unwrap_or(0),
         ) / 2,
         liquidation_buffer_bps: 5,
+        volatility_pico_bps: state.ewma_abs_return_pico_bps.saturating_mul(3),
+        spread_pico_bps: state.ewma_spread_pico_bps,
+        model_uncertainty_pico_bps: bps_between_pico(
+            state.mark_price_ticks.unwrap_or(0),
+            state.index_price_ticks.unwrap_or(0),
+        ) / 2,
+        liquidation_buffer_pico_bps: 5 * PICO_BPS_SCALE,
     })
 }
 
@@ -2801,8 +3029,9 @@ fn entry_block_reason_for(
     risk_state: SimulationRiskState,
     threshold: Option<AdaptiveThreshold>,
     threshold_status: ThresholdStatus,
-    buy_edge_bps: Option<i64>,
-    sell_edge_bps: Option<i64>,
+    relief_pico_bps: i64,
+    buy_edge_pico_bps: Option<i64>,
+    sell_edge_pico_bps: Option<i64>,
 ) -> &'static str {
     match risk_state {
         SimulationRiskState::ReduceOnlyEquitySession => "equity_session_open",
@@ -2817,7 +3046,10 @@ fn entry_block_reason_for(
             if state.book.is_none() {
                 "quote_missing"
             } else {
-                let Some(required_bps) = threshold.and_then(AdaptiveThreshold::required_bps) else {
+                let Some(required_pico_bps) = threshold
+                    .and_then(AdaptiveThreshold::required_pico_bps)
+                    .map(|required| required.saturating_sub(relief_pico_bps.max(0)))
+                else {
                     return match threshold_status {
                         ThresholdStatus::WarmingUp => "threshold_warming_up",
                         ThresholdStatus::InsufficientData => "threshold_insufficient_data",
@@ -2826,8 +3058,9 @@ fn entry_block_reason_for(
                         ThresholdStatus::Ready => "threshold_unavailable",
                     };
                 };
-                let edge_reaches_threshold = buy_edge_bps.is_some_and(|edge| edge >= required_bps)
-                    || sell_edge_bps.is_some_and(|edge| edge >= required_bps);
+                let edge_reaches_threshold = buy_edge_pico_bps
+                    .is_some_and(|edge| edge >= required_pico_bps)
+                    || sell_edge_pico_bps.is_some_and(|edge| edge >= required_pico_bps);
                 if edge_reaches_threshold {
                     "signal_not_admissible"
                 } else {
@@ -2863,9 +3096,12 @@ fn data_quality_for(
     if gap > i128::from(max_mark_index_gap_bps) * i128::from(index) {
         return DataQualityStatus::Contradictory;
     }
-    if state.last_mark_received_at_ms == 0
-        || now_ms < state.last_mark_received_at_ms
-        || now_ms.saturating_sub(state.last_mark_received_at_ms) > 5_000
+    // Freshness is evaluated only on the exchange clock. Local receipt time
+    // can jump, be adjusted, or belong to another timezone and is therefore
+    // retained only for latency diagnostics.
+    if state.last_mark_time_ms == 0
+        || now_ms < state.last_mark_time_ms
+        || now_ms.saturating_sub(state.last_mark_time_ms) > 5_000
     {
         return DataQualityStatus::Stale;
     }
@@ -2875,32 +3111,40 @@ fn data_quality_for(
     DataQualityStatus::Fresh
 }
 
-fn edge_bps(numerator_price: i64, denominator_price: i64) -> Option<i64> {
+fn edge_pico_bps(numerator_price: i64, denominator_price: i64) -> Option<i64> {
     if numerator_price <= 0 || denominator_price <= 0 {
         return None;
     }
     Some(
-        ((i128::from(numerator_price) - i128::from(denominator_price)) * 10_000
+        ((i128::from(numerator_price) - i128::from(denominator_price))
+            * 10_000
+            * i128::from(PICO_BPS_SCALE)
             / i128::from(denominator_price))
         .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64,
     )
+}
+
+/// Compatibility diagnostic; admission uses edge_pico_bps directly.
+fn edge_micro_bps(numerator_price: i64, denominator_price: i64) -> Option<i64> {
+    edge_pico_bps(numerator_price, denominator_price).map(pico_bps_to_micro)
+}
+
+fn edge_bps(numerator_price: i64, denominator_price: i64) -> Option<i64> {
+    edge_pico_bps(numerator_price, denominator_price).map(pico_bps_to_bps)
 }
 
 fn fair_value_for_state(state: &SimulationSymbolState) -> Option<FairValueEstimate> {
     let book = state.book?;
     let index = state.index_price_ticks?;
     let mark = state.mark_price_ticks?;
-    let mid = book
-        .bid_price_ticks
-        .checked_add(book.ask_price_ticks)?
-        / 2;
-    FairValueEstimate::from_market(
+    let mid = book.bid_price_ticks.checked_add(book.ask_price_ticks)? / 2;
+    FairValueEstimate::from_market_precise(
         crate::strategy::PriceTicks(state.anchor.close_price_ticks),
         crate::strategy::PriceTicks(index),
         crate::strategy::PriceTicks(mark),
         crate::strategy::PriceTicks(mid),
-        state.ewma_abs_return_bps,
-        state.ewma_spread_bps,
+        state.ewma_abs_return_pico_bps,
+        state.ewma_spread_pico_bps,
     )
 }
 
@@ -2955,133 +3199,128 @@ fn dynamic_threshold_diagnostic_for(
             missing_component: Some("validated_components"),
         };
     }
-    let gap_bps = bps_between(mark, index);
+    let gap_pico_bps = edge_pico_bps(mark, index)
+        .map(|value| i128::from(value.unsigned_abs()))
+        .unwrap_or(i128::from(i64::MAX))
+        .min(i128::from(i64::MAX)) as i64;
     let prior_used = variant != SimulationPolicyVariant::M0Fixed
-        && (state.ewma_abs_return_micro_bps == 0 || state.ewma_spread_micro_bps == 0);
-    let volatility_bps = if state.ewma_abs_return_micro_bps == 0 {
-        THRESHOLD_PRIOR_VOLATILITY_BPS
+        && (state.ewma_abs_return_pico_bps == 0 || state.ewma_spread_pico_bps == 0);
+    let volatility_pico_bps = if state.ewma_abs_return_pico_bps == 0 {
+        THRESHOLD_PRIOR_VOLATILITY_PICO_BPS
     } else {
-        micro_bps_to_bps(state.ewma_abs_return_micro_bps.saturating_mul(3))
+        state.ewma_abs_return_pico_bps.saturating_mul(3)
     };
-    let cost_bps = ppm_to_bps(fee_ppm.saturating_mul(2));
-    let fair_value_confidence_bps = fair_value_for_state(state)
-        .map(|estimate| estimate.confidence_bps)
-        .unwrap_or(gap_bps);
-    let uncertainty_bps = gap_bps
-        .saturating_div(2)
-        .saturating_add(5)
-        .saturating_add(fair_value_confidence_bps.min(50));
-    let spread_bps = if state.ewma_spread_micro_bps == 0 {
-        THRESHOLD_PRIOR_SPREAD_BPS
-    } else {
-        micro_bps_to_bps(state.ewma_spread_micro_bps) / 2
-    };
-    let liquidity_bps =
-        liquidity_penalty_bps(requested_quantity, book.bid_quantity, book.ask_quantity);
-    let baseline_adverse_selection_bps = if variant.uses_microstructure() {
-        micro_bps_to_bps(state.ewma_abs_return_micro_bps.saturating_mul(2))
-    } else {
-        0
-    };
-    let fill_feedback_bps = if variant == SimulationPolicyVariant::M0Fixed {
-        0
-    } else {
-        micro_bps_to_bps(state.ewma_adverse_markout_micro_bps)
-    };
-    let adverse_selection_bps = baseline_adverse_selection_bps.saturating_add(fill_feedback_bps);
-    let statistical_bps = if variant.uses_statistical_term() {
-        micro_bps_to_bps(state.ewma_abs_return_micro_bps.saturating_mul(8))
-    } else {
-        0
-    };
-    let tail_risk_bps = if variant.uses_tail_guard() {
-        m5_tail_risk_bps(state)
-    } else {
-        0
-    };
-    let inventory_ratio_bps = if max_position > 0 {
-        (i128::from(state.position).abs() * 10_000 / i128::from(max_position)).clamp(0, 10_000)
-            as i64
-    } else {
-        10_000
-    };
-    let inventory_bps = ((i128::from(inventory_ratio_bps) * i128::from(inventory_ratio_bps))
-        / 1_000_000)
+    let cost_pico_bps = ppm_to_pico_bps(fee_ppm.saturating_mul(2));
+    let fair_value_confidence_pico_bps = fair_value_for_state(state)
+        .map(|estimate| {
+            i128::from(estimate.confidence_bps).saturating_mul(i128::from(PICO_BPS_SCALE))
+        })
+        .unwrap_or(i128::from(gap_pico_bps))
         .clamp(0, i128::from(i64::MAX)) as i64;
+    let uncertainty_pico_bps = (i128::from(gap_pico_bps) / 2
+        + 5 * i128::from(PICO_BPS_SCALE)
+        + i128::from(fair_value_confidence_pico_bps).min(50 * i128::from(PICO_BPS_SCALE)))
+    .clamp(0, i128::from(i64::MAX)) as i64;
+    let spread_pico_bps = if state.ewma_spread_pico_bps == 0 {
+        THRESHOLD_PRIOR_SPREAD_PICO_BPS
+    } else {
+        state.ewma_spread_pico_bps / 2
+    };
+    let liquidity_pico_bps =
+        liquidity_penalty_pico_bps(requested_quantity, book.bid_quantity, book.ask_quantity);
+    let baseline_adverse_selection_pico_bps = if variant.uses_microstructure() {
+        state.ewma_abs_return_pico_bps.saturating_mul(2)
+    } else {
+        0
+    };
+    let fill_feedback_pico_bps = if variant == SimulationPolicyVariant::M0Fixed {
+        0
+    } else {
+        state.ewma_adverse_markout_pico_bps
+    };
+    let adverse_selection_pico_bps =
+        baseline_adverse_selection_pico_bps.saturating_add(fill_feedback_pico_bps);
+    let statistical_pico_bps = if variant.uses_statistical_term() {
+        state.ewma_abs_return_pico_bps.saturating_mul(8)
+    } else {
+        0
+    };
+    let tail_risk_pico_bps = if variant.uses_tail_guard() {
+        m5_tail_risk_pico(state)
+    } else {
+        0
+    };
+    let inventory_pico_bps = if max_position > 0 {
+        let ratio_pico = i128::from(state.position).abs() * 10_000 * i128::from(PICO_BPS_SCALE)
+            / i128::from(max_position);
+        (ratio_pico.saturating_mul(ratio_pico) / (1_000_000_i128 * i128::from(PICO_BPS_SCALE)))
+            .clamp(0, i128::from(i64::MAX)) as i64
+    } else {
+        100 * PICO_BPS_SCALE
+    };
     let funding_remaining_ms = state.next_funding_time_ms.saturating_sub(timestamp_ms);
-    let deadline_risk_bps =
+    let deadline_risk_pico_bps =
         if state.next_funding_time_ms > timestamp_ms && state.latest_funding_rate_e8.is_some() {
             if funding_remaining_ms <= 10 * 60 * 1_000 {
-                50
+                50 * PICO_BPS_SCALE
             } else if funding_remaining_ms <= 30 * 60 * 1_000 {
-                25
+                25 * PICO_BPS_SCALE
             } else if funding_remaining_ms <= 60 * 60 * 1_000 {
-                10
+                10 * PICO_BPS_SCALE
             } else {
                 0
             }
         } else {
             0
         };
-    // All components are economic premiums. Normalize their lower bound here
-    // so one malformed adaptive sample cannot turn a valid market state into
-    // an unexplained threshold-unavailable block.
-    let floor_bps = floor_bps.max(0);
-    let volatility_bps = volatility_bps.max(0);
-    let cost_bps = cost_bps.max(0);
-    let uncertainty_bps = uncertainty_bps.max(0);
-    let deadline_risk_bps = deadline_risk_bps.max(0);
-    let spread_bps = spread_bps.max(0);
-    let adverse_selection_bps = adverse_selection_bps.max(0);
-    let liquidity_bps = liquidity_bps.max(0);
-    let inventory_bps = inventory_bps.max(0);
-    let statistical_bps = statistical_bps.max(0);
-    let tail_risk_bps = tail_risk_bps.max(0);
-    let threshold = AdaptiveThreshold::from_components(
-        floor_bps,
+    let floor_pico_bps = i128::from(floor_bps.max(0))
+        .saturating_mul(i128::from(PICO_BPS_SCALE))
+        .clamp(0, i128::from(i64::MAX)) as i64;
+    let threshold = AdaptiveThreshold::from_pico_components(
+        floor_pico_bps,
         if variant == SimulationPolicyVariant::M0Fixed {
             0
         } else {
-            volatility_bps
+            volatility_pico_bps
         },
         if variant == SimulationPolicyVariant::M0Fixed {
             0
         } else {
-            cost_bps
+            cost_pico_bps
         },
         if variant == SimulationPolicyVariant::M0Fixed {
             0
         } else {
-            uncertainty_bps
+            uncertainty_pico_bps
         },
         if variant == SimulationPolicyVariant::M0Fixed {
             0
         } else {
-            deadline_risk_bps
+            deadline_risk_pico_bps
         },
         if variant == SimulationPolicyVariant::M0Fixed {
             0
         } else {
-            5
+            5 * PICO_BPS_SCALE
         },
         if variant == SimulationPolicyVariant::M0Fixed {
             0
         } else {
-            spread_bps
+            spread_pico_bps
         },
-        adverse_selection_bps,
+        adverse_selection_pico_bps,
         if variant == SimulationPolicyVariant::M0Fixed {
             0
         } else {
-            liquidity_bps
+            liquidity_pico_bps
         },
         if variant == SimulationPolicyVariant::M0Fixed {
             0
         } else {
-            inventory_bps
+            inventory_pico_bps
         },
-        statistical_bps,
-        tail_risk_bps,
+        statistical_pico_bps,
+        tail_risk_pico_bps,
     );
     ThresholdDiagnostic {
         status: if threshold.is_some() {
@@ -3121,41 +3360,30 @@ fn dynamic_threshold_for(
 }
 
 fn scale_threshold_non_fee(threshold: AdaptiveThreshold, scale_ppm: i64) -> AdaptiveThreshold {
-    let scale = |value: i64| value.saturating_mul(scale_ppm.clamp(0, 1_000_000)) / 1_000_000;
-    AdaptiveThreshold {
-        floor_bps: scale(threshold.floor_bps),
-        residual_volatility_bps: scale(threshold.residual_volatility_bps),
-        cost_bps: threshold.cost_bps,
-        uncertainty_bps: scale(threshold.uncertainty_bps),
-        deadline_risk_bps: threshold.deadline_risk_bps,
-        safety_margin_bps: scale(threshold.safety_margin_bps),
-        spread_bps: scale(threshold.spread_bps),
-        adverse_selection_bps: scale(threshold.adverse_selection_bps),
-        liquidity_bps: scale(threshold.liquidity_bps),
-        inventory_bps: scale(threshold.inventory_bps),
-        statistical_bps: scale(threshold.statistical_bps),
-        tail_risk_bps: scale(threshold.tail_risk_bps),
-    }
-}
-
-fn apply_adaptive_relief(mut threshold: AdaptiveThreshold, relief_bps: i64) -> AdaptiveThreshold {
-    let relief = relief_bps.clamp(0, ADAPTIVE_RELIEF_MAX_BPS);
-    let reduce = |value: i64| value.saturating_sub(relief).max(0);
-    // Never reduce hard economic costs or deadline risk. The controller only
-    // removes empirically uncertain risk premium after repeated near misses.
-    threshold.residual_volatility_bps = reduce(threshold.residual_volatility_bps);
-    threshold.uncertainty_bps = reduce(threshold.uncertainty_bps);
-    threshold.safety_margin_bps = reduce(threshold.safety_margin_bps);
-    threshold.spread_bps = reduce(threshold.spread_bps);
-    threshold.adverse_selection_bps = reduce(threshold.adverse_selection_bps);
-    threshold.liquidity_bps = reduce(threshold.liquidity_bps);
-    threshold.inventory_bps = reduce(threshold.inventory_bps);
-    threshold.statistical_bps = reduce(threshold.statistical_bps);
-    threshold.tail_risk_bps = reduce(threshold.tail_risk_bps);
-    threshold
+    let scale = |value: i64| {
+        (i128::from(value) * i128::from(scale_ppm.clamp(0, 1_000_000)) / 1_000_000)
+            .clamp(0, i128::from(i64::MAX)) as i64
+    };
+    let values = threshold.components_pico_bps();
+    AdaptiveThreshold::from_pico_components(
+        scale(values[0]),
+        scale(values[1]),
+        values[2],
+        values[3].min(i64::MAX),
+        values[4],
+        scale(values[5]),
+        scale(values[6]),
+        scale(values[7]),
+        scale(values[8]),
+        scale(values[9]),
+        scale(values[10]),
+        scale(values[11]),
+    )
+    .expect("scaled threshold components are non-negative")
 }
 
 fn threshold_metrics(threshold: AdaptiveThreshold) -> ThresholdMetrics {
+    let exact = threshold.components_pico_bps();
     ThresholdMetrics {
         floor_bps: threshold.floor_bps,
         residual_volatility_bps: threshold.residual_volatility_bps,
@@ -3169,58 +3397,130 @@ fn threshold_metrics(threshold: AdaptiveThreshold) -> ThresholdMetrics {
         inventory_bps: threshold.inventory_bps,
         statistical_bps: threshold.statistical_bps,
         tail_risk_bps: threshold.tail_risk_bps,
+        floor_pico_bps: exact[0],
+        residual_volatility_pico_bps: exact[1],
+        cost_pico_bps: exact[2],
+        uncertainty_pico_bps: exact[3],
+        deadline_risk_pico_bps: exact[4],
+        safety_margin_pico_bps: exact[5],
+        spread_pico_bps: exact[6],
+        adverse_selection_pico_bps: exact[7],
+        liquidity_pico_bps: exact[8],
+        inventory_pico_bps: exact[9],
+        statistical_pico_bps: exact[10],
+        tail_risk_pico_bps: exact[11],
         required_bps: threshold.required_bps(),
+        required_pico_bps: threshold.required_pico_bps(),
+        required_micro_bps: threshold.required_micro_bps(),
     }
 }
 
-fn ewma_micro(previous: i64, sample: i64) -> i64 {
+fn ewma_scaled(previous: i64, sample: i64) -> i64 {
     if previous <= 0 {
         sample.max(0)
     } else {
         ((i128::from(previous) * i128::from(EWMA_PREVIOUS_WEIGHT_PPM)
             + i128::from(sample.max(0)) * i128::from(EWMA_SAMPLE_WEIGHT_PPM))
-            / i128::from(MICRO_BPS_SCALE))
+            / i128::from(1_000_000_i64))
         .clamp(0, i128::from(i64::MAX)) as i64
+    }
+}
+
+fn ewma_micro(previous: i64, sample: i64) -> i64 {
+    ewma_scaled(previous, sample)
+}
+
+fn pico_bps_to_micro(value: i64) -> i64 {
+    if value == 0 {
+        return 0;
+    }
+    let magnitude = i128::from(value.unsigned_abs());
+    let rounded = ((magnitude + i128::from(PICO_BPS_SCALE / MICRO_BPS_SCALE / 2))
+        / i128::from(PICO_BPS_SCALE / MICRO_BPS_SCALE))
+    .clamp(0, i128::from(i64::MAX)) as i64;
+    if value >= 0 {
+        rounded
+    } else {
+        rounded.saturating_neg()
+    }
+}
+
+fn pico_bps_to_bps(value: i64) -> i64 {
+    if value == 0 {
+        return 0;
+    }
+    let magnitude = i128::from(value.unsigned_abs());
+    let rounded = ((magnitude + i128::from(PICO_BPS_SCALE / 2)) / i128::from(PICO_BPS_SCALE))
+        .clamp(0, i128::from(i64::MAX)) as i64;
+    if value >= 0 {
+        rounded
+    } else {
+        rounded.saturating_neg()
     }
 }
 
 fn micro_bps_to_bps(value: i64) -> i64 {
-    if value <= 0 {
+    if value == 0 {
         return 0;
     }
-    ((i128::from(value) + i128::from(MICRO_BPS_SCALE / 2)) / i128::from(MICRO_BPS_SCALE))
-        .clamp(0, i128::from(i64::MAX)) as i64
+    let magnitude = i128::from(value.unsigned_abs());
+    let rounded = ((magnitude + i128::from(MICRO_BPS_SCALE / 2)) / i128::from(MICRO_BPS_SCALE))
+        .clamp(0, i128::from(i64::MAX)) as i64;
+    if value >= 0 {
+        rounded
+    } else {
+        rounded.saturating_neg()
+    }
+}
+
+fn ppm_to_pico_bps(ppm: i64) -> i64 {
+    if ppm <= 0 {
+        return 0;
+    }
+    (i128::from(ppm) * i128::from(PICO_BPS_SCALE) / 100).clamp(0, i128::from(i64::MAX)) as i64
 }
 
 fn bps_between(left: i64, right: i64) -> i64 {
-    if left <= 0 || right <= 0 {
-        return i64::MAX;
-    }
-    (((i128::from(left) - i128::from(right)).abs() * 10_000) / i128::from(right))
-        .clamp(0, i128::from(i64::MAX)) as i64
+    edge_pico_bps(left, right)
+        .map(pico_bps_to_bps)
+        .unwrap_or(i64::MAX)
+}
+
+fn bps_between_pico(left: i64, right: i64) -> i64 {
+    edge_pico_bps(left, right)
+        .map(|value| i128::from(value.unsigned_abs()).min(i128::from(i64::MAX)) as i64)
+        .unwrap_or(i64::MAX)
 }
 
 const M5_TAIL_CAUTION_BPS: i64 = 35;
 const M5_TAIL_REDUCE_ONLY_BPS: i64 = 60;
 const M5_TAIL_HALT_BPS: i64 = 100;
 
-fn m5_tail_stress_bps(state: &SimulationSymbolState) -> i64 {
-    let volatility = micro_bps_to_bps(state.ewma_abs_return_micro_bps.saturating_mul(4));
+fn m5_tail_stress_pico(state: &SimulationSymbolState) -> i64 {
+    let volatility = state.ewma_abs_return_pico_bps.saturating_mul(4);
     let mark_index = match (state.mark_price_ticks, state.index_price_ticks) {
-        (Some(mark), Some(index)) => bps_between(mark, index).saturating_mul(2),
+        (Some(mark), Some(index)) => bps_between_pico(mark, index).saturating_mul(2),
         _ => i64::MAX,
     };
-    let spread = micro_bps_to_bps(state.ewma_spread_micro_bps.saturating_mul(4));
+    let spread = state.ewma_spread_pico_bps.saturating_mul(4);
     volatility.max(mark_index).max(spread)
 }
 
-fn m5_tail_risk_bps(state: &SimulationSymbolState) -> i64 {
+fn m5_tail_stress_bps(state: &SimulationSymbolState) -> i64 {
+    pico_bps_to_bps(m5_tail_stress_pico(state))
+}
+
+fn m5_tail_risk_pico(state: &SimulationSymbolState) -> i64 {
     // Keep the tail premium finite. A halted quote is a risk decision, not an
     // arithmetic failure; the signal remains explainable as a large hurdle.
-    m5_tail_stress_bps(state)
-        .saturating_sub(M5_TAIL_CAUTION_BPS)
+    m5_tail_stress_pico(state)
+        .saturating_sub(M5_TAIL_CAUTION_BPS.saturating_mul(PICO_BPS_SCALE))
         .saturating_mul(2)
-        .min(10_000)
+        .min(10_000 * PICO_BPS_SCALE)
+}
+
+fn m5_tail_risk_bps(state: &SimulationSymbolState) -> i64 {
+    pico_bps_to_bps(m5_tail_risk_pico(state))
 }
 
 fn m5_quote_quantity(state: &SimulationSymbolState, requested_quantity: i64) -> i64 {
@@ -3236,19 +3536,20 @@ fn m5_tail_reduce_only(state: &SimulationSymbolState) -> bool {
     m5_tail_stress_bps(state) >= M5_TAIL_REDUCE_ONLY_BPS
 }
 
-fn m7_entry_admissible(state: &SimulationSymbolState, threshold_bps: i64) -> bool {
+fn m7_entry_admissible(state: &SimulationSymbolState, threshold_pico_bps: i64) -> bool {
     let Some(book) = state.book else {
         return false;
     };
     let mid = book.bid_price_ticks.saturating_add(book.ask_price_ticks) / 2;
-    if mid <= 0 || state.anchor.close_price_ticks <= 0 || threshold_bps <= 0 {
+    if mid <= 0 || state.anchor.close_price_ticks <= 0 || threshold_pico_bps <= 0 {
         return false;
     }
-    let residual_bps = bps_between(mid, state.anchor.close_price_ticks).abs();
+    let residual_pico_bps = bps_between_pico(mid, state.anchor.close_price_ticks);
     // M7 treats very large residuals under elevated stress as repricing,
     // not a free mean-reversion edge, while preserving ordinary opportunities.
-    residual_bps >= threshold_bps
-        && !(residual_bps >= 500 && m5_tail_stress_bps(state) >= M5_TAIL_CAUTION_BPS)
+    residual_pico_bps >= threshold_pico_bps
+        && !(residual_pico_bps >= 500 * PICO_BPS_SCALE
+            && m5_tail_stress_pico(state) >= M5_TAIL_CAUTION_BPS * PICO_BPS_SCALE)
 }
 
 fn ppm_to_bps(ppm: i64) -> i64 {
@@ -3258,38 +3559,64 @@ fn ppm_to_bps(ppm: i64) -> i64 {
     ((i128::from(ppm) + 99) / 100).clamp(0, i128::from(i64::MAX)) as i64
 }
 
-fn liquidity_penalty_bps(quantity: i64, bid_quantity: i64, ask_quantity: i64) -> i64 {
+fn liquidity_adjusted_quantity(
+    requested_quantity: i64,
+    bid_quantity: i64,
+    ask_quantity: i64,
+) -> i64 {
+    if requested_quantity <= 0 || bid_quantity <= 0 || ask_quantity <= 0 {
+        return 0;
+    }
+    let depth = bid_quantity.min(ask_quantity);
+    // Never request more than the executable side of the current book.
+    // Participation risk is priced continuously below; this cap preserves the
+    // configured quantity when the book can actually support it.
+    requested_quantity.min(depth).max(1)
+}
+
+fn liquidity_ratio_pico_bps(quantity: i64, bid_quantity: i64, ask_quantity: i64) -> i64 {
     if quantity <= 0 || bid_quantity <= 0 || ask_quantity <= 0 {
-        // Invalid executable size is handled by the execution gate. Keep the
-        // diagnostic threshold finite so the block reason remains explicit.
-        return 10_000;
+        return 10_000 * PICO_BPS_SCALE;
     }
-    let worst_depth = bid_quantity.min(ask_quantity);
-    if quantity > worst_depth {
-        100
-    } else if i128::from(quantity) * 2 > i128::from(worst_depth) {
-        25
-    } else if i128::from(quantity) * 10 > i128::from(worst_depth) {
-        10
-    } else {
+    let depth = bid_quantity.min(ask_quantity);
+    (i128::from(quantity).max(0) * 10_000 * i128::from(PICO_BPS_SCALE) / i128::from(depth))
+        .clamp(0, 10_000 * i128::from(PICO_BPS_SCALE)) as i64
+}
+
+fn liquidity_ratio_bps(quantity: i64, bid_quantity: i64, ask_quantity: i64) -> i64 {
+    pico_bps_to_bps(liquidity_ratio_pico_bps(
+        quantity,
+        bid_quantity,
+        ask_quantity,
+    ))
+}
+
+fn liquidity_penalty_pico_bps(quantity: i64, bid_quantity: i64, ask_quantity: i64) -> i64 {
+    let participation_pico_bps = liquidity_ratio_pico_bps(quantity, bid_quantity, ask_quantity);
+    if participation_pico_bps <= 1_000 * PICO_BPS_SCALE {
         0
+    } else {
+        ((participation_pico_bps - 1_000 * PICO_BPS_SCALE) * 6 / 1_000)
+            .clamp(0, 100 * PICO_BPS_SCALE)
     }
+}
+
+fn liquidity_penalty_bps(quantity: i64, bid_quantity: i64, ask_quantity: i64) -> i64 {
+    pico_bps_to_bps(liquidity_penalty_pico_bps(
+        quantity,
+        bid_quantity,
+        ask_quantity,
+    ))
 }
 
 fn fill_probability_bps(quantity: i64, bid_quantity: i64, ask_quantity: i64) -> u16 {
     if quantity <= 0 || bid_quantity <= 0 || ask_quantity <= 0 {
         return 0;
     }
-    let depth = bid_quantity.min(ask_quantity);
-    if i128::from(quantity) * 10 <= i128::from(depth) {
-        8_000
-    } else if i128::from(quantity) * 2 <= i128::from(depth) {
-        6_000
-    } else if quantity <= depth {
-        4_000
-    } else {
-        2_000
-    }
+    let participation_bps = liquidity_ratio_bps(quantity, bid_quantity, ask_quantity);
+    // This is an explicitly conservative top-of-book proxy. It is not claimed
+    // to be a calibrated fill hazard until completed fills are observed.
+    (10_000_i64 - participation_bps * 8 / 10).clamp(500, 9_500) as u16
 }
 
 fn local_day(timestamp_ms: u64) -> u64 {
@@ -4727,12 +5054,53 @@ mod tests {
     #[test]
     fn adaptive_relief_never_removes_hard_cost_or_deadline_risk() {
         let base = AdaptiveThreshold::from_components(5, 4, 3, 2, 7, 6, 5, 4, 3, 2, 8, 1).unwrap();
-        let relaxed = apply_adaptive_relief(base, 3);
-        assert_eq!(relaxed.floor_bps, base.floor_bps);
-        assert_eq!(relaxed.cost_bps, base.cost_bps);
-        assert_eq!(relaxed.deadline_risk_bps, base.deadline_risk_bps);
-        assert_eq!(relaxed.uncertainty_bps, 0);
-        assert!(relaxed.required_bps().unwrap() < base.required_bps().unwrap());
+        let hard_cost_micro =
+            (base.floor_bps + base.cost_bps + base.deadline_risk_bps) * MICRO_BPS_SCALE;
+        let relaxed_required = base
+            .required_micro_bps()
+            .unwrap()
+            .saturating_sub(3 * MICRO_BPS_SCALE);
+        assert!(relaxed_required >= hard_cost_micro);
+        assert!(relaxed_required < base.required_micro_bps().unwrap());
+    }
+
+    #[test]
+    fn edge_micro_bps_preserves_fractional_basis_points() {
+        let edge = edge_micro_bps(100_001, 100_000).unwrap();
+        assert_eq!(edge, 100_000);
+        assert_eq!(micro_bps_to_bps(edge), 0);
+        assert!(edge_micro_bps(100_000, 100_001).unwrap() < 0);
+    }
+
+    #[test]
+    fn exchange_clock_freshness_ignores_local_receipt_clock() {
+        let mut engine = engine();
+        let mark = parse_market_message(
+            br#"{"e":"markPriceUpdate","E":100,"s":"CXMTUSDT","p":"100","i":"100","T":600000,"r":"0"}"#,
+            0,
+            0,
+        )
+        .unwrap();
+        engine.on_event_at_ref(&mark, 1_000_000);
+        let book = parse_market_message(
+            br#"{"e":"bookTicker","u":1,"E":200,"T":200,"s":"CXMTUSDT","b":"98","B":"100","a":"99","A":"100"}"#,
+            0,
+            0,
+        )
+        .unwrap();
+        engine.on_event_at_ref(&book, 1);
+        let metrics = engine.metrics_snapshot(200, 1).symbols[0].clone();
+        assert_eq!(metrics.data_quality, DataQualityStatus::Fresh);
+        assert_eq!(metrics.mark_age_ms, Some(100));
+    }
+
+    #[test]
+    fn liquidity_controls_are_continuous_and_monotonic() {
+        assert_eq!(liquidity_ratio_bps(10, 100, 100), 1_000);
+        assert_eq!(liquidity_penalty_bps(10, 100, 100), 0);
+        assert!(liquidity_penalty_bps(50, 100, 100) > liquidity_penalty_bps(25, 100, 100));
+        assert!(fill_probability_bps(10, 100, 100) > fill_probability_bps(50, 100, 100));
+        assert_eq!(liquidity_adjusted_quantity(100, 100, 100), 100);
     }
 
     #[test]

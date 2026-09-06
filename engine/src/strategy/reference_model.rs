@@ -2,6 +2,9 @@
 use super::PriceTicks;
 
 pub const PPM_SCALE: i128 = 1_000_000;
+/// One pico-bps is 1e-12 bps. This is the highest useful fixed decimal
+/// resolution while prices remain represented in 1e-8 quote-currency ticks.
+pub const PICO_BPS_SCALE: i128 = 1_000_000_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReferenceQuality {
@@ -109,6 +112,8 @@ pub struct FairValueEstimate {
     pub confidence_bps: i64,
     pub dispersion_bps: i64,
     pub regime: FairValueRegime,
+    pub confidence_pico_bps: i64,
+    pub dispersion_pico_bps: i64,
 }
 
 impl FairValueEstimate {
@@ -120,18 +125,50 @@ impl FairValueEstimate {
         volatility_bps: i64,
         spread_bps: i64,
     ) -> Option<Self> {
-        if [anchor.0, index.0, mark.0, mid.0].iter().any(|value| *value <= 0) {
+        Self::from_market_precise(
+            anchor,
+            index,
+            mark,
+            mid,
+            volatility_bps.max(0).saturating_mul(PICO_BPS_SCALE as i64),
+            spread_bps.max(0).saturating_mul(PICO_BPS_SCALE as i64),
+        )
+    }
+
+    pub fn from_market_precise(
+        anchor: PriceTicks,
+        index: PriceTicks,
+        mark: PriceTicks,
+        mid: PriceTicks,
+        volatility_pico_bps: i64,
+        spread_pico_bps: i64,
+    ) -> Option<Self> {
+        if [anchor.0, index.0, mark.0, mid.0]
+            .iter()
+            .any(|value| *value <= 0)
+            || volatility_pico_bps < 0
+            || spread_pico_bps < 0
+        {
             return None;
         }
-        let index_gap = distance_bps(index.0, anchor.0);
-        let mark_gap = distance_bps(mark.0, index.0);
-        let mid_gap = distance_bps(mid.0, mark.0);
-        let dispersion_bps = index_gap.max(mark_gap).max(mid_gap);
-        let regime = if dispersion_bps >= 100 || volatility_bps >= 75 {
+        let index_gap = distance_pico_bps(index.0, anchor.0);
+        let mark_gap = distance_pico_bps(mark.0, index.0);
+        let mid_gap = distance_pico_bps(mid.0, mark.0);
+        let dispersion_pico_bps = index_gap.max(mark_gap).max(mid_gap);
+        let dispersion_bps = ((i128::from(dispersion_pico_bps) + PICO_BPS_SCALE / 2)
+            / PICO_BPS_SCALE)
+            .clamp(0, i128::from(i64::MAX)) as i64;
+        let regime = if i128::from(dispersion_pico_bps) >= 100 * PICO_BPS_SCALE
+            || i128::from(volatility_pico_bps) >= 75 * PICO_BPS_SCALE
+        {
             FairValueRegime::Dislocated
-        } else if dispersion_bps >= 50 || volatility_bps >= 35 {
+        } else if i128::from(dispersion_pico_bps) >= 50 * PICO_BPS_SCALE
+            || i128::from(volatility_pico_bps) >= 35 * PICO_BPS_SCALE
+        {
             FairValueRegime::Stressed
-        } else if dispersion_bps <= 5 && volatility_bps <= 8 {
+        } else if i128::from(dispersion_pico_bps) <= 5 * PICO_BPS_SCALE
+            && i128::from(volatility_pico_bps) <= 8 * PICO_BPS_SCALE
+        {
             FairValueRegime::Calm
         } else {
             FairValueRegime::Normal
@@ -149,21 +186,25 @@ impl FairValueEstimate {
         if price <= 0 || price > i128::from(i64::MAX) {
             return None;
         }
-        let confidence_bps = dispersion_bps
-            .saturating_add(volatility_bps.max(0))
-            .saturating_add(spread_bps.max(0) / 2)
-            .clamp(0, i64::MAX);
+        let confidence_pico_bps = dispersion_pico_bps
+            .saturating_add(volatility_pico_bps)
+            .saturating_add(spread_pico_bps / 2);
+        let confidence_bps = ((i128::from(confidence_pico_bps) + PICO_BPS_SCALE / 2)
+            / PICO_BPS_SCALE)
+            .clamp(0, i128::from(i64::MAX)) as i64;
         Some(Self {
             price: PriceTicks(price as i64),
             confidence_bps,
             dispersion_bps,
             regime,
+            confidence_pico_bps,
+            dispersion_pico_bps,
         })
     }
 }
 
-fn distance_bps(left: i64, right: i64) -> i64 {
-    (((i128::from(left) - i128::from(right)).abs() * 10_000)
+fn distance_pico_bps(left: i64, right: i64) -> i64 {
+    (((i128::from(left) - i128::from(right)).abs() * 10_000 * PICO_BPS_SCALE)
         / i128::from(right.max(1)))
     .clamp(0, i128::from(i64::MAX)) as i64
 }
@@ -281,5 +322,21 @@ mod tests {
         .unwrap();
         assert_eq!(estimate.regime, FairValueRegime::Calm);
         assert!(estimate.confidence_bps < 10);
+    }
+
+    #[test]
+    fn precise_fair_value_preserves_one_price_tick_below_one_bps() {
+        let estimate = FairValueEstimate::from_market_precise(
+            PriceTicks(1_000_000_000),
+            PriceTicks(1_000_000_001),
+            PriceTicks(1_000_000_001),
+            PriceTicks(1_000_000_001),
+            1,
+            1,
+        )
+        .unwrap();
+        assert_eq!(estimate.dispersion_pico_bps, 10_000_000);
+        assert_eq!(estimate.dispersion_bps, 0);
+        assert_eq!(estimate.regime, FairValueRegime::Calm);
     }
 }

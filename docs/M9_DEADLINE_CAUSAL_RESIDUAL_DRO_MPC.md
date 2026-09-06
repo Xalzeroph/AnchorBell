@@ -2,10 +2,18 @@
 
 > 英文名：M9 Deadline-Constrained Causal Residual, Joint Fill–Return, Distributionally Robust Model Predictive Control（M9-DCR-DRO-MPC）
 
-- 状态：**设计冻结；尚未实现；尚未回测；尚未获得实盘授权**
+- 状态：**M9 策略层已实现并接入可选模拟计划；尚未完成校准、外样本验证或任何新增实盘授权**
+- 深化规格：[M9_V2_MATHEMATICAL_EXECUTION_SPEC.md](M9_V2_MATHEMATICAL_EXECUTION_SPEC.md)。v2 对会计、可成交价格、安全回退、统计和求解器的修订优先于 v1；版本冻结不等于参数已校准。
 - 谱系：M9 是 M8 的严格子策略，继承 M8 的全部不可变合同和资金费控制。
 - 目标：在真实 Binance 合约、成交、费用、资金费、延迟、盘口和期限退出约束下，最大化可验证的全生命周期扣费后增长。
 - 非目标：不以“产生更多订单”、短窗未实现收益或单次最佳回测为优化目标。
+
+### 当前代码实现边界
+
+- 策略实现：`engine/src/strategy/m9.rs`；当前使用显式版本化的保守 bootstrap prior，尚未用历史成交数据校准。
+- 模拟接入：`SimulationPolicyVariant::M9DeadlineCausalDroMpc` 与 `ExperimentPlan::m1_to_m9()`；批量入口默认仍是 M1–M8，只有 `--include-m9` 才启用 M9。
+- 当前实现提供确定性有限期限残差、Null-RW 折扣、保守成交下界、退出容量和 maker-only 动作；联合 hazard、完整 DRO 场景库、在线校准和外样本证书仍属于后续验证工作。
+- 代码接入或单元测试通过，不等于策略已证明盈利，也不改变任何实盘授权。
 
 ## 1. 结论与诚实边界
 
@@ -37,7 +45,7 @@ M8 已有资金费感知、稳健半径、CVaR、库存控制和候选报价。M
 | 策略边界 | 只读 DecisionContext，只输出 OrderIntent/ExitPlan | 公平价值、残差、动作评分 |
 | 证据 | 运行、数据、代码、参数 digest；训练/验证/锁箱边界 | 在线后验，仅使用当时可见数据 |
 
-不可变核心只能通过新 schema/新版本升级，不能在运行中被策略修改。策略不得直接生成成交、写余额、写仓位、修改交易所规则或读取未来事件。
+不可变的是核心语义和历史记录，不是永远沿用启动时的交易所规则值。规则变化以带 valid-time/known-at 的版本事件进入核心并触发模型失效/切换；未知新规则下停止新增风险。策略不得直接生成成交、写余额、写仓位、修改规则真相或读取未来事件。
 
 正常 M9 严格 maker-only。任何主动减仓只能属于独立、预注册、人工批准的 EmergencyExecutionPolicy；它不是 M9 的隐藏分支，也不得在回测中偷偷启用。
 
@@ -67,7 +75,7 @@ $L_t^{-self}$ 是剔除自身挂单影响后的盘口视图。训练标签可以
 
 ## 6. 统一潜在公平价值与残差
 
-令 $a_t=\log A_t^{contract}$，$p_t$ 为可执行微价格而非不可成交的理论中价。分解：
+令 $a_t=\log A_t^{contract}$，$p_t=\log P_t^{ref}$ 为统一对数参考价格。mid/microprice 都只是估计特征，不保证可成交；收益必须用逐笔成交价和数量相关的 bid/ask VWAP 计算。分解：
 
 $$
 p_t-a_t=n_t+u_t,\qquad n_t=f_t-a_t,\qquad u_t=p_t-f_t.
@@ -139,19 +147,19 @@ $$
 
 ## 8. 全生命周期净收益定义
 
-对路径 $\omega$，动作的净现金收益为：
+对路径 $\omega$，永续合约收益由合同化会计给出，而非现货全额买卖现金流：
 
 $$
-\Pi_T(\omega)=\sum_k s_k q_k p_k+Funding_T-Fees_T-CancelCost_T-LiquidationCost_T+V_T^{residual},
+\Pi_{t:T}=\Delta RP+\Delta UP+Funding-Fees+Adjustments,
 $$
 
-其中 $s_k=+1$ 表示卖出、$s_k=-1$ 表示买入；$V_T^{residual}$ 必须按期限末可执行清算价格和冲击计价，不能使用乐观 mid。只有完整闭环且会计对账成功的 realized PnL 才能成为收益证据。
+RP/UP 是已实现/未实现损益，外部出入金从业绩中剔除。线性合约每笔闭仓损益为方向乘闭仓数量乘合约乘数乘退出/入场价差；Quanto 必须调用独立 payoff 合同。未成交的假想退出不能写 RP，退出冲击已进入成交价时不得重复扣除。完整会话净权益路径包含全部未闭仓/失败退出；闭环 realized PnL 单独报告，不能只筛选成功闭环样本。详见 v2 §3。
 
 strategy_pnl 必须明确定义为相对冻结基准的执行增益或残差捕获，不能把市场方向收益、未实现收益或 mark-to-fill 差额重命名为 alpha。
 
 ## 9. 候选动作与期限控制
 
-每次决策生成有限、确定性的候选集：NO_ACTION、KEEP、CANCEL、各合法 tick 的 maker quote、离散仓位尺寸、不同 TTL 和 ExitPlan。NO_ACTION 必须始终存在，且在证据不足、求解超时或安全证书失败时成为默认动作。
+每次决策生成有限、确定性的候选集：NO_ACTION、KEEP、CANCEL、各合法 tick 的 maker quote、离散仓位尺寸、不同 TTL 和 ExitPlan。NO_ACTION 必须始终存在，但只有在空仓、无未确认风险订单时才可作为安全默认；已有库存或挂单时调用独立 SafetySupervisor，执行已授权撤单、maker 减仓与对账，无法执行则显式记录风险。
 
 每个新仓动作必须同时创建退出计划：最迟开始退出时刻、目标库存轨迹、可接受队列等待、撤改单规则、资金费边界、开盘/维护前的残余库存上限。没有可行 ExitPlan 的 entry 不是候选动作。
 
@@ -198,7 +206,7 @@ M9 不把所有目标粗暴压成一个可被权重钻空子的分数，按以�
 4. L3 在 L0–L2 可行集中最大化最坏情形期望对数增长；
 5. L4 同值时选择换手更低、订单更持久、解释更简单的动作。
 
-完整 POMDP 不宣称可全局精确求解。工程上使用有限动作、有限场景、短视界滚动优化；线性/二阶锥可表达部分用确定性 LP/SOCP，离散选择用有界 MISOCP。每次输出 incumbent、上下界 gap、耗时和 RobustRiskCertificate。
+完整 POMDP 不宣称可全局精确求解。初版对有限反馈策略枚举，再以有限场景概率多面体上的 LP 计算鲁棒价值/CVaR；连续对数增长涉及指数锥，不能笼统声称 MISOCP 精确求解。二次近似须给误差界。每次输出候选域、价值下界、可用上界、耗时和条件性 RobustRiskCertificate；无上界时 gap 标 unavailable。
 
 超时、数值异常或无可行解时不得返回未经认证的“近似最优”订单，只能复用仍有效的安全 incumbent、KEEP、CANCEL、NO_ACTION 或 reduce-risk。
 
@@ -433,9 +441,9 @@ M9 只有在代码、测试、数据、校准和 X0–X6 证据全部完成后�
    https://www.binance.com/en/support/announcement/detail/53bfc17634f54f2f90666dbc396f5cee
 3. Binance，Quanto Contracts：本币报价、USDT 结算的合约语义。
    https://www.binance.com/en/support/announcement/detail/18724cba64a048938986a98bbb257258
-4. Fabre & Ragel, Optimal Quoting under Adverse Selection and Price Reading：信息风险、库存与报价控制。
+4. Barzykin, Bergault, Guéant & Lemmel, Optimal Quoting under Adverse Selection and Price Reading：信息风险、库存与报价控制。
    https://arxiv.org/html/2508.20225v1
-5. Shi & Cartlidge, MDQR：跨档位依赖、订单尺寸和深度队列反应建模。
+5. Bodor & Carlier, MDQR：跨档位依赖、订单尺寸和深度队列反应建模。
    https://arxiv.org/html/2501.08822v1
 6. Market Simulation under Adverse Selection：价格与订单流独立模拟会夸大短期表现。
    https://arxiv.org/html/2409.12721v1
@@ -452,7 +460,7 @@ M9 只有在代码、测试、数据、校准和 X0–X6 证据全部完成后�
     https://www.davidhbailey.com/dhbpapers/deflated-sharpe.pdf
 12. Howard et al.，Time-uniform, nonparametric, nonasymptotic confidence sequences：任意停止下的时间一致推断。
     https://arxiv.org/html/1810.08240v9
-13. Ackerer et al.，Fundamentals of Perpetual Futures：永续合约、资金费与非必然收敛边界。
+13. He, Manela, Ross & von Wachter，Fundamentals of Perpetual Futures：永续合约、资金费与非必然收敛边界。
     https://arxiv.org/abs/2212.06888
 
 ## 24. 最终决策规则
@@ -466,6 +474,6 @@ M9 只有在代码、测试、数据、校准和 X0–X6 证据全部完成后�
 5. 在全部不确定分布内，CVaR、回撤、margin、集中度和残余库存是否合格？
 6. 求解器是否在预算内给出可复现的安全证书？
 
-任一答案为否，选择 NO_ACTION、CANCEL 或 reduce-risk。全部为是，才执行证据收缩后尺寸最小的合格 maker intent。
+任一答案为否，拒绝新增风险并由 SafetySupervisor 处理既有库存/订单。全部为是，在可行候选中选择鲁棒目标最大的 maker intent；仅在目标值处于数值等价容差内时优先较低风险、较小尺寸，而非一律选最小单。
 
 这就是 M9 的完整原则：**先证明这笔交易在真实生命周期中值得存在，再讨论它能赚多少。**
