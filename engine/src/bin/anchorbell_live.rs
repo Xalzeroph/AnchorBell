@@ -444,7 +444,13 @@ async fn run(args: Args) -> Result<i32, String> {
                             anchors.get(symbol).expect("validated anchor").close_price_ticks,
                             &args,
                         ) else { continue };
-                        match supervisor.evaluate(symbol, intent, now) {
+                        let (gate_decision, decision_audit) =
+                            supervisor.evaluate_with_audit(symbol, intent, now);
+                        println!("{}", serde_json::json!({
+                            "event": "decision_audit",
+                            "decision": decision_audit,
+                        }));
+                        match gate_decision {
                             GateDecision::Allow => {
                                 if args.send_orders && !working.contains_key(symbol) {
                                     order_sequence = order_sequence.saturating_add(1);

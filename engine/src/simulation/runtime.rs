@@ -31,6 +31,7 @@ use crate::{
         BinanceC2cFxClient, BinanceC2cFxPoller, BinanceMarketConfig, BinanceMarketFeed,
         BinanceMarketStream, FxPollerConfig, FxUpdate, PublicMarketMetadataClient, ReconnectPolicy,
     },
+    observability::{DecisionAudit, DecisionGateAudit, DECISION_AUDIT_SCHEMA_VERSION},
     orderbook::LocalOrderBook,
     risk::evaluate_funding_overlay,
     runtime::{
@@ -611,6 +612,8 @@ struct PendingMarkout {
 #[derive(Debug, Clone, Copy)]
 struct WorkingOrder {
     client_id: u64,
+    /// Stable decision that authorized this order; propagated to fills/cancels.
+    decision_id: Option<u64>,
     side: Side,
     price_ticks: i64,
     remaining_quantity: i64,
@@ -674,6 +677,9 @@ struct SimulationSymbolState {
 #[derive(Debug, Clone, Serialize)]
 pub struct SimulationRecord {
     pub timestamp_ms: u64,
+    pub exchange_event_time_ms: u64,
+    pub received_at_ms: u64,
+    pub decision_id: Option<u64>,
     /// Self-describing ledger tag for multi-strategy multi-policy executions.
     pub strategy_variant: String,
     pub kind: String,
@@ -701,10 +707,13 @@ pub struct SimulationRecord {
     pub net_pnl_ticks: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_audit: Option<DecisionAudit>,
 }
 
 struct RecordFields<'a> {
     kind: &'a str,
+    decision_id: Option<u64>,
     client_id: Option<u64>,
     side: Option<Side>,
     price_ticks: Option<i64>,
@@ -1026,6 +1035,7 @@ pub struct SimulationEngine {
     capital_usdt_ticks: Option<i64>,
     states: BTreeMap<String, SimulationSymbolState>,
     next_client_id: u64,
+    next_decision_id: u64,
     event_count: u64,
     order_count: u64,
     fill_count: u64,
@@ -1146,6 +1156,7 @@ impl SimulationEngine {
             capital_usdt_ticks: None,
             states,
             next_client_id: 1,
+            next_decision_id: 1,
             event_count: 0,
             order_count: 0,
             fill_count: 0,
@@ -1302,6 +1313,7 @@ impl SimulationEngine {
                 timestamp_ms,
                 RecordFields {
                     kind: "order_canceled",
+                    decision_id: order.decision_id,
                     client_id: Some(order.client_id),
                     side: Some(order.side),
                     price_ticks: Some(order.price_ticks),
@@ -1425,6 +1437,7 @@ impl SimulationEngine {
                     timestamp_ms,
                     RecordFields {
                         kind: "capital_rebalance",
+                        decision_id: None,
                         client_id: None,
                         side: None,
                         price_ticks: state.mark_price_ticks,
@@ -1506,7 +1519,7 @@ impl SimulationEngine {
                 post_only: true,
             });
             if let Some(intent) = desired {
-                records.extend(self.place_symbol(&symbol, intent, timestamp_ms, true));
+                records.extend(self.place_symbol(&symbol, intent, timestamp_ms, true, None));
             } else {
                 let state = self.states.get(&symbol).expect("symbol state exists");
                 records.push(self.record(
@@ -1515,6 +1528,7 @@ impl SimulationEngine {
                     timestamp_ms,
                     RecordFields {
                         kind: "flatten_unavailable",
+                        decision_id: None,
                         client_id: None,
                         side: None,
                         price_ticks: None,
@@ -2119,6 +2133,7 @@ impl SimulationEngine {
                 mark.event_time_ms,
                 RecordFields {
                     kind: "funding_settlement",
+                    decision_id: None,
                     client_id: None,
                     side: None,
                     price_ticks: Some(mark.mark_price.0),
@@ -2258,6 +2273,7 @@ impl SimulationEngine {
             trade.trade_time_ms.max(trade.event_time_ms),
             RecordFields {
                 kind: "fill",
+                decision_id: order.decision_id,
                 client_id: Some(order.client_id),
                 side: Some(order.side),
                 price_ticks: Some(order.price_ticks),
@@ -2359,6 +2375,8 @@ impl SimulationEngine {
     }
 
     fn rebalance_symbol(&mut self, symbol: &str, timestamp_ms: u64) -> Vec<SimulationRecord> {
+        let decision_id = self.next_decision_id;
+        self.next_decision_id = self.next_decision_id.saturating_add(1);
         let allocation = self.position_allocations.get(symbol);
         let max_position = allocation
             .map(|allocation| allocation.max_position)
@@ -2373,7 +2391,7 @@ impl SimulationEngine {
             max_position,
             requested_quantity,
         );
-        let (desired, reduce_only, has_working) = {
+        let (desired, reduce_only, has_working, decision_reason) = {
             let state = self.states.get(symbol).expect("symbol state exists");
             let Some(book) = state.book else {
                 return Vec::new();
@@ -2424,7 +2442,18 @@ impl SimulationEngine {
             if !entries_allowed || tail_reduce_only {
                 let should_reduce = !session_allowed || funding_reduce_only || tail_reduce_only;
                 if !should_reduce {
-                    (None, true, state.working.is_some())
+                    (
+                        None,
+                        true,
+                        state.working.is_some(),
+                        if !session_allowed {
+                            "session_calendar_gate"
+                        } else if !funding_allowed {
+                            "funding_gate"
+                        } else {
+                            "tail_risk_gate"
+                        },
+                    )
                 } else {
                     let side = if state.position > 0 {
                         Some(Side::Sell)
@@ -2445,10 +2474,10 @@ impl SimulationEngine {
                         quantity: state.position.checked_abs().unwrap_or(i64::MAX),
                         post_only: true,
                     });
-                    (desired, true, state.working.is_some())
+                    (desired, true, state.working.is_some(), "reduce_only")
                 }
             } else if strategy_variant == SimulationPolicyVariant::M9DeadlineCausalDroMpc {
-                let (intent, reduce_only, _reason) = m9_intent_for_state(
+                let (intent, reduce_only, reason) = m9_intent_for_state(
                     state,
                     timestamp_ms,
                     max_position,
@@ -2456,7 +2485,7 @@ impl SimulationEngine {
                     self.max_mark_index_gap_bps,
                     self.fee_ppm,
                 );
-                (intent, reduce_only, state.working.is_some())
+                (intent, reduce_only, state.working.is_some(), reason)
             } else {
                 let mark_index_ok = match (state.mark_price_ticks, state.index_price_ticks) {
                     (Some(mark), Some(index)) => {
@@ -2481,7 +2510,15 @@ impl SimulationEngine {
                             timestamp_ms,
                         ));
                 if !valid {
-                    (None, false, state.working.is_some())
+                    let reason =
+                        match data_quality_for(state, timestamp_ms, self.max_mark_index_gap_bps) {
+                            DataQualityStatus::Missing => "market_data_missing",
+                            DataQualityStatus::Contradictory => "market_data_contradictory",
+                            DataQualityStatus::Stale => "market_data_not_fresh",
+                            DataQualityStatus::Fresh => "anchor_or_signal_gate",
+                            DataQualityStatus::Unknown => "market_data_unknown",
+                        };
+                    (None, false, state.working.is_some(), reason)
                 } else {
                     let quantity = liquidity_adjusted_quantity(
                         requested_quantity,
@@ -2593,22 +2630,105 @@ impl SimulationEngine {
                         });
                         input.and_then(AnchorMakerStrategy::generate_adaptive_intent)
                     };
-                    (intent, false, state.working.is_some())
+                    let reason = if intent.is_some() {
+                        "admissible"
+                    } else if strategy_variant == SimulationPolicyVariant::M7EvidenceGated {
+                        "m7_evidence_gate"
+                    } else {
+                        "signal_below_threshold"
+                    };
+                    (intent, false, state.working.is_some(), reason)
                 }
             }
         };
         if desired.is_none() {
+            let outcome = if has_working {
+                "cancel_pending"
+            } else {
+                "rejected"
+            };
+            let decision_record = {
+                let state = self.states.get(symbol).expect("symbol state exists");
+                let mut record = self.record(
+                    symbol,
+                    state,
+                    timestamp_ms,
+                    RecordFields {
+                        kind: "decision",
+                        decision_id: Some(decision_id),
+                        client_id: None,
+                        side: None,
+                        price_ticks: None,
+                        quantity: None,
+                        order_age_ms: None,
+                        queue_ahead_quantity: None,
+                        quote_distance_bps: None,
+                        detail: Some(decision_reason),
+                    },
+                );
+                record.decision_audit = Some(decision_audit(
+                    self,
+                    symbol,
+                    state,
+                    timestamp_ms,
+                    decision_id,
+                    outcome,
+                    decision_reason,
+                    max_position,
+                    requested_quantity,
+                ));
+                record
+            };
+            self.reject_entry(decision_reason);
             if has_working {
-                return self.cancel_symbol(
+                let mut records = vec![decision_record];
+                records.extend(self.cancel_symbol(
                     symbol,
                     timestamp_ms,
                     "session, signal, or data gate blocked",
-                );
+                ));
+                return records;
             }
-            self.reject_entry("strategy_or_risk");
-            return Vec::new();
+            return vec![decision_record];
         }
         let desired = desired.expect("desired intent exists");
+        let decision_record = {
+            let state = self.states.get(symbol).expect("symbol state exists");
+            let outcome = if reduce_only {
+                "reduce_only"
+            } else {
+                "admissible"
+            };
+            let mut record = self.record(
+                symbol,
+                state,
+                timestamp_ms,
+                RecordFields {
+                    kind: "decision",
+                    decision_id: Some(decision_id),
+                    client_id: None,
+                    side: Some(desired.side),
+                    price_ticks: Some(desired.price),
+                    quantity: Some(desired.quantity),
+                    order_age_ms: None,
+                    queue_ahead_quantity: None,
+                    quote_distance_bps: None,
+                    detail: Some(decision_reason),
+                },
+            );
+            record.decision_audit = Some(decision_audit(
+                self,
+                symbol,
+                state,
+                timestamp_ms,
+                decision_id,
+                outcome,
+                decision_reason,
+                max_position,
+                requested_quantity,
+            ));
+            record
+        };
         let same_order = self.states[symbol].working.is_some_and(|order| {
             order.side == desired.side
                 && order.price_ticks == desired.price
@@ -2616,7 +2736,7 @@ impl SimulationEngine {
                 && order.reduce_only == reduce_only
         });
         if same_order {
-            return Vec::new();
+            return vec![decision_record];
         }
         let hold_existing_quote = has_working
             && !reduce_only
@@ -2627,17 +2747,22 @@ impl SimulationEngine {
                         < self.quote_reprice_min_interval_ms
             });
         if hold_existing_quote {
-            return Vec::new();
+            return vec![decision_record];
         }
-        let mut records = if has_working {
-            self.cancel_symbol(symbol, timestamp_ms, "quote replacement")
-        } else {
-            Vec::new()
-        };
+        let mut records = vec![decision_record];
+        if has_working {
+            records.extend(self.cancel_symbol(symbol, timestamp_ms, "quote replacement"));
+        }
         if self.states[symbol].working.is_some() {
             return records;
         }
-        records.extend(self.place_symbol(symbol, desired, timestamp_ms, reduce_only));
+        records.extend(self.place_symbol(
+            symbol,
+            desired,
+            timestamp_ms,
+            reduce_only,
+            Some(decision_id),
+        ));
         records
     }
 
@@ -2647,6 +2772,7 @@ impl SimulationEngine {
         intent: OrderIntent,
         timestamp_ms: u64,
         reduce_only: bool,
+        decision_id: Option<u64>,
     ) -> Vec<SimulationRecord> {
         if !intent.post_only || intent.price <= 0 || intent.quantity <= 0 {
             return Vec::new();
@@ -2685,6 +2811,7 @@ impl SimulationEngine {
         };
         state.working = Some(WorkingOrder {
             client_id,
+            decision_id,
             side: intent.side,
             price_ticks: intent.price,
             remaining_quantity: intent.quantity,
@@ -2705,6 +2832,7 @@ impl SimulationEngine {
             timestamp_ms,
             RecordFields {
                 kind: "order_placed",
+                decision_id,
                 client_id: Some(client_id),
                 side: Some(intent.side),
                 price_ticks: Some(intent.price),
@@ -2757,6 +2885,7 @@ impl SimulationEngine {
             timestamp_ms,
             RecordFields {
                 kind: "order_canceled",
+                decision_id: order.decision_id,
                 client_id: Some(order.client_id),
                 side: Some(order.side),
                 price_ticks: Some(order.price_ticks),
@@ -2778,6 +2907,9 @@ impl SimulationEngine {
     ) -> SimulationRecord {
         SimulationRecord {
             timestamp_ms,
+            exchange_event_time_ms: self.last_event_at_ms,
+            received_at_ms: self.last_received_at_ms,
+            decision_id: fields.decision_id,
             strategy_variant: self.strategy_variant.label().to_owned(),
             kind: fields.kind.to_owned(),
             symbol: symbol.to_owned(),
@@ -2800,7 +2932,175 @@ impl SimulationEngine {
                 .saturating_add(state.funding_pnl_ticks)
                 .saturating_sub(state.fees_ticks),
             detail: fields.detail.map(str::to_owned),
+            decision_audit: None,
         }
+    }
+}
+
+fn decision_audit(
+    engine: &SimulationEngine,
+    symbol: &str,
+    state: &SimulationSymbolState,
+    timestamp_ms: u64,
+    decision_id: u64,
+    outcome: &str,
+    final_gate: &str,
+    max_position: i64,
+    requested_quantity: i64,
+) -> DecisionAudit {
+    let book = state.book;
+    let book_valid = book.is_some_and(|book| {
+        book.bid_price_ticks > 0
+            && book.ask_price_ticks >= book.bid_price_ticks
+            && book.bid_quantity > 0
+            && book.ask_quantity > 0
+    });
+    let mark_index_ok = match (state.mark_price_ticks, state.index_price_ticks) {
+        (Some(mark), Some(index)) if mark > 0 && index > 0 => {
+            (i128::from(mark) - i128::from(index)).abs() * 10_000
+                <= i128::from(engine.max_mark_index_gap_bps.max(0)) * i128::from(index)
+        }
+        _ => false,
+    };
+    let mark_age_ms =
+        (state.last_mark_time_ms > 0).then(|| timestamp_ms.saturating_sub(state.last_mark_time_ms));
+    let signal_fresh = state.last_mark_time_ms > 0
+        && timestamp_ms >= state.last_mark_time_ms
+        && timestamp_ms.saturating_sub(state.last_mark_time_ms) <= 5_000;
+    let anchor_valid = state
+        .anchor
+        .valid_at(timestamp_ms, engine.max_anchor_age_ms);
+    let anchor_age_ms = (state.anchor.observed_at_ms > 0)
+        .then(|| timestamp_ms.saturating_sub(state.anchor.observed_at_ms));
+    let session_allowed =
+        !engine.live_risk_gates || simulation_session_allows_entry(symbol, timestamp_ms);
+    let funding_allowed = !engine.live_risk_gates
+        || funding_entry_allowed_variant(
+            state,
+            timestamp_ms,
+            engine.strategy_variant,
+            engine.fee_ppm,
+        );
+    let threshold_diagnostic = dynamic_threshold_diagnostic_for(
+        state,
+        engine.strategy_variant,
+        engine.strategy.entry_threshold_bps,
+        engine.fee_ppm,
+        requested_quantity,
+        max_position,
+        timestamp_ms,
+    );
+    let threshold = threshold_diagnostic
+        .threshold
+        .map(|value| scale_threshold_non_fee(value, engine.threshold_scale_ppm));
+    let fair_value = fair_value_for_state(state);
+    let liquidity_ratio_bps = book
+        .map(|book| liquidity_ratio_bps(requested_quantity, book.bid_quantity, book.ask_quantity));
+    let position_capacity = state.position.checked_abs().unwrap_or(i64::MAX) < max_position;
+    let gates = vec![
+        DecisionGateAudit {
+            name: "session_calendar".to_owned(),
+            passed: session_allowed,
+            reason: if session_allowed {
+                "session permits entry"
+            } else {
+                "exchange-clock session gate"
+            }
+            .to_owned(),
+        },
+        DecisionGateAudit {
+            name: "funding".to_owned(),
+            passed: funding_allowed,
+            reason: if funding_allowed {
+                "funding gate permits entry"
+            } else {
+                "funding deadline/rate gate"
+            }
+            .to_owned(),
+        },
+        DecisionGateAudit {
+            name: "market_book".to_owned(),
+            passed: book_valid,
+            reason: if book_valid {
+                "valid bid/ask and positive depth"
+            } else {
+                "book missing, crossed, or empty"
+            }
+            .to_owned(),
+        },
+        DecisionGateAudit {
+            name: "mark_index".to_owned(),
+            passed: mark_index_ok,
+            reason: if mark_index_ok {
+                "mark/index complete and within configured gap"
+            } else {
+                "mark/index missing or beyond configured gap"
+            }
+            .to_owned(),
+        },
+        DecisionGateAudit {
+            name: "signal_freshness".to_owned(),
+            passed: signal_fresh,
+            reason: if signal_fresh {
+                "exchange-event signal age <= 5000ms"
+            } else {
+                "exchange-event signal is stale or unavailable"
+            }
+            .to_owned(),
+        },
+        DecisionGateAudit {
+            name: "anchor".to_owned(),
+            passed: anchor_valid,
+            reason: if anchor_valid {
+                "anchor valid at exchange event time"
+            } else {
+                "anchor unavailable or expired"
+            }
+            .to_owned(),
+        },
+        DecisionGateAudit {
+            name: "threshold".to_owned(),
+            passed: threshold.is_some(),
+            reason: threshold_diagnostic.status.label().to_owned(),
+        },
+        DecisionGateAudit {
+            name: "inventory_capacity".to_owned(),
+            passed: position_capacity,
+            reason: if position_capacity {
+                "position remains below allocation"
+            } else {
+                "position allocation exhausted"
+            }
+            .to_owned(),
+        },
+        DecisionGateAudit {
+            name: "policy_terminal".to_owned(),
+            passed: outcome == "admissible" || outcome == "reduce_only",
+            reason: final_gate.to_owned(),
+        },
+    ];
+    DecisionAudit {
+        schema_version: DECISION_AUDIT_SCHEMA_VERSION,
+        decision_id,
+        exchange_event_time_ms: timestamp_ms,
+        received_at_ms: engine.last_received_at_ms,
+        outcome: outcome.to_owned(),
+        final_gate: final_gate.to_owned(),
+        gates,
+        book_bid_ticks: book.map(|book| book.bid_price_ticks),
+        book_ask_ticks: book.map(|book| book.ask_price_ticks),
+        book_bid_quantity: book.map(|book| book.bid_quantity),
+        book_ask_quantity: book.map(|book| book.ask_quantity),
+        mark_ticks: state.mark_price_ticks,
+        index_ticks: state.index_price_ticks,
+        anchor_ticks: state.anchor.close_price_ticks,
+        position: state.position,
+        mark_age_ms,
+        anchor_age_ms,
+        threshold_status: threshold_diagnostic.status.label().to_owned(),
+        threshold_pico_bps: threshold.and_then(|value| value.required_pico_bps()),
+        fair_value_ticks: fair_value.map(|estimate| estimate.price.0),
+        liquidity_ratio_bps,
     }
 }
 
@@ -4777,7 +5077,8 @@ mod tests {
             &mut engine,
             br#"{"e":"bookTicker","u":1,"E":2,"T":2,"s":"CXMTUSDT","b":"98","B":"10","a":"99","A":"10"}"#,
         );
-        assert_eq!(placed.len(), 1);
+        assert!(placed.iter().any(|record| record.kind == "decision"));
+        assert!(placed.iter().any(|record| record.kind == "order_placed"));
         let wrong_side = feed(
             &mut engine,
             br#"{"e":"aggTrade","E":3,"s":"CXMTUSDT","a":1,"p":"98","q":"3","T":3,"m":false}"#,
@@ -4803,7 +5104,7 @@ mod tests {
             &mut engine,
             br#"{"e":"bookTicker","u":1,"E":2,"T":2,"s":"CXMTUSDT","b":"98","B":"10","a":"99","A":"10"}"#,
         );
-        assert_eq!(placed.len(), 1);
+        assert!(placed.iter().any(|record| record.kind == "order_placed"));
         feed(
             &mut engine,
             br#"{"e":"markPriceUpdate","E":299999,"s":"CXMTUSDT","p":"100","i":"100","T":600000,"r":"0"}"#,
@@ -4812,8 +5113,10 @@ mod tests {
             &mut engine,
             br#"{"e":"bookTicker","u":2,"E":300001,"T":300001,"s":"CXMTUSDT","b":"98","B":"10","a":"99","A":"10"}"#,
         );
-        assert_eq!(canceled.len(), 1);
-        assert_eq!(canceled[0].kind, "order_canceled");
+        assert!(canceled.iter().any(|record| record.kind == "decision"));
+        assert!(canceled
+            .iter()
+            .any(|record| record.kind == "order_canceled"));
         assert_eq!(engine.summary().working_orders, 0);
     }
 
@@ -5026,7 +5329,10 @@ mod tests {
             &mut engine,
             br#"{"e":"bookTicker","u":2,"E":3,"T":3,"s":"CXMTUSDT","b":"97","B":"10","a":"99","A":"10"}"#,
         );
-        assert!(in_flight.is_empty());
+        assert!(in_flight.iter().any(|record| record.kind == "decision"));
+        assert!(!in_flight
+            .iter()
+            .any(|record| record.kind == "order_canceled"));
         assert_eq!(engine.summary().working_orders, 1);
         let filled = feed(
             &mut engine,

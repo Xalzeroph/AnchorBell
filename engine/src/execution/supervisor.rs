@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::observability::{DecisionAudit, DecisionGateAudit, DECISION_AUDIT_SCHEMA_VERSION};
+
 use super::{
     recovery::{RecoveryEvent, RecoveryMachine, RecoveryState},
     OrderIntent, SessionCheckpoint, Side, UserDataEvent,
@@ -49,6 +51,26 @@ pub enum GateDecision {
     Flatten(GateReason),
 }
 
+impl GateReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::UnknownSymbol => "unknown_symbol",
+            Self::NotHealthy => "not_healthy",
+            Self::NonMakerIntent => "non_maker_intent",
+            Self::InvalidIntent => "invalid_intent",
+            Self::MarketStale => "market_stale",
+            Self::FxStale => "fx_stale",
+            Self::AnchorUnavailable => "anchor_unavailable",
+            Self::EquitySessionOpen => "equity_session_open",
+            Self::FundingUnknown => "funding_unknown",
+            Self::FundingWindow => "funding_window",
+            Self::PositionLimit => "position_limit",
+            Self::ResidualExposure => "residual_exposure",
+            Self::UnknownRemoteState => "unknown_remote_state",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SupervisorConfig {
     pub max_market_age_ms: u64,
@@ -90,6 +112,7 @@ pub struct ExecutionSupervisor {
     last_user_event_at_ms: u64,
     unknown_remote_state: bool,
     recovery: RecoveryMachine,
+    next_decision_id: u64,
 }
 
 impl ExecutionSupervisor {
@@ -126,6 +149,7 @@ impl ExecutionSupervisor {
             last_user_event_at_ms: 0,
             unknown_remote_state: false,
             recovery: RecoveryMachine::new(),
+            next_decision_id: 1,
         })
     }
 
@@ -335,6 +359,160 @@ impl ExecutionSupervisor {
             return GateDecision::NoAction(GateReason::PositionLimit);
         }
         GateDecision::Allow
+    }
+
+    /// Evaluate a live intent and emit the same versioned audit contract used
+    /// by replay and simulation. The adapter owns transport; this layer owns
+    /// gate semantics and correlation identity.
+    pub fn evaluate_with_audit(
+        &mut self,
+        symbol: &str,
+        intent: OrderIntent,
+        now_ms: u64,
+    ) -> (GateDecision, DecisionAudit) {
+        let decision_id = self.next_decision_id;
+        self.next_decision_id = self.next_decision_id.saturating_add(1);
+        let decision = self.evaluate(symbol, intent, now_ms);
+        let (outcome, final_gate) = match decision {
+            GateDecision::Allow => ("admissible", "allow"),
+            GateDecision::NoAction(reason) => ("no_action", reason.label()),
+            GateDecision::Halt(reason) => ("halt", reason.label()),
+            GateDecision::Flatten(reason) => ("reduce_only", reason.label()),
+        };
+        let key = symbol.trim().to_ascii_uppercase();
+        let state = self.symbols.get(key.as_str()).copied();
+        let market_fresh = state.is_some_and(|state| {
+            state.market_at_ms > 0
+                && now_ms >= state.market_at_ms
+                && now_ms.saturating_sub(state.market_at_ms) <= self.config.max_market_age_ms
+        });
+        let fx_fresh = state.is_some_and(|state| {
+            state.fx_at_ms > 0
+                && now_ms >= state.fx_at_ms
+                && now_ms.saturating_sub(state.fx_at_ms) <= self.config.max_fx_age_ms
+        });
+        let anchor_ready = state.is_some_and(|state| state.anchor_ready);
+        let equity_closed = state.is_some_and(|state| state.equity_closed);
+        let funding_known =
+            state.is_some_and(|state| state.funding_known && state.next_funding_at_ms > now_ms);
+        let position_capacity = state.is_some_and(|state| {
+            let next_position = match intent.side {
+                Side::Buy => i128::from(state.position) + i128::from(intent.quantity),
+                Side::Sell => i128::from(state.position) - i128::from(intent.quantity),
+            };
+            next_position.abs() <= i128::from(self.config.max_position)
+        });
+        let gates = vec![
+            DecisionGateAudit {
+                name: "supervisor_health".to_owned(),
+                passed: self.state == SupervisorState::Healthy,
+                reason: format!("{:?}", self.state),
+            },
+            DecisionGateAudit {
+                name: "intent_post_only".to_owned(),
+                passed: intent.post_only
+                    && intent.symbol > 0
+                    && intent.price > 0
+                    && intent.quantity > 0,
+                reason: if intent.post_only {
+                    "valid maker intent fields"
+                } else {
+                    "live intent must be post-only"
+                }
+                .to_owned(),
+            },
+            DecisionGateAudit {
+                name: "market_freshness".to_owned(),
+                passed: market_fresh,
+                reason: if market_fresh {
+                    "exchange market timestamp within configured age"
+                } else {
+                    "market timestamp missing or stale"
+                }
+                .to_owned(),
+            },
+            DecisionGateAudit {
+                name: "fx_freshness".to_owned(),
+                passed: fx_fresh,
+                reason: if fx_fresh {
+                    "exchange FX timestamp within configured age"
+                } else {
+                    "FX timestamp missing or stale"
+                }
+                .to_owned(),
+            },
+            DecisionGateAudit {
+                name: "anchor_ready".to_owned(),
+                passed: anchor_ready,
+                reason: if anchor_ready {
+                    "authoritative anchor ready"
+                } else {
+                    "anchor unavailable"
+                }
+                .to_owned(),
+            },
+            DecisionGateAudit {
+                name: "equity_session".to_owned(),
+                passed: equity_closed,
+                reason: if equity_closed {
+                    "equity market is closed"
+                } else {
+                    "equity session open"
+                }
+                .to_owned(),
+            },
+            DecisionGateAudit {
+                name: "funding".to_owned(),
+                passed: funding_known,
+                reason: if funding_known {
+                    "funding known and outside flatten window"
+                } else {
+                    "funding unknown or inside flatten window"
+                }
+                .to_owned(),
+            },
+            DecisionGateAudit {
+                name: "position_capacity".to_owned(),
+                passed: position_capacity,
+                reason: if position_capacity {
+                    "position remains within supervisor limit"
+                } else {
+                    "position limit exceeded"
+                }
+                .to_owned(),
+            },
+            DecisionGateAudit {
+                name: "terminal_decision".to_owned(),
+                passed: matches!(decision, GateDecision::Allow | GateDecision::Flatten(_)),
+                reason: final_gate.to_owned(),
+            },
+        ];
+        (
+            decision,
+            DecisionAudit {
+                schema_version: DECISION_AUDIT_SCHEMA_VERSION,
+                decision_id,
+                exchange_event_time_ms: now_ms,
+                received_at_ms: now_ms,
+                outcome: outcome.to_owned(),
+                final_gate: final_gate.to_owned(),
+                gates,
+                book_bid_ticks: None,
+                book_ask_ticks: None,
+                book_bid_quantity: None,
+                book_ask_quantity: None,
+                mark_ticks: None,
+                index_ticks: None,
+                anchor_ticks: 0,
+                position: state.map(|state| state.position).unwrap_or(0),
+                mark_age_ms: state.map(|state| now_ms.saturating_sub(state.market_at_ms)),
+                anchor_age_ms: None,
+                threshold_status: "not_applicable_live_supervisor".to_owned(),
+                threshold_pico_bps: None,
+                fair_value_ticks: None,
+                liquidity_ratio_bps: None,
+            },
+        )
     }
 
     pub fn on_user_data(&mut self, event: UserDataEvent) -> Result<(), GateReason> {
