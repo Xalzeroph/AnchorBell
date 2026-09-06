@@ -41,11 +41,13 @@ use crate::{
     strategy::{
         calendar::{calendar_for, EquitySessionCalendar},
         capital::{dynamic_weights, CapitalRiskInput},
-        decide_m9, profile_for, side_adverse_selection_bps, side_adverse_selection_pico_bps,
+        decide_m9, decide_maker_exit, profile_for, side_adverse_selection_bps,
+        side_adverse_selection_pico_bps,
         universe::instrument_for,
         AdaptiveThreshold, AnchorCurrency, AnchorMakerStrategy, CalibrationSnapshot,
-        CalibrationState, DataQualityStatus, FairValueEstimate, M9Action, M9Input, SignalInput,
-        VenueSessionState,
+        CalibrationState, DataQualityStatus, DualFlattenPlan, ExitBook, ExitConstraints,
+        ExitWorkingOrder, FairValueEstimate, FundingRateKind, FundingSchedule, M9Action, M9Input,
+        MakerExitDecision, MakerExitInput, SignalInput, VenueSessionState,
     },
 };
 
@@ -637,6 +639,7 @@ struct SimulationSymbolState {
     book: Option<BookState>,
     local_book: LocalOrderBook,
     last_book_update_id: Option<u64>,
+    last_book_event_at_ms: u64,
     mark_price_ticks: Option<i64>,
     index_price_ticks: Option<i64>,
     next_funding_time_ms: u64,
@@ -1089,6 +1092,7 @@ impl SimulationEngine {
                         book: None,
                         local_book: LocalOrderBook::default(),
                         last_book_update_id: None,
+                        last_book_event_at_ms: 0,
                         mark_price_ticks: None,
                         index_price_ticks: None,
                         next_funding_time_ms: 0,
@@ -2095,6 +2099,7 @@ impl SimulationEngine {
                 return Vec::new();
             }
             state.last_book_update_id = Some(ticker.update_id);
+            state.last_book_event_at_ms = ticker.event_time_ms;
             state.book = Some(BookState {
                 bid_price_ticks: ticker.bid_price.0,
                 bid_quantity: ticker.bid_quantity.0,
@@ -2527,41 +2532,21 @@ impl SimulationEngine {
             let entries_allowed = session_allowed && funding_allowed;
             let tail_reduce_only = strategy_variant.uses_tail_guard() && m5_tail_reduce_only(state);
             if !entries_allowed || tail_reduce_only {
-                let should_reduce = !session_allowed || funding_reduce_only || tail_reduce_only;
+                let should_reduce = !session_allowed
+                    || (!funding_allowed && state.position != 0)
+                    || funding_reduce_only
+                    || tail_reduce_only;
                 if !should_reduce {
                     (
                         None,
                         true,
                         state.working.is_some(),
-                        if !session_allowed {
-                            "session_calendar_gate"
-                        } else if !funding_allowed {
-                            "funding_gate"
-                        } else {
-                            "tail_risk_gate"
-                        },
+                        "entry_restricted_without_position_reduction",
                     )
                 } else {
-                    let side = if state.position > 0 {
-                        Some(Side::Sell)
-                    } else if state.position < 0 {
-                        Some(Side::Buy)
-                    } else {
-                        None
-                    };
-                    let desired = side.map(|side| OrderIntent {
-                        symbol: state.symbol_id,
-                        side,
-                        // Reduce-only orders must remain post-only: sell at ask, buy at bid.
-                        price: if side == Side::Sell {
-                            book.ask_price_ticks
-                        } else {
-                            book.bid_price_ticks
-                        },
-                        quantity: state.position.checked_abs().unwrap_or(i64::MAX),
-                        post_only: true,
-                    });
-                    (desired, true, state.working.is_some(), "reduce_only")
+                    let (desired, exit_reason) =
+                        maker_exit_intent_for_state(state, timestamp_ms, self.quantity_scale);
+                    (desired, true, state.working.is_some(), exit_reason)
                 }
             } else if strategy_variant == SimulationPolicyVariant::M9DeadlineCausalDroMpc {
                 let (intent, reduce_only, reason) = m9_intent_for_state(
@@ -3346,6 +3331,97 @@ fn m9_intent_for_state(
         M9Action::NoAction => None,
     };
     (intent, reduce_only, decision.reason)
+}
+
+fn maker_exit_intent_for_state(
+    state: &SimulationSymbolState,
+    timestamp_ms: u64,
+    quantity_scale: u32,
+) -> (Option<OrderIntent>, &'static str) {
+    let Some(position_quantity) = state.position.checked_abs() else {
+        return (None, "maker_exit_position_overflow");
+    };
+    let Some(book) = state.book else {
+        return (None, "maker_exit_invalid_book");
+    };
+    if position_quantity == 0 {
+        return (None, "maker_exit_flat");
+    }
+    let funding = if state.next_funding_time_ms > timestamp_ms {
+        FundingSchedule::new(
+            Some(state.next_funding_time_ms),
+            Some(8),
+            state.latest_funding_rate_e8.map(|rate| rate / 100),
+            FundingRateKind::Regular,
+            timestamp_ms,
+        )
+    } else {
+        FundingSchedule::new(None, None, None, FundingRateKind::Unknown, timestamp_ms)
+    };
+    let Some(funding) = funding else {
+        return (None, "maker_exit_funding_schedule_invalid");
+    };
+    let Some(plan) =
+        DualFlattenPlan::new(timestamp_ms, None, funding, 30 * 60 * 1_000, 5 * 60 * 1_000)
+    else {
+        return (None, "maker_exit_plan_invalid");
+    };
+    let position_quantity = position_quantity.min(i64::MAX);
+    let working = match state.working {
+        None => ExitWorkingOrder::None,
+        Some(order) if order.cancel_requested_at_ms.is_some() => ExitWorkingOrder::Pending,
+        Some(order) => ExitWorkingOrder::Confirmed {
+            side: order.side,
+            price: order.price_ticks,
+            remaining: order.remaining_quantity,
+            reduce_only: order.reduce_only,
+        },
+    };
+    let decision = decide_maker_exit(MakerExitInput {
+        symbol: state.symbol_id,
+        position: state.position,
+        position_confirmed: true,
+        now_ms: timestamp_ms,
+        max_book_age_ms: 5_000,
+        plan,
+        book: Some(ExitBook {
+            bid: book.bid_price_ticks,
+            ask: book.ask_price_ticks,
+            observed_at_ms: state.last_book_event_at_ms,
+        }),
+        constraints: Some(ExitConstraints {
+            min_price: 1,
+            max_price: i64::MAX,
+            price_tick: 1,
+            min_quantity: 1,
+            max_quantity: position_quantity,
+            quantity_step: 1,
+            min_notional: 1,
+            quantity_scale,
+            observed_at_ms: timestamp_ms,
+            max_age_ms: 5_000,
+        }),
+        working,
+    });
+    match decision {
+        MakerExitDecision::Submit(intent) => (Some(intent), "maker_exit_submit"),
+        MakerExitDecision::KeepWorking => (
+            state.working.map(|order| OrderIntent {
+                symbol: state.symbol_id,
+                side: order.side,
+                price: order.price_ticks,
+                quantity: order.remaining_quantity,
+                post_only: true,
+            }),
+            "maker_exit_keep_working",
+        ),
+        MakerExitDecision::CancelWorking => (None, "maker_exit_cancel_working"),
+        MakerExitDecision::WaitForReconciliation => (None, "maker_exit_wait_reconciliation"),
+        MakerExitDecision::ResidualExposure => (None, "maker_exit_hard_deadline"),
+        MakerExitDecision::Flat => (None, "maker_exit_flat"),
+        MakerExitDecision::Trading => (None, "maker_exit_not_in_window"),
+        MakerExitDecision::Blocked(_) => (None, "maker_exit_blocked"),
+    }
 }
 
 pub fn event_time_ms(event: &BinanceMarketEvent) -> u64 {

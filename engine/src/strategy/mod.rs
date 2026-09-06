@@ -7,6 +7,7 @@ pub mod flatten;
 pub mod instrument_profile;
 pub mod inventory;
 pub mod m9;
+pub mod maker_exit;
 pub mod market_context;
 pub mod method_graph;
 pub mod price_engine;
@@ -33,6 +34,10 @@ pub use instrument_profile::{profile_for, AnchorCurrency, InstrumentKind, Instru
 pub use inventory::InventoryState;
 pub use m9::{
     decide as decide_m9, M9Action, M9Calibration, M9Decision, M9Input, M9Phase, M9_MODEL_VERSION,
+};
+pub use maker_exit::{
+    decide_maker_exit, ExitBlockReason, ExitBook, ExitConstraints, ExitWorkingOrder,
+    MakerExitDecision, MakerExitInput,
 };
 pub use market_context::MarketContext;
 pub use method_graph::{
