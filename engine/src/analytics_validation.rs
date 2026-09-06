@@ -678,21 +678,14 @@ pub struct SimulationPromotionGate {
     pub reason: String,
 }
 
-pub fn evaluate_simulation_promotion(
-    input: SimulationPromotionInput,
-) -> SimulationPromotionGate {
+pub fn evaluate_simulation_promotion(input: SimulationPromotionInput) -> SimulationPromotionGate {
     const MINIMUM_FILLS: u64 = 100;
     let integrity_passed = input.ledger_count > 0 && input.records_dropped == 0;
     let evidence_sufficient = input.fills >= MINIMUM_FILLS && input.orders >= input.fills;
     let economic_passed = evidence_sufficient && input.total_net_pnl_ticks > 0;
-    let survival_passed = integrity_passed
-        && input.valuation_incomplete_ledgers == 0
-        && input.non_flat_ledgers == 0;
-    let verdict = if integrity_passed
-        && evidence_sufficient
-        && economic_passed
-        && survival_passed
-    {
+    let survival_passed =
+        integrity_passed && input.valuation_incomplete_ledgers == 0 && input.non_flat_ledgers == 0;
+    let verdict = if integrity_passed && evidence_sufficient && economic_passed && survival_passed {
         ValidationVerdict::Supported
     } else if integrity_passed && evidence_sufficient && (!economic_passed || !survival_passed) {
         ValidationVerdict::Falsified

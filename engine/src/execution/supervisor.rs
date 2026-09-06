@@ -511,6 +511,9 @@ impl ExecutionSupervisor {
                 threshold_pico_bps: None,
                 fair_value_ticks: None,
                 liquidity_ratio_bps: None,
+                signal_abs_pico_bps: None,
+                adaptive_relief_pico_bps: 0,
+                threshold_components_pico_bps: None,
             },
         )
     }

@@ -82,10 +82,13 @@ pub struct DecisionAudit {
     pub threshold_pico_bps: Option<i64>,
     pub fair_value_ticks: Option<i64>,
     pub liquidity_ratio_bps: Option<i64>,
+    pub signal_abs_pico_bps: Option<i64>,
+    pub adaptive_relief_pico_bps: i64,
+    pub threshold_components_pico_bps: Option<[i64; 12]>,
 }
 
 /// Stable schema version for decision/order/fill correlation records.
-pub const DECISION_AUDIT_SCHEMA_VERSION: u16 = 1;
+pub const DECISION_AUDIT_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Debug, Default)]
 pub struct AuditSequence {

@@ -204,6 +204,9 @@ fn main() {
             dynamic_capital_refresh_ms: DYNAMIC_CAPITAL_REFRESH_MS,
             // Keep REST weight bounded; resync is throttled on 418/429.
             depth_snapshot_limit: 100,
+            checkpoint_path: Some(checkpoint_path),
+            checkpoint_session_id: Some(run_id.clone()),
+            checkpoint_interval_ms: 5_000,
             duration_secs: args.duration_secs,
             evidence: EvidenceConfig::default(),
         };

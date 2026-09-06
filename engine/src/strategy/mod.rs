@@ -1,6 +1,7 @@
 pub mod anchor_maker;
 pub mod anchor_policy;
 pub mod calendar;
+pub mod calibration;
 pub mod capital;
 pub mod flatten;
 pub mod instrument_profile;
@@ -22,6 +23,10 @@ pub use anchor_policy::{AnchorDecision, AnchorPolicy, BasisPoints, PriceTicks, Q
 pub use calendar::{
     calendar_for, EquitySessionCalendar, SessionWindow, VenueSessionState, A_SHARE_CALENDAR,
     HONG_KONG_CALENDAR,
+};
+pub use calibration::{
+    CalibrationParameter, CalibrationSnapshot, CalibrationState, CalibrationStatus,
+    CALIBRATION_MODEL_VERSION, CALIBRATION_SCHEMA_VERSION,
 };
 pub use flatten::{DualFlattenPlan, FlattenPhase, FlattenReason};
 pub use instrument_profile::{profile_for, AnchorCurrency, InstrumentKind, InstrumentProfile};

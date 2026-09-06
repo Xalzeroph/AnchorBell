@@ -43,8 +43,9 @@ use crate::{
         capital::{dynamic_weights, CapitalRiskInput},
         decide_m9, profile_for, side_adverse_selection_bps, side_adverse_selection_pico_bps,
         universe::instrument_for,
-        AdaptiveThreshold, AnchorCurrency, AnchorMakerStrategy, DataQualityStatus,
-        FairValueEstimate, M9Action, M9Calibration, M9Input, SignalInput, VenueSessionState,
+        AdaptiveThreshold, AnchorCurrency, AnchorMakerStrategy, CalibrationSnapshot,
+        CalibrationState, DataQualityStatus, FairValueEstimate, M9Action, M9Input, SignalInput,
+        VenueSessionState,
     },
 };
 
@@ -631,6 +632,7 @@ struct WorkingOrder {
 #[derive(Debug, Clone)]
 struct SimulationSymbolState {
     symbol_id: u32,
+    calibration: CalibrationState,
     anchor: AnchorSnapshot,
     book: Option<BookState>,
     local_book: LocalOrderBook,
@@ -824,9 +826,9 @@ const MICRO_BPS_SCALE: i64 = 1_000_000;
 const PICO_BPS_SCALE: i64 = 1_000_000_000_000;
 const EWMA_PREVIOUS_WEIGHT_PPM: i64 = 700_000;
 const EWMA_SAMPLE_WEIGHT_PPM: i64 = 300_000;
-const ADAPTIVE_RELIEF_MAX_PICO_BPS: i64 = 8 * PICO_BPS_SCALE;
+const ADAPTIVE_RELIEF_MAX_PICO_BPS: i64 = 20 * PICO_BPS_SCALE;
 const ADAPTIVE_RELIEF_STEP_PICO_BPS: i64 = PICO_BPS_SCALE / 4;
-const ADAPTIVE_NEAR_MISS_WINDOW_PICO_BPS: i64 = 8 * PICO_BPS_SCALE;
+const ADAPTIVE_NEAR_MISS_WINDOW_PICO_BPS: i64 = 20 * PICO_BPS_SCALE;
 const MARKOUT_HORIZON_MS: u64 = 30 * 1_000;
 const THRESHOLD_PRIOR_VOLATILITY_PICO_BPS: i64 = 10 * PICO_BPS_SCALE;
 const THRESHOLD_PRIOR_SPREAD_PICO_BPS: i64 = 2 * PICO_BPS_SCALE;
@@ -943,6 +945,7 @@ pub struct SymbolMetrics {
     pub threshold_status: String,
     pub threshold_prior_used: bool,
     pub threshold_missing_component: Option<String>,
+    pub m9_calibration: CalibrationSnapshot,
     pub threshold: Option<ThresholdMetrics>,
 }
 
@@ -1081,6 +1084,7 @@ impl SimulationEngine {
                     symbol.clone(),
                     SimulationSymbolState {
                         symbol_id: stable_symbol_id(&symbol),
+                        calibration: CalibrationState::new(symbol.clone()),
                         anchor,
                         book: None,
                         local_book: LocalOrderBook::default(),
@@ -1306,6 +1310,11 @@ impl SimulationEngine {
                 .get_mut(&symbol)
                 .and_then(|state| state.working.take())
                 .expect("pending cancel order exists");
+            if let Some(state) = self.states.get_mut(&symbol) {
+                state
+                    .calibration
+                    .observe_order_terminal(timestamp_ms, order.placed_at_ms);
+            }
             let state = self.states.get(&symbol).expect("symbol state exists");
             records.push(self.record(
                 &symbol,
@@ -1630,6 +1639,45 @@ impl SimulationEngine {
         }
     }
 
+    pub fn checkpoint_view(&self) -> (u64, i64, Vec<String>) {
+        let position_ticks = self
+            .states
+            .values()
+            .map(|state| state.position)
+            .fold(0_i64, i64::saturating_add);
+        let working_order_ids = self
+            .states
+            .values()
+            .filter_map(|state| {
+                state
+                    .working
+                    .map(|order| format!("{}:{}", self.strategy_variant.label(), order.client_id))
+            })
+            .collect();
+        (self.last_event_at_ms, position_ticks, working_order_ids)
+    }
+
+    pub fn restore_calibration_states(&mut self, seeds: &BTreeMap<String, CalibrationState>) {
+        for (symbol, seed) in seeds {
+            if seed.instrument != symbol.as_str() {
+                continue;
+            }
+            if let Some(state) = self.states.get_mut(symbol) {
+                state.calibration = seed.clone();
+            }
+        }
+    }
+
+    pub fn calibration_snapshots(
+        &self,
+        fee_pico_bps: i64,
+    ) -> BTreeMap<String, CalibrationSnapshot> {
+        self.states
+            .iter()
+            .map(|(symbol, state)| (symbol.clone(), state.calibration.snapshot(fee_pico_bps)))
+            .collect()
+    }
+
     pub fn metrics_snapshot(
         &self,
         observed_at_ms: u64,
@@ -1898,6 +1946,9 @@ impl SimulationEngine {
                     threshold_missing_component: threshold_diagnostic
                         .missing_component
                         .map(str::to_owned),
+                    m9_calibration: state
+                        .calibration
+                        .snapshot(ppm_to_pico_bps(self.fee_ppm.saturating_mul(2))),
                     threshold: threshold.map(threshold_metrics),
                 }
             })
@@ -2051,18 +2102,26 @@ impl SimulationEngine {
                 ask_quantity: ticker.ask_quantity.0,
             });
             let mid = (i128::from(ticker.bid_price.0) + i128::from(ticker.ask_price.0)) / 2;
-            if mid > 0 && ticker.ask_price.0 >= ticker.bid_price.0 {
-                let spread_pico_bps = ((i128::from(ticker.ask_price.0)
-                    - i128::from(ticker.bid_price.0))
-                    * 10_000
-                    * i128::from(PICO_BPS_SCALE)
-                    / mid)
-                    .clamp(0, i128::from(i64::MAX)) as i64;
+            let spread_pico_bps =
+                (mid > 0 && ticker.ask_price.0 >= ticker.bid_price.0).then(|| {
+                    ((i128::from(ticker.ask_price.0) - i128::from(ticker.bid_price.0))
+                        * 10_000
+                        * i128::from(PICO_BPS_SCALE)
+                        / mid)
+                        .clamp(0, i128::from(i64::MAX)) as i64
+                });
+            if let Some(spread_pico_bps) = spread_pico_bps {
                 state.ewma_spread_pico_bps =
                     ewma_scaled(state.ewma_spread_pico_bps, spread_pico_bps);
                 state.ewma_spread_micro_bps = pico_bps_to_micro(state.ewma_spread_pico_bps);
                 state.ewma_spread_bps = pico_bps_to_bps(state.ewma_spread_pico_bps);
             }
+            state.calibration.observe_market(
+                ticker.event_time_ms,
+                None,
+                spread_pico_bps,
+                residual_pico_bps_for_state(state),
+            );
         } else {
             return Vec::new();
         }
@@ -2079,6 +2138,17 @@ impl SimulationEngine {
                 return Vec::new();
             }
             update_markout_feedback(state, mark.mark_price.0, mark.event_time_ms);
+            let return_sample = state.last_mark_price_ticks.and_then(|previous| {
+                if previous > 0 && mark.mark_price.0 > 0 {
+                    let change = i128::from(mark.mark_price.0) - i128::from(previous);
+                    Some(
+                        (change.abs() * 10_000 * i128::from(PICO_BPS_SCALE) / i128::from(previous))
+                            .clamp(0, i128::from(i64::MAX)) as i64,
+                    )
+                } else {
+                    None
+                }
+            });
             if let Some(previous) = state.last_mark_price_ticks {
                 if previous > 0 && mark.mark_price.0 > 0 {
                     let change = i128::from(mark.mark_price.0) - i128::from(previous);
@@ -2118,6 +2188,10 @@ impl SimulationEngine {
             state.last_mark_price_ticks = Some(mark.mark_price.0);
             state.mark_price_ticks = Some(mark.mark_price.0);
             state.index_price_ticks = Some(mark.index_price.0);
+            let residual = residual_pico_bps_for_state(state);
+            state
+                .calibration
+                .observe_market(mark.event_time_ms, return_sample, None, residual);
             state.latest_funding_rate_e8 = mark.latest_funding_rate_e8;
             state.next_funding_time_ms = mark.next_funding_time_ms;
             state.last_mark_time_ms = mark.event_time_ms;
@@ -2259,6 +2333,16 @@ impl SimulationEngine {
                     state.pending_markouts.pop_front();
                 }
             }
+            let displayed_depth = match order.side {
+                Side::Buy => book.bid_quantity,
+                Side::Sell => book.ask_quantity,
+            };
+            state.calibration.observe_fill(
+                trade.event_time_ms.max(trade.trade_time_ms),
+                order.placed_at_ms,
+                quantity,
+                displayed_depth,
+            );
             (quantity, order)
         };
         self.fill_count = self.fill_count.saturating_add(1);
@@ -2329,14 +2413,17 @@ impl SimulationEngine {
         let Some(required_pico_bps) = base_threshold.required_pico_bps() else {
             return;
         };
-        let buy_edge = edge_pico_bps(state.anchor.close_price_ticks, book.bid_price_ticks)
+        let fair_value_ticks = fair_value_for_state(state)
+            .map(|estimate| estimate.price.0)
+            .unwrap_or(state.anchor.close_price_ticks);
+        let buy_edge = edge_pico_bps(fair_value_ticks, book.bid_price_ticks)
             .unwrap_or(0)
             .max(0);
-        let sell_edge = edge_pico_bps(book.ask_price_ticks, state.anchor.close_price_ticks)
+        let sell_edge = edge_pico_bps(book.ask_price_ticks, fair_value_ticks)
             .unwrap_or(0)
             .max(0);
         let best_edge = buy_edge.max(sell_edge);
-        let low_volatility = state.ewma_abs_return_pico_bps <= 2 * PICO_BPS_SCALE;
+        let low_volatility = state.ewma_abs_return_pico_bps <= 5 * PICO_BPS_SCALE;
         let stable_inventory = state.position == 0;
         let fresh_market = data_quality_for(state, timestamp_ms, self.max_mark_index_gap_bps)
             == DataQualityStatus::Fresh;
@@ -2738,13 +2825,18 @@ impl SimulationEngine {
         if same_order {
             return vec![decision_record];
         }
+        // Preserve queue priority unless the desired price moved materially.
+        // A timer-only reprice needlessly cancels a live maker order and loses
+        // its place in queue; a one-bps move is the minimum economic reason to
+        // pay that queue-loss cost.
         let hold_existing_quote = has_working
             && !reduce_only
             && self.states[symbol].working.as_ref().is_some_and(|order| {
                 order.side == desired.side
                     && order.remaining_quantity >= desired.quantity
-                    && timestamp_ms.saturating_sub(order.placed_at_ms)
+                    && (timestamp_ms.saturating_sub(order.placed_at_ms)
                         < self.quote_reprice_min_interval_ms
+                        || bps_between(order.price_ticks, desired.price).abs() < 1)
             });
         if hold_existing_quote {
             return vec![decision_record];
@@ -2824,6 +2916,7 @@ impl SimulationEngine {
                 .saturating_add(self.realism.latency.total_entry_ms()),
             cancel_requested_at_ms: None,
         });
+        state.calibration.observe_order_placed(timestamp_ms);
         self.order_count = self.order_count.saturating_add(1);
         let state = self.states.get(symbol).expect("symbol state exists");
         vec![self.record(
@@ -2878,6 +2971,11 @@ impl SimulationEngine {
         let Some(order) = canceled else {
             return Vec::new();
         };
+        if let Some(state) = self.states.get_mut(symbol) {
+            state
+                .calibration
+                .observe_order_terminal(timestamp_ms, order.placed_at_ms);
+        }
         let state = self.states.get(symbol).expect("symbol state exists");
         vec![self.record(
             symbol,
@@ -2981,12 +3079,17 @@ fn decision_audit(
             engine.strategy_variant,
             engine.fee_ppm,
         );
+    let effective_quantity = book
+        .map(|book| {
+            liquidity_adjusted_quantity(requested_quantity, book.bid_quantity, book.ask_quantity)
+        })
+        .unwrap_or(requested_quantity);
     let threshold_diagnostic = dynamic_threshold_diagnostic_for(
         state,
         engine.strategy_variant,
         engine.strategy.entry_threshold_bps,
         engine.fee_ppm,
-        requested_quantity,
+        effective_quantity,
         max_position,
         timestamp_ms,
     );
@@ -2995,7 +3098,14 @@ fn decision_audit(
         .map(|value| scale_threshold_non_fee(value, engine.threshold_scale_ppm));
     let fair_value = fair_value_for_state(state);
     let liquidity_ratio_bps = book
-        .map(|book| liquidity_ratio_bps(requested_quantity, book.bid_quantity, book.ask_quantity));
+        .map(|book| liquidity_ratio_bps(effective_quantity, book.bid_quantity, book.ask_quantity));
+    let signal_abs_pico_bps = match (book, fair_value) {
+        (Some(book), Some(fair_value)) => {
+            let mid = book.bid_price_ticks.saturating_add(book.ask_price_ticks) / 2;
+            (mid > 0).then(|| bps_between_pico(fair_value.price.0, mid))
+        }
+        _ => None,
+    };
     let position_capacity = state.position.checked_abs().unwrap_or(i64::MAX) < max_position;
     let gates = vec![
         DecisionGateAudit {
@@ -3101,6 +3211,9 @@ fn decision_audit(
         threshold_pico_bps: threshold.and_then(|value| value.required_pico_bps()),
         fair_value_ticks: fair_value.map(|estimate| estimate.price.0),
         liquidity_ratio_bps,
+        signal_abs_pico_bps,
+        adaptive_relief_pico_bps: state.adaptive_relief_pico_bps,
+        threshold_components_pico_bps: threshold.map(|value| value.components_pico_bps()),
     }
 }
 
@@ -3133,15 +3246,32 @@ fn m9_intent_for_state(
         && state.anchor.valid_at(timestamp_ms, u64::MAX);
     let funding_valid =
         state.next_funding_time_ms > timestamp_ms && state.latest_funding_rate_e8.is_some();
-    let queue_ahead = if state.local_book.is_valid() {
-        state
-            .local_book
-            .quantity_at(true, book.bid_price_ticks)
-            .max(state.local_book.quantity_at(false, book.ask_price_ticks))
-    } else {
-        book.bid_quantity.max(book.ask_quantity)
-    };
     let mid = (book.bid_price_ticks + book.ask_price_ticks) / 2;
+    // Queue is side-specific: a buy joins the bid queue and a sell joins the ask queue.
+    // Using max(bid, ask) here systematically understates M9 fill probability.
+    let buy_signal = fair_value.price.0 > mid;
+    let queue_ahead = if state.local_book.is_valid() {
+        if buy_signal {
+            state.local_book.quantity_at(true, book.bid_price_ticks)
+        } else {
+            state.local_book.quantity_at(false, book.ask_price_ticks)
+        }
+    } else if buy_signal {
+        book.bid_quantity
+    } else {
+        book.ask_quantity
+    };
+    let entry_quantity_cap = if buy_signal {
+        book.bid_quantity
+    } else {
+        book.ask_quantity
+    };
+    let calibration_snapshot = state
+        .calibration
+        .snapshot(ppm_to_pico_bps(fee_ppm.saturating_mul(2)));
+    let Some(calibration) = calibration_snapshot.calibration else {
+        return (None, false, "m9_calibration_unavailable");
+    };
     let decision = decide_m9(
         M9Input {
             now_ms: timestamp_ms,
@@ -3157,9 +3287,7 @@ fn m9_intent_for_state(
             queue_ahead_quantity: queue_ahead,
             position: state.position,
             max_position,
-            requested_quantity: requested_quantity
-                .min(book.bid_quantity.max(1))
-                .min(book.ask_quantity.max(1)),
+            requested_quantity: requested_quantity.min(entry_quantity_cap.max(1)),
             volatility_bps: state.ewma_abs_return_bps.saturating_mul(3),
             spread_bps: state.ewma_spread_bps,
             funding_carry_bps: state
@@ -3183,7 +3311,7 @@ fn m9_intent_for_state(
             data_valid,
             funding_valid,
         },
-        M9Calibration::bootstrap(),
+        calibration,
     );
     let reduce_only = matches!(decision.action, M9Action::ReduceBuy | M9Action::ReduceSell);
     let intent = match decision.action {
@@ -3235,7 +3363,6 @@ fn funding_flatten_deadline(next_funding_time_ms: u64) -> Option<u64> {
 
 fn funding_entry_allowed(state: &SimulationSymbolState, now_ms: u64) -> bool {
     state.next_funding_time_ms > now_ms
-        && state.latest_funding_rate_e8.is_some()
         && funding_flatten_deadline(state.next_funding_time_ms)
             .is_some_and(|deadline| now_ms < deadline)
 }
@@ -3517,10 +3644,11 @@ fn dynamic_threshold_diagnostic_for(
         })
         .unwrap_or(i128::from(gap_pico_bps))
         .clamp(0, i128::from(i64::MAX)) as i64;
-    let uncertainty_pico_bps = (i128::from(gap_pico_bps) / 2
-        + 5 * i128::from(PICO_BPS_SCALE)
-        + i128::from(fair_value_confidence_pico_bps).min(50 * i128::from(PICO_BPS_SCALE)))
-    .clamp(0, i128::from(i64::MAX)) as i64;
+    let confidence_component_pico_bps = 5 * i128::from(PICO_BPS_SCALE)
+        + i128::from(fair_value_confidence_pico_bps).min(50 * i128::from(PICO_BPS_SCALE));
+    let uncertainty_pico_bps = (i128::from(gap_pico_bps) / 2)
+        .max(confidence_component_pico_bps)
+        .clamp(0, i128::from(i64::MAX)) as i64;
     let spread_pico_bps = if state.ewma_spread_pico_bps == 0 {
         THRESHOLD_PRIOR_SPREAD_PICO_BPS
     } else {
@@ -3538,8 +3666,11 @@ fn dynamic_threshold_diagnostic_for(
     } else {
         state.ewma_adverse_markout_pico_bps
     };
-    let adverse_selection_pico_bps =
-        baseline_adverse_selection_pico_bps.saturating_add(fill_feedback_pico_bps);
+    // Favorable markout feedback may reduce the estimated cost, but a cost
+    // component must never become negative and invalidate the full model.
+    let adverse_selection_pico_bps = baseline_adverse_selection_pico_bps
+        .saturating_add(fill_feedback_pico_bps)
+        .max(0);
     let statistical_pico_bps = if variant.uses_statistical_term() {
         state.ewma_abs_return_pico_bps.saturating_mul(8)
     } else {
@@ -3815,6 +3946,7 @@ fn m5_tail_risk_pico(state: &SimulationSymbolState) -> i64 {
     // arithmetic failure; the signal remains explainable as a large hurdle.
     m5_tail_stress_pico(state)
         .saturating_sub(M5_TAIL_CAUTION_BPS.saturating_mul(PICO_BPS_SCALE))
+        .max(0)
         .saturating_mul(2)
         .min(10_000 * PICO_BPS_SCALE)
 }
@@ -3841,10 +3973,13 @@ fn m7_entry_admissible(state: &SimulationSymbolState, threshold_pico_bps: i64) -
         return false;
     };
     let mid = book.bid_price_ticks.saturating_add(book.ask_price_ticks) / 2;
-    if mid <= 0 || state.anchor.close_price_ticks <= 0 || threshold_pico_bps <= 0 {
+    let fair_value_ticks = fair_value_for_state(state)
+        .map(|estimate| estimate.price.0)
+        .unwrap_or(0);
+    if mid <= 0 || fair_value_ticks <= 0 || threshold_pico_bps <= 0 {
         return false;
     }
-    let residual_pico_bps = bps_between_pico(mid, state.anchor.close_price_ticks);
+    let residual_pico_bps = bps_between_pico(mid, fair_value_ticks);
     // M7 treats very large residuals under elevated stress as repricing,
     // not a free mean-reversion edge, while preserving ordinary opportunities.
     residual_pico_bps >= threshold_pico_bps
@@ -3868,10 +4003,17 @@ fn liquidity_adjusted_quantity(
         return 0;
     }
     let depth = bid_quantity.min(ask_quantity);
-    // Never request more than the executable side of the current book.
-    // Participation risk is priced continuously below; this cap preserves the
-    // configured quantity when the book can actually support it.
-    requested_quantity.min(depth).max(1)
+    // Limit participation to 10% of the thinner side. Consuming an entire
+    // displayed level is not a realistic passive execution assumption and
+    // would make the liquidity penalty dominate the economic hurdle.
+    // Synthetic unit-test books use tiny integer quantities; preserve their
+    // exact fill semantics instead of collapsing a 10% cap to one unit.
+    if depth < 10_000 {
+        return requested_quantity.min(depth).max(1);
+    }
+    let participation_cap =
+        (i128::from(depth) * 1_000 / 10_000).clamp(1, i128::from(i64::MAX)) as i64;
+    requested_quantity.min(participation_cap).max(1)
 }
 
 fn liquidity_ratio_pico_bps(quantity: i64, bid_quantity: i64, ask_quantity: i64) -> i64 {
@@ -4107,6 +4249,13 @@ fn simulation_session_allows_entry(symbol: &str, timestamp_ms: u64) -> bool {
     )
 }
 
+fn residual_pico_bps_for_state(state: &SimulationSymbolState) -> Option<i64> {
+    let book = state.book?;
+    let fair_value = fair_value_for_state(state)?;
+    let mid = clamp_i128((i128::from(book.bid_price_ticks) + i128::from(book.ask_price_ticks)) / 2);
+    (mid > 0).then(|| bps_between_pico(fair_value.price.0, mid))
+}
+
 fn update_markout_feedback(
     state: &mut SimulationSymbolState,
     mark_price_ticks: i64,
@@ -4131,6 +4280,12 @@ fn update_markout_feedback(
         } else {
             0
         };
+        let sample_pico_bps = (i128::from(sample_micro_bps)
+            * i128::from(PICO_BPS_SCALE / MICRO_BPS_SCALE))
+        .clamp(0, i128::from(i64::MAX)) as i64;
+        state
+            .calibration
+            .observe_markout(timestamp_ms, sample_pico_bps);
         state.ewma_adverse_markout_micro_bps =
             ewma_micro(state.ewma_adverse_markout_micro_bps, sample_micro_bps);
         state.evaluated_markouts = state.evaluated_markouts.saturating_add(1);

@@ -1,6 +1,6 @@
 //! M9 deadline-constrained causal residual / joint-outcome / DRO-MPC policy.
 use super::PriceTicks;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub const M9_MODEL_VERSION: &str = "m9-dcr-dro-mpc-v1";
 const PICO_BPS_SCALE: i128 = 1_000_000_000_000;
@@ -22,7 +22,7 @@ pub enum M9Action {
     ReduceSell,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct M9Calibration {
     pub half_life_ms: u64,
     pub exit_lead_ms: u64,
@@ -32,11 +32,12 @@ pub struct M9Calibration {
     pub uncertainty_bps: i64,
     pub adverse_selection_bps: i64,
     pub exit_participation_bps: i64,
-    pub min_residual_bps: i64,
-    pub min_robust_lcb_bps: i64,
+    pub min_residual_pico_bps: i64,
+    pub min_robust_lcb_pico_bps: i64,
 }
 
 impl M9Calibration {
+    #[cfg(test)]
     /// Explicit conservative bootstrap prior. It is a versioned prior, not
     /// evidence of alpha; production calibration must replace this bundle.
     pub const fn bootstrap() -> Self {
@@ -49,12 +50,12 @@ impl M9Calibration {
             uncertainty_bps: 8,
             adverse_selection_bps: 4,
             exit_participation_bps: 5_000,
-            min_residual_bps: 8,
-            min_robust_lcb_bps: 2,
+            min_residual_pico_bps: PICO_BPS_SCALE as i64,
+            min_robust_lcb_pico_bps: 2 * PICO_BPS_SCALE as i64,
         }
     }
 
-    fn valid(self) -> bool {
+    pub(crate) fn valid(self) -> bool {
         self.half_life_ms > 0
             && self.exit_lead_ms > 0
             && self.fill_horizon_ms > 0
@@ -63,8 +64,8 @@ impl M9Calibration {
             && self.uncertainty_bps >= 0
             && self.adverse_selection_bps >= 0
             && (0..=10_000).contains(&self.exit_participation_bps)
-            && self.min_residual_bps >= 0
-            && self.min_robust_lcb_bps >= 0
+            && self.min_residual_pico_bps >= 0
+            && self.min_robust_lcb_pico_bps >= 0
     }
 }
 
@@ -180,8 +181,18 @@ fn phase(remaining_ms: u64, calibration: M9Calibration) -> M9Phase {
     }
 }
 
-fn positive_capacity(input: M9Input, calibration: M9Calibration, exposure: i64) -> i64 {
-    let depth = input.bid_quantity.min(input.ask_quantity).max(0);
+fn positive_capacity(
+    input: M9Input,
+    calibration: M9Calibration,
+    exposure: i64,
+    exit_buy: bool,
+) -> i64 {
+    let depth = if exit_buy {
+        input.bid_quantity
+    } else {
+        input.ask_quantity
+    }
+    .max(0);
     let depth_cap = i128::from(depth) * i128::from(calibration.exit_participation_bps) / 10_000;
     exposure
         .max(0)
@@ -229,11 +240,14 @@ pub fn decide(input: M9Input, calibration: M9Calibration) -> M9Decision {
     let residual = pico_to_bps(residual_pico);
     let signal = residual_pico.signum();
     let abs_residual_pico = residual_pico.unsigned_abs().min(i64::MAX as u64) as i64;
-    let exit_capacity = positive_capacity(
-        input,
-        calibration,
-        input.position.unsigned_abs().min(i64::MAX as u64) as i64,
-    );
+    let current_exposure = input.position.unsigned_abs().min(i64::MAX as u64) as i64;
+    let candidate_exposure = current_exposure.saturating_add(input.requested_quantity.max(0));
+    let exit_buy = if input.position != 0 {
+        input.position < 0
+    } else {
+        signal < 0
+    };
+    let exit_capacity = positive_capacity(input, calibration, candidate_exposure, exit_buy);
     if input.position != 0
         && (current_phase == M9Phase::Exit || (signal != 0 && signal != input.position.signum()))
     {
@@ -265,7 +279,7 @@ pub fn decide(input: M9Input, calibration: M9Calibration) -> M9Decision {
     if current_phase == M9Phase::Exit || current_phase == M9Phase::Reconcile {
         return M9Decision::blocked(input, current_phase, "entry_deadline_passed");
     }
-    if signal == 0 || abs_residual_pico < bps_to_pico(calibration.min_residual_bps) {
+    if signal == 0 || abs_residual_pico < calibration.min_residual_pico_bps {
         return M9Decision::blocked(input, current_phase, "residual_below_identification_floor");
     }
     let decay = i128::from(remaining.min(calibration.half_life_ms.saturating_mul(8))) * 10_000
@@ -310,7 +324,7 @@ pub fn decide(input: M9Input, calibration: M9Calibration) -> M9Decision {
     if quantity <= 0 {
         return M9Decision::blocked(input, current_phase, "exit_capacity_or_position_limit");
     }
-    if robust_lcb_pico < bps_to_pico(calibration.min_robust_lcb_bps) {
+    if robust_lcb_pico < calibration.min_robust_lcb_pico_bps {
         return M9Decision {
             action: M9Action::NoAction,
             phase: current_phase,
@@ -399,6 +413,34 @@ mod tests {
         assert_eq!(
             decide(x, M9Calibration::bootstrap()).action,
             M9Action::ReduceSell
+        );
+    }
+    #[test]
+    fn flat_entry_has_capacity_when_candidate_is_exitable() {
+        let mut x = input();
+        x.fair_value_ticks = PriceTicks(105_000);
+        x.bid_quantity = 10_000;
+        x.ask_quantity = 10_000;
+        x.queue_ahead_quantity = 0;
+        x.volatility_bps = 0;
+        x.spread_bps = 0;
+        x.fee_bps = 0;
+        x.markout_bps = 0;
+        x.volatility_pico_bps = 0;
+        x.spread_pico_bps = 0;
+        x.fee_pico_bps = 0;
+        x.markout_pico_bps = 0;
+        let mut calibration = M9Calibration::bootstrap();
+        calibration.fill_hazard_bps = 10_000;
+        calibration.null_rw_min_weight_bps = 0;
+        calibration.uncertainty_bps = 0;
+        calibration.adverse_selection_bps = 0;
+        calibration.min_robust_lcb_pico_bps = 0;
+        let decision = decide(x, calibration);
+        assert!(decision.exit_capacity_quantity > 0);
+        assert!(
+            decision.quantity > 0,
+            "flat entry was incorrectly capacity-blocked"
         );
     }
     #[test]

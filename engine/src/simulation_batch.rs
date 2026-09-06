@@ -8,7 +8,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
@@ -19,7 +19,7 @@ use crate::{
         ValidationSummary,
     },
     backtest::realism::{LatencyModel, QueueModel, RealisticFillModel},
-    execution::BinanceEnvironment,
+    execution::{BinanceEnvironment, SessionCheckpoint},
     market::{
         binance::{parse_price_ticks, parse_quantity, BinanceMarketEvent},
         metadata::BinanceDepthSnapshot,
@@ -36,6 +36,10 @@ use crate::{
     simulation::engine::{
         AnchorSnapshot, PerformancePoint, PositionAllocation, SimulationEngine, SimulationError,
         SimulationPolicyVariant, SimulationSummary,
+    },
+    strategy::{
+        CalibrationSnapshot, CalibrationState, CALIBRATION_MODEL_VERSION,
+        CALIBRATION_SCHEMA_VERSION,
     },
 };
 
@@ -80,6 +84,9 @@ pub struct SimulationBatchConfig {
     pub dynamic_capital_refresh_ms: u64,
     /// REST snapshot depth used to seed the live-like local order book.
     pub depth_snapshot_limit: usize,
+    pub checkpoint_path: Option<PathBuf>,
+    pub checkpoint_session_id: Option<String>,
+    pub checkpoint_interval_ms: u64,
     pub duration_secs: u64,
     /// Shared, deterministic evidence test fed exactly once per public event.
     pub evidence: EvidenceConfig,
@@ -111,6 +118,14 @@ pub struct SimulationBatchResult {
     pub ledgers: Vec<SimulationLedgerResult>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CalibrationStore {
+    schema_version: u32,
+    model_version: String,
+    updated_at_event_time_ms: u64,
+    snapshots: BTreeMap<String, CalibrationSnapshot>,
+}
+
 struct Ledger {
     spec: SimulationBatchSpec,
     engine: SimulationEngine,
@@ -128,6 +143,68 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+async fn load_calibration_seeds(path: &Path) -> BTreeMap<String, CalibrationState> {
+    let Ok(bytes) = tokio::fs::read(path).await else {
+        return BTreeMap::new();
+    };
+    let Ok(store) = serde_json::from_slice::<CalibrationStore>(&bytes) else {
+        return BTreeMap::new();
+    };
+    if store.schema_version != CALIBRATION_SCHEMA_VERSION
+        || store.model_version != CALIBRATION_MODEL_VERSION
+    {
+        return BTreeMap::new();
+    }
+    store
+        .snapshots
+        .into_iter()
+        .filter_map(|(symbol, snapshot)| {
+            if symbol != snapshot.instrument || snapshot.replay().is_err() {
+                None
+            } else {
+                Some((symbol, snapshot.state))
+            }
+        })
+        .collect()
+}
+
+fn calibration_rank(snapshot: &CalibrationSnapshot) -> (u64, u64, u64, u64) {
+    (
+        snapshot.effective_sample_size,
+        snapshot.state.fill_events,
+        snapshot.state.completed_orders,
+        snapshot.window_end_event_time_ms,
+    )
+}
+
+async fn persist_calibration_store(path: &Path, ledgers: &[Ledger]) -> Result<(), SimulationError> {
+    let mut snapshots = BTreeMap::<String, CalibrationSnapshot>::new();
+    for ledger in ledgers {
+        for (symbol, snapshot) in ledger.engine.calibration_snapshots(0) {
+            let replace = snapshots
+                .get(&symbol)
+                .map(|previous| calibration_rank(&snapshot) > calibration_rank(previous))
+                .unwrap_or(true);
+            if replace {
+                snapshots.insert(symbol, snapshot);
+            }
+        }
+    }
+    let updated_at_event_time_ms = snapshots
+        .values()
+        .map(|snapshot| snapshot.window_end_event_time_ms)
+        .max()
+        .unwrap_or(0);
+    let store = CalibrationStore {
+        schema_version: CALIBRATION_SCHEMA_VERSION,
+        model_version: CALIBRATION_MODEL_VERSION.to_owned(),
+        updated_at_event_time_ms,
+        snapshots,
+    };
+    write_json_atomic(path, &store).await?;
+    Ok(())
 }
 
 #[allow(clippy::type_complexity)]
@@ -179,6 +256,7 @@ async fn unique_output_root(root: &Path) -> Result<PathBuf, SimulationError> {
 fn build_engine(
     config: &SimulationBatchConfig,
     spec: &SimulationBatchSpec,
+    calibration_seeds: &BTreeMap<String, CalibrationState>,
 ) -> Result<SimulationEngine, SimulationError> {
     let realism = RealisticFillModel {
         queue: QueueModel {
@@ -208,6 +286,7 @@ fn build_engine(
     .with_quote_reprice_min_interval_ms(config.quote_reprice_min_interval_ms)
     .with_dynamic_capital_refresh_ms(config.dynamic_capital_refresh_ms)
     .with_threshold_scale_ppm(config.threshold_scale_ppm);
+    engine.restore_calibration_states(calibration_seeds);
     if let Some(allocations) = config.position_allocations.clone() {
         engine = engine.with_position_allocations(allocations)?;
     }
@@ -247,6 +326,11 @@ pub async fn run(
         return Err(SimulationError::InvalidConfig(
             "simulation policy identity must be non-empty",
         ));
+    }
+    let calibration_store_path = config.output_root.join("calibration/latest.json");
+    let calibration_seeds = load_calibration_seeds(&calibration_store_path).await;
+    if let Some(parent) = calibration_store_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
     }
     config.output_root = unique_output_root(&config.output_root).await?;
     tokio::fs::create_dir_all(&config.output_root).await?;
@@ -359,7 +443,7 @@ pub async fn run(
         } = spawn_line_writer(Some(dir.join("records.jsonl")), 16_384, 1 << 20, 256).await;
         ledgers.push(Ledger {
             spec: spec.clone(),
-            engine: build_engine(&config, spec)?,
+            engine: build_engine(&config, spec, &calibration_seeds)?,
             record_tx,
             record_writer,
             record_written,
@@ -544,6 +628,7 @@ pub async fn run(
         tokio::time::interval(Duration::from_millis(config.metrics_refresh_ms.max(250)));
     let mut last_received_at_ms = 0_u64;
     let mut event_sequence = 0_u64;
+    let mut last_checkpoint_at_ms = 0_u64;
     let mut fx_latest = BTreeMap::<String, FxUpdate>::new();
     let run_result = tokio::time::timeout(run_duration, async {
         loop {
@@ -551,6 +636,32 @@ pub async fn run(
                 biased;
                 _ = metrics_interval.tick() => {
                     let observed_at = now_ms();
+                    if let (Some(path), Some(session_id)) =
+                        (&config.checkpoint_path, config.checkpoint_session_id.as_deref())
+                    {
+                        if observed_at.saturating_sub(last_checkpoint_at_ms)
+                            >= config.checkpoint_interval_ms.max(1_000)
+                        {
+                            let mut checkpoint =
+                                SessionCheckpoint::new(session_id, "simulation", "PORTFOLIO");
+                            for ledger in &ledgers {
+                                let (event_at_ms, position_ticks, working_order_ids) =
+                                    ledger.engine.checkpoint_view();
+                                checkpoint.last_event_at_ms =
+                                    checkpoint.last_event_at_ms.max(event_at_ms);
+                                checkpoint.position_ticks =
+                                    checkpoint.position_ticks.saturating_add(position_ticks);
+                                checkpoint.working_order_ids.extend(working_order_ids);
+                            }
+                            checkpoint.risk_stopped = last_received_at_ms == 0
+                                || observed_at.saturating_sub(last_received_at_ms)
+                                    > config.read_timeout_ms.max(5_000);
+                            checkpoint.write_atomic(path).map_err(|error| {
+                                SimulationError::Io(format!("checkpoint write failed: {error}"))
+                            })?;
+                            last_checkpoint_at_ms = observed_at;
+                        }
+                    }
                     write_json_atomic(&evidence_summary_path, &evidence.summary()).await?;
                     for ledger in &mut ledgers {
                         ledger.history.push_back(ledger.engine.performance_point(observed_at));
@@ -558,6 +669,7 @@ pub async fn run(
                         let snapshot = ledger.engine.metrics_snapshot_with_history(observed_at, last_received_at_ms, ledger.history.make_contiguous());
                         write_json_atomic(&ledger.metrics_path, &snapshot).await?;
                     }
+                    persist_calibration_store(&calibration_store_path, &ledgers).await?;
                 }
                 event = event_rx.recv() => {
                     let Some(event) = event else { return Err::<(), SimulationError>(SimulationError::Market("all market shards stopped".to_owned())); };
