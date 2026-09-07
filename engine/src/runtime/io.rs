@@ -1,7 +1,7 @@
 use std::{
-    io,
+    fs::File,
+    io::{self, Read, Write},
     path::{Path, PathBuf},
-    process::Stdio,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -10,9 +10,10 @@ use std::{
 };
 
 use serde::Serialize;
-use tokio::{io::AsyncWriteExt, process::Command, sync::mpsc, task::JoinHandle};
+use sha2::{Digest, Sha256};
+use tokio::{io::AsyncWriteExt, sync::mpsc, task::JoinHandle};
 
-const LINE_WRITER_SEGMENT_BYTES: u64 = 256 * 1024 * 1024;
+const LINE_WRITER_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 
 pub struct AsyncLineWriter {
     pub sender: mpsc::Sender<String>,
@@ -127,70 +128,96 @@ async fn compress_segment(path: &Path, segment: u64) -> Result<(), io::Error> {
         .and_then(|name| name.to_str())
         .ok_or_else(|| io::Error::other("line-writer path has no UTF-8 file name"))?;
     let raw_path = path.with_file_name(format!("{file_name}.segment-{segment:06}"));
-    let archive_path = raw_path.with_extension("gz");
+    let archive_path = raw_path.with_file_name(format!("{file_name}.segment-{segment:06}.zst"));
+    let metadata_path =
+        raw_path.with_file_name(format!("{file_name}.segment-{segment:06}.zst.meta.json"));
     tokio::fs::rename(path, &raw_path)
         .await
         .map_err(|error| io_context("archive line-writer segment", &raw_path, error))?;
+    tokio::task::spawn_blocking(move || {
+        compress_segment_blocking(raw_path, archive_path, metadata_path)
+    })
+    .await
+    .map_err(|error| io::Error::other(format!("compression task failed: {error}")))?
+}
 
-    let raw_size = tokio::fs::metadata(&raw_path)
-        .await
-        .map_err(|error| io_context("inspect line-writer segment", &raw_path, error))?
-        .len();
-    if raw_size == 0 {
-        tokio::fs::remove_file(&raw_path)
-            .await
-            .map_err(|error| io_context("discard empty line-writer segment", &raw_path, error))?;
-        return Ok(());
-    }
-
-    let archive = std::fs::File::create(&archive_path).map_err(|error| {
+fn compress_segment_blocking(
+    raw_path: PathBuf,
+    archive_path: PathBuf,
+    metadata_path: PathBuf,
+) -> Result<(), io::Error> {
+    let mut input = File::open(&raw_path)
+        .map_err(|error| io_context("open raw line-writer segment", &raw_path, error))?;
+    let temporary_archive = archive_path.with_extension("zst.tmp");
+    let archive = File::create(&temporary_archive).map_err(|error| {
         io_context(
-            "create compressed line-writer archive",
-            &archive_path,
+            "create temporary compressed line-writer archive",
+            &temporary_archive,
             error,
         )
     })?;
-    let output = Command::new("gzip")
-        .arg("-n")
-        .arg("-c")
-        .arg(&raw_path)
-        .stdout(Stdio::from(archive))
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|error| io_context("compress line-writer segment", &raw_path, error))?;
-    if !output.status.success() {
-        let _ = tokio::fs::remove_file(&archive_path).await;
-        return Err(io_context(
-            "compress line-writer segment",
-            &raw_path,
-            io::Error::other(String::from_utf8_lossy(&output.stderr).trim().to_owned()),
-        ));
+    let mut encoder = zstd::stream::write::Encoder::new(archive, 3)
+        .map_err(|error| io_context("create zstd encoder", &raw_path, error))?;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut hasher = Sha256::new();
+    let mut uncompressed_bytes = 0_u64;
+    let mut line_count = 0_u64;
+    loop {
+        let read = input
+            .read(&mut buffer)
+            .map_err(|error| io_context("read raw line-writer segment", &raw_path, error))?;
+        if read == 0 {
+            break;
+        }
+        let bytes = &buffer[..read];
+        encoder
+            .write_all(bytes)
+            .map_err(|error| io_context("write zstd line-writer archive", &archive_path, error))?;
+        hasher.update(bytes);
+        uncompressed_bytes = uncompressed_bytes.saturating_add(read as u64);
+        line_count =
+            line_count.saturating_add(bytes.iter().filter(|byte| **byte == b'\n').count() as u64);
     }
-    let archive_size = tokio::fs::metadata(&archive_path)
-        .await
-        .map_err(|error| {
-            io_context(
-                "verify compressed line-writer archive",
-                &archive_path,
-                error,
-            )
-        })?
+    let archive = encoder
+        .finish()
+        .map_err(|error| io_context("finish zstd line-writer archive", &archive_path, error))?;
+    archive
+        .sync_all()
+        .map_err(|error| io_context("sync zstd line-writer archive", &archive_path, error))?;
+    let compressed_bytes = archive
+        .metadata()
+        .map_err(|error| io_context("inspect zstd line-writer archive", &archive_path, error))?
         .len();
-    if archive_size == 0 {
-        let _ = tokio::fs::remove_file(&archive_path).await;
+    if compressed_bytes == 0 {
+        let _ = std::fs::remove_file(&temporary_archive);
         return Err(io_context(
-            "verify compressed line-writer archive",
-            &archive_path,
+            "verify zstd line-writer archive",
+            &temporary_archive,
             io::Error::other("compressed archive is empty"),
         ));
     }
-    tokio::fs::remove_file(&raw_path)
-        .await
+    std::fs::rename(&temporary_archive, &archive_path)
+        .map_err(|error| io_context("publish zstd line-writer archive", &archive_path, error))?;
+    let metadata = serde_json::json!({
+        "schema_version": 1,
+        "compression": "zstd",
+        "compression_level": 3,
+        "uncompressed_bytes": uncompressed_bytes,
+        "compressed_bytes": compressed_bytes,
+        "line_count": line_count,
+        "sha256": hex::encode(hasher.finalize()),
+    });
+    let metadata_bytes = serde_json::to_vec_pretty(&metadata)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let temporary_metadata = metadata_path.with_extension("json.tmp");
+    std::fs::write(&temporary_metadata, metadata_bytes)
+        .map_err(|error| io_context("write zstd archive metadata", &temporary_metadata, error))?;
+    std::fs::rename(&temporary_metadata, &metadata_path)
+        .map_err(|error| io_context("publish zstd archive metadata", &metadata_path, error))?;
+    std::fs::remove_file(&raw_path)
         .map_err(|error| io_context("remove verified raw line-writer segment", &raw_path, error))?;
     Ok(())
 }
-
 pub async fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), io::Error> {
     let bytes = serde_json::to_vec(value).map_err(|error| io::Error::other(error.to_string()))?;
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -280,5 +307,32 @@ mod tests {
         writer.sender.send("one".to_owned()).await.unwrap();
         drop(writer.sender);
         assert_eq!(writer.task.await.unwrap().unwrap(), 1);
+    }
+
+    #[test]
+    fn zstd_archive_round_trips_with_integrity_metadata() {
+        let root = std::env::temp_dir().join(format!(
+            "anchorbell-io-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let raw = root.join("records.jsonl.segment-000000");
+        let archive = raw.with_file_name("records.jsonl.segment-000000.zst");
+        let metadata = raw.with_file_name("records.jsonl.segment-000000.zst.meta.json");
+        let original = b"{\"kind\":\"fill\",\"quantity\":3}\n{ \"kind\": \"cancel\" }\n";
+        std::fs::write(&raw, original).unwrap();
+        compress_segment_blocking(raw.clone(), archive.clone(), metadata.clone()).unwrap();
+        let restored = zstd::stream::decode_all(File::open(&archive).unwrap()).unwrap();
+        assert_eq!(restored, original);
+        assert!(!raw.exists());
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&metadata).unwrap()).unwrap();
+        assert_eq!(metadata["compression"], "zstd");
+        assert_eq!(metadata["line_count"], 2);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
