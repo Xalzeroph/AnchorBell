@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     env,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -184,7 +184,6 @@ async fn run(args: Args) -> Result<i32, String> {
         &symbols,
         args.price_scale,
         args.quantity_scale,
-        args.send_orders,
     )
     .await?;
     for symbol in &symbols {
@@ -244,6 +243,7 @@ async fn run(args: Args) -> Result<i32, String> {
     let mut working = recovered_working;
     let mut order_sequence = 0_u64;
     let mut last_gate_blockers = Vec::<String>::new();
+    let mut last_checkpoint_at_ms = 0_u64;
     let mut health_tick = tokio::time::interval(Duration::from_millis(250));
     health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -277,6 +277,19 @@ async fn run(args: Args) -> Result<i32, String> {
                     }
                 } else {
                     last_gate_blockers.clear();
+                }
+                if now.saturating_sub(last_checkpoint_at_ms) >= 5_000 {
+                    persist_live_checkpoint(
+                        &checkpoint_path,
+                        &run_id,
+                        &state,
+                        &working,
+                        supervisor.state() != SupervisorState::Healthy,
+                    )?;
+                    registry
+                        .checkpoint(&run_id, checkpoint_path.display().to_string(), now)
+                        .map_err(|error| format!("live checkpoint registration failed: {error}"))?;
+                    last_checkpoint_at_ms = now;
                 }
             }
             event = rx.recv() => {
@@ -391,7 +404,6 @@ async fn run(args: Args) -> Result<i32, String> {
                         &symbols,
                         args.price_scale,
                         args.quantity_scale,
-                        args.send_orders,
                     )
                     .await?;
                     for symbol in &symbols {
@@ -473,8 +485,17 @@ async fn run(args: Args) -> Result<i32, String> {
                             GateDecision::Flatten(reason) => {
                                 supervisor.begin_flatten()
                                     .map_err(|r| format!("flatten transition rejected: {r:?}"))?;
-                                cancel_symbol_orders(&client, &credentials, symbol).await?;
-                                working.remove(symbol);
+                                if args.send_orders {
+                                    cancel_symbol_orders(&client, &credentials, symbol).await?;
+                                    working.remove(symbol);
+                                } else {
+                                    println!("{}", serde_json::json!({
+                                        "event": "order_mutation_skipped",
+                                        "action": "cancel_symbol_orders",
+                                        "symbol": symbol,
+                                        "reason": "read_only_mode",
+                                    }));
+                                }
                                 if args.send_orders {
                                     let local = state.get(symbol).expect("initialized symbol");
                                     if local.position_ticks != 0 {
@@ -542,10 +563,31 @@ async fn run(args: Args) -> Result<i32, String> {
     }
 
     for symbol in &symbols {
-        if let Some(order) = working.remove(symbol) {
-            cancel_order(&client, &credentials, symbol, &order.client_order_id).await?;
+        if let Some(order) = working.get(symbol).cloned() {
+            if args.send_orders {
+                cancel_order(&client, &credentials, symbol, &order.client_order_id).await?;
+                working.remove(symbol);
+            } else {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "order_mutation_skipped",
+                        "action": "cancel_order",
+                        "symbol": symbol,
+                        "client_order_id": order.client_order_id,
+                        "reason": "read_only_mode",
+                    })
+                );
+            }
         }
     }
+    persist_live_checkpoint(
+        &checkpoint_path,
+        &run_id,
+        &state,
+        &working,
+        supervisor.state() != SupervisorState::Healthy,
+    )?;
     registry
         .transition(&run_id, RunStatus::Completed, now_ms())
         .map_err(|error| format!("live run registry completion failed: {error}"))?;
@@ -575,7 +617,6 @@ async fn reconcile_account(
     symbols: &[String],
     price_scale: u32,
     quantity_scale: u32,
-    send_orders: bool,
 ) -> Result<BTreeMap<String, RemoteSymbolState>, String> {
     let timestamp = client.server_time_ms().await.map_err(|e| e.to_string())?;
     let snapshot = client
@@ -590,14 +631,10 @@ async fn reconcile_account(
 
     for order in &snapshot.open_orders {
         if !is_configured(&order.symbol) {
-            if send_orders {
-                cancel_order(client, credentials, &order.symbol, &order.client_order_id).await?;
-            } else {
-                eprintln!(
-                    "read-only observation: external open order on unknown symbol {}: {}",
-                    order.symbol, order.client_order_id
-                );
-            }
+            return Err(format!(
+                "untracked external open order on unknown symbol {}: {}; refusing live start",
+                order.symbol, order.client_order_id
+            ));
         }
     }
 
@@ -625,13 +662,11 @@ async fn reconcile_account(
                     price_ticks,
                     quantity_ticks,
                 });
-            } else if !send_orders {
-                eprintln!(
-                    "read-only observation: external open order on {symbol}: {}",
-                    order.client_order_id
-                );
             } else {
-                cancel_order(client, credentials, symbol, &order.client_order_id).await?;
+                return Err(format!(
+                    "untracked external open order on {symbol}: {}; refusing live start",
+                    order.client_order_id
+                ));
             }
         }
 
@@ -906,6 +941,47 @@ async fn spawn_user_data(
 
 // This edge adapter keeps authentication, order identity, and exchange scales explicit.
 #[allow(clippy::too_many_arguments)]
+fn persist_live_checkpoint(
+    path: &Path,
+    session_id: &str,
+    state: &BTreeMap<String, SymbolState>,
+    working: &BTreeMap<String, WorkingOrder>,
+    risk_stopped: bool,
+) -> Result<(), String> {
+    let mut checkpoint = SessionCheckpoint::new(session_id, "live", "PORTFOLIO");
+    for (symbol, local) in state {
+        checkpoint.position_ticks = checkpoint
+            .position_ticks
+            .saturating_add(local.position_ticks);
+        checkpoint.gross_position_ticks = checkpoint
+            .gross_position_ticks
+            .saturating_add(local.position_ticks.checked_abs().unwrap_or(i64::MAX));
+        checkpoint
+            .portfolio_positions
+            .insert(format!("live::{symbol}"), local.position_ticks);
+    }
+    checkpoint.working_order_ids = working
+        .iter()
+        .map(|(symbol, order)| format!("live::{symbol}:{}", order.client_order_id))
+        .collect();
+    checkpoint.last_event_at_ms = state
+        .values()
+        .flat_map(|local| {
+            [
+                local.book.as_ref().map(|value| value.event_time_ms),
+                local.mark.as_ref().map(|value| value.event_time_ms),
+            ]
+            .into_iter()
+            .flatten()
+        })
+        .max()
+        .unwrap_or(0);
+    checkpoint.risk_stopped = risk_stopped;
+    checkpoint
+        .write_atomic(path)
+        .map_err(|error| format!("live checkpoint write failed: {error}"))
+}
+
 async fn place_order(
     client: &BinanceRestClient,
     credentials: &BinanceCredentials,
