@@ -1,6 +1,8 @@
 use std::{
     collections::BTreeMap,
     env,
+    fs::{self, File, OpenOptions},
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
     process,
     sync::Arc,
@@ -23,7 +25,9 @@ use anchorbell_engine::{
         audit::AuditSink,
         control_plane::RuntimeControlPlane,
         run_registry::{RunMode, RunRegistry, RunSpec, RunStatus, RUN_REGISTRY_SCHEMA_VERSION},
+        DataQuality, EventEnvelope, EventSource,
     },
+    simulation::{AnchorSnapshot, SimulationEngine, SimulationPolicyVariant, SimulationRecord},
     strategy::{
         adaptive_intent_from_market, calendar_for, profile_for, AnchorCurrency, EquityRegion,
         VenueSessionState,
@@ -75,6 +79,192 @@ struct WorkingOrder {
     side: Side,
     price_ticks: i64,
     quantity_ticks: i64,
+}
+
+const SHADOW_SCHEMA_VERSION: u32 = 1;
+const SHADOW_FEE_PPM: i64 = 200;
+
+#[derive(Debug, serde::Serialize)]
+struct ShadowRecordLine<'a> {
+    schema_version: u32,
+    live_market_event_sequence: u64,
+    live_run_id: &'a str,
+    record: &'a SimulationRecord,
+}
+
+struct ShadowSimulation {
+    engine: SimulationEngine,
+    records: BufWriter<File>,
+    live_observations: BufWriter<File>,
+    summary_path: PathBuf,
+    live_market_event_sequence: u64,
+}
+
+impl ShadowSimulation {
+    fn new(
+        run_id: &str,
+        shadow_dir: &Path,
+        anchors: BTreeMap<String, AnchorSnapshot>,
+        args: &Args,
+    ) -> Result<Self, String> {
+        fs::create_dir_all(shadow_dir)
+            .map_err(|error| format!("shadow simulation directory failed: {error}"))?;
+        let engine = SimulationEngine::new(
+            anchors,
+            args.entry_threshold_bps,
+            args.max_position,
+            args.quantity,
+            args.max_mark_index_gap_bps,
+            args.max_anchor_age_ms,
+            SHADOW_FEE_PPM,
+            args.quantity_scale,
+        )
+        .map_err(|error| format!("shadow simulation config rejected: {error}"))?
+        .with_live_risk_gates()
+        .with_strategy_variant(SimulationPolicyVariant::M4Statistical)
+        .with_price_scale(args.price_scale);
+        let manifest = serde_json::json!({
+            "schema_version": SHADOW_SCHEMA_VERSION,
+            "run_id": run_id,
+            "mode": "live_shadow_simulation",
+            "strategy_variant": SimulationPolicyVariant::M4Statistical.label(),
+            "market_event_source": "live_binance_public",
+            "execution": "simulation_only",
+            "fee_ppm": SHADOW_FEE_PPM,
+            "entry_threshold_bps": args.entry_threshold_bps,
+            "max_position": args.max_position,
+            "requested_quantity": args.quantity,
+            "max_mark_index_gap_bps": args.max_mark_index_gap_bps,
+            "max_anchor_age_ms": args.max_anchor_age_ms,
+            "price_scale": args.price_scale,
+            "quantity_scale": args.quantity_scale,
+        });
+        fs::write(
+            shadow_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest)
+                .map_err(|error| format!("shadow manifest encode failed: {error}"))?,
+        )
+        .map_err(|error| format!("shadow manifest write failed: {error}"))?;
+        let records = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(shadow_dir.join("simulation-records.jsonl"))
+            .map_err(|error| format!("shadow records open failed: {error}"))?;
+        let observations = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(shadow_dir.join("live-observations.jsonl"))
+            .map_err(|error| format!("shadow observations open failed: {error}"))?;
+        Ok(Self {
+            engine,
+            records: BufWriter::new(records),
+            live_observations: BufWriter::new(observations),
+            summary_path: shadow_dir.join("summary.json"),
+            live_market_event_sequence: 0,
+        })
+    }
+
+    fn on_market(
+        &mut self,
+        run_id: &str,
+        event: BinanceMarketEvent,
+        observed_at_ms: u64,
+        received_at_ms: u64,
+    ) -> Result<u64, String> {
+        self.live_market_event_sequence = self.live_market_event_sequence.saturating_add(1);
+        let sequence = self.live_market_event_sequence;
+        let envelope = EventEnvelope {
+            event_id: format!("{run_id}-market-{sequence}").into(),
+            run_id: run_id.to_owned().into(),
+            causality_id: format!("{run_id}-market-stream").into(),
+            source: EventSource::BinancePublic,
+            observed_at_ms,
+            received_at_ms: received_at_ms.max(observed_at_ms),
+            sequence,
+            state_version: sequence,
+            quality: DataQuality::Trusted,
+            payload: event,
+        };
+        let records = self
+            .engine
+            .on_enveloped_event(&envelope)
+            .map_err(|error| format!("shadow market event rejected at {sequence}: {error}"))?;
+        for record in &records {
+            let line = ShadowRecordLine {
+                schema_version: SHADOW_SCHEMA_VERSION,
+                live_market_event_sequence: sequence,
+                live_run_id: run_id,
+                record,
+            };
+            serde_json::to_writer(&mut self.records, &line)
+                .map_err(|error| format!("shadow record encode failed: {error}"))?;
+            self.records
+                .write_all(b"\n")
+                .map_err(|error| format!("shadow record write failed: {error}"))?;
+        }
+        if !records.is_empty() {
+            self.records
+                .flush()
+                .map_err(|error| format!("shadow record flush failed: {error}"))?;
+        }
+        Ok(sequence)
+    }
+
+    fn live_observation(&mut self, value: serde_json::Value) -> Result<(), String> {
+        serde_json::to_writer(&mut self.live_observations, &value)
+            .map_err(|error| format!("live observation encode failed: {error}"))?;
+        self.live_observations
+            .write_all(b"\n")
+            .map_err(|error| format!("live observation write failed: {error}"))?;
+        self.live_observations
+            .flush()
+            .map_err(|error| format!("live observation flush failed: {error}"))?;
+        Ok(())
+    }
+
+    fn finish(mut self, run_id: &str, timestamp_ms: u64) -> Result<(), String> {
+        let records = self.engine.cancel_all(timestamp_ms, "live_shadow_shutdown");
+        let sequence = self.live_market_event_sequence;
+        for record in &records {
+            let line = ShadowRecordLine {
+                schema_version: SHADOW_SCHEMA_VERSION,
+                live_market_event_sequence: sequence,
+                live_run_id: run_id,
+                record,
+            };
+            serde_json::to_writer(&mut self.records, &line)
+                .map_err(|error| format!("shadow final record encode failed: {error}"))?;
+            self.records
+                .write_all(b"\n")
+                .map_err(|error| format!("shadow final record write failed: {error}"))?;
+        }
+        self.records
+            .flush()
+            .map_err(|error| format!("shadow final record flush failed: {error}"))?;
+        self.live_observations
+            .flush()
+            .map_err(|error| format!("live observation final flush failed: {error}"))?;
+        let (last_event_at_ms, position_ticks, gross_position_ticks, working_order_ids, positions) =
+            self.engine.checkpoint_view("shadow");
+        let summary = serde_json::json!({
+            "schema_version": SHADOW_SCHEMA_VERSION,
+            "run_id": run_id,
+            "completed_at_ms": timestamp_ms,
+            "last_event_at_ms": last_event_at_ms,
+            "position_ticks": position_ticks,
+            "gross_position_ticks": gross_position_ticks,
+            "working_order_ids": working_order_ids,
+            "portfolio_positions": positions,
+            "summary": self.engine.summary(),
+        });
+        fs::write(
+            &self.summary_path,
+            serde_json::to_vec_pretty(&summary)
+                .map_err(|error| format!("shadow summary encode failed: {error}"))?,
+        )
+        .map_err(|error| format!("shadow summary write failed: {error}"))?;
+        Ok(())
+    }
 }
 
 #[tokio::main]
@@ -165,6 +355,21 @@ async fn run(args: Args) -> Result<i32, String> {
     if anchors.len() != LIVE_SYMBOLS.len() {
         return Err("anchor set is not the exact nine-symbol universe".into());
     }
+    let shadow_dir = checkpoint_path
+        .parent()
+        .ok_or_else(|| "live checkpoint has no parent directory".to_owned())?
+        .join("shadow-simulation");
+    let mut shadow = ShadowSimulation::new(&run_id, &shadow_dir, anchors.clone(), &args)?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "event": "live_shadow_simulation_started",
+            "run_id": run_id,
+            "path": shadow_dir,
+            "strategy_variant": SimulationPolicyVariant::M4Statistical.label(),
+            "execution": "simulation_only",
+        })
+    );
 
     let mut control_plane = RuntimeControlPlane::new();
     let mut audit_sink = AuditSink::from_environment("target/runtime-audit.jsonl");
@@ -242,6 +447,7 @@ async fn run(args: Args) -> Result<i32, String> {
     let mut supervisor_ready = false;
     let mut working = recovered_working;
     let mut order_sequence = 0_u64;
+    let mut last_shadow_event_sequence = 0_u64;
     let mut last_gate_blockers = Vec::<String>::new();
     let mut last_checkpoint_at_ms = 0_u64;
     let mut health_tick = tokio::time::interval(Duration::from_millis(250));
@@ -299,6 +505,13 @@ async fn run(args: Args) -> Result<i32, String> {
                 };
                 match event {
                     Event::Market(value) => {
+                        let received_at_ms = now_ms();
+                        last_shadow_event_sequence = shadow.on_market(
+                            &run_id,
+                            value.clone(),
+                            market_event_time_ms(&value),
+                            received_at_ms,
+                        )?;
                         let symbol = market_event_symbol(&value).to_owned();
                         if !state.contains_key(&symbol) {
                             return Err(format!("market event outside declared universe: {symbol}"));
@@ -336,6 +549,14 @@ async fn run(args: Args) -> Result<i32, String> {
                     }
                     Event::User(value) => {
                         apply_user(&mut state, &mut working, &value, args.quantity_scale)?;
+                        let payload = serde_json::to_value(&value)
+                            .map_err(|error| format!("live user observation encode failed: {error}"))?;
+                        shadow.live_observation(serde_json::json!({
+                            "kind": "live_user_event",
+                            "market_event_sequence": last_shadow_event_sequence,
+                            "received_at_ms": now_ms(),
+                            "payload": payload,
+                        }))?;
                         control_plane
                             .observe_user_data(now_ms())
                             .map_err(|error| format!("lifecycle health report rejected: {error}"))?;
@@ -458,6 +679,16 @@ async fn run(args: Args) -> Result<i32, String> {
                         ) else { continue };
                         let (gate_decision, decision_audit) =
                             supervisor.evaluate_with_audit(symbol, intent, now);
+                        let decision_payload = serde_json::to_value(&decision_audit)
+                            .map_err(|error| format!("live decision observation encode failed: {error}"))?;
+                        shadow.live_observation(serde_json::json!({
+                            "kind": "live_decision",
+                            "market_event_sequence": last_shadow_event_sequence,
+                            "received_at_ms": now,
+                            "symbol": symbol,
+                            "gate": format!("{gate_decision:?}"),
+                            "decision": decision_payload,
+                        }))?;
                         println!("{}", serde_json::json!({
                             "event": "decision_audit",
                             "decision": decision_audit,
@@ -588,6 +819,7 @@ async fn run(args: Args) -> Result<i32, String> {
         &working,
         supervisor.state() != SupervisorState::Healthy,
     )?;
+    shadow.finish(&run_id, now_ms())?;
     registry
         .transition(&run_id, RunStatus::Completed, now_ms())
         .map_err(|error| format!("live run registry completion failed: {error}"))?;
@@ -700,6 +932,15 @@ fn market_event_symbol(event: &BinanceMarketEvent) -> &str {
         BinanceMarketEvent::MarkPrice(value) => &value.symbol,
         BinanceMarketEvent::AggTrade(value) => &value.symbol,
         BinanceMarketEvent::DepthUpdate(value) => &value.symbol,
+    }
+}
+
+fn market_event_time_ms(event: &BinanceMarketEvent) -> u64 {
+    match event {
+        BinanceMarketEvent::BookTicker(value) => value.event_time_ms,
+        BinanceMarketEvent::MarkPrice(value) => value.event_time_ms,
+        BinanceMarketEvent::AggTrade(value) => value.event_time_ms,
+        BinanceMarketEvent::DepthUpdate(value) => value.event_time_ms,
     }
 }
 
