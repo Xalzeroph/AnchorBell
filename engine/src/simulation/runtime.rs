@@ -2352,10 +2352,13 @@ impl SimulationEngine {
         };
         self.fill_count = self.fill_count.saturating_add(1);
         self.filled_quantity = self.filled_quantity.saturating_add(quantity);
+        let portfolio_absolute_position = self
+            .states
+            .values()
+            .map(|state| state.position.checked_abs().unwrap_or(i64::MAX))
+            .fold(0_i64, i64::saturating_add);
+        self.peak_absolute_position = self.peak_absolute_position.max(portfolio_absolute_position);
         let state = self.states.get(&symbol).expect("symbol state exists");
-        self.peak_absolute_position = self
-            .peak_absolute_position
-            .max(state.position.checked_abs().unwrap_or(i64::MAX));
         vec![self.record(
             &symbol,
             state,
@@ -2544,8 +2547,12 @@ impl SimulationEngine {
                         "entry_restricted_without_position_reduction",
                     )
                 } else {
-                    let (desired, exit_reason) =
-                        maker_exit_intent_for_state(state, timestamp_ms, self.quantity_scale);
+                    let (desired, exit_reason) = maker_exit_intent_for_state(
+                        symbol,
+                        state,
+                        timestamp_ms,
+                        self.quantity_scale,
+                    );
                     (desired, true, state.working.is_some(), exit_reason)
                 }
             } else if strategy_variant == SimulationPolicyVariant::M9DeadlineCausalDroMpc {
@@ -3334,6 +3341,7 @@ fn m9_intent_for_state(
 }
 
 fn maker_exit_intent_for_state(
+    symbol: &str,
     state: &SimulationSymbolState,
     timestamp_ms: u64,
     quantity_scale: u32,
@@ -3361,9 +3369,13 @@ fn maker_exit_intent_for_state(
     let Some(funding) = funding else {
         return (None, "maker_exit_funding_schedule_invalid");
     };
-    let Some(plan) =
-        DualFlattenPlan::new(timestamp_ms, None, funding, 30 * 60 * 1_000, 5 * 60 * 1_000)
-    else {
+    let Some(plan) = DualFlattenPlan::new(
+        timestamp_ms,
+        next_equity_pre_open_at_ms(symbol, timestamp_ms),
+        funding,
+        30 * 60 * 1_000,
+        5 * 60 * 1_000,
+    ) else {
         return (None, "maker_exit_plan_invalid");
     };
     let position_quantity = position_quantity.min(i64::MAX);
@@ -3441,6 +3453,31 @@ fn funding_entry_allowed(state: &SimulationSymbolState, now_ms: u64) -> bool {
     state.next_funding_time_ms > now_ms
         && funding_flatten_deadline(state.next_funding_time_ms)
             .is_some_and(|deadline| now_ms < deadline)
+}
+
+fn next_equity_pre_open_at_ms(symbol: &str, timestamp_ms: u64) -> Option<u64> {
+    let profile = profile_for(symbol)?;
+    let calendar = calendar_for(profile.region);
+    let current_day = local_day(timestamp_ms);
+    let current_minute = local_minute(timestamp_ms);
+
+    for day_offset in 0..=7_u64 {
+        let day = current_day.saturating_add(day_offset);
+        let day_start_ms = day.saturating_mul(86_400_000).saturating_sub(8 * 3_600_000);
+        let date_key = EquitySessionCalendar::date_key_from_timestamp(day_start_ms);
+        let weekday = local_weekday(day_start_ms);
+        if weekday > 5
+            || calendar.is_holiday(date_key)
+            || !EquitySessionCalendar::calendar_snapshot_supported(date_key)
+        {
+            continue;
+        }
+        if day_offset == 0 && current_minute >= profile.pre_open_minute {
+            continue;
+        }
+        return Some(day_start_ms.saturating_add(u64::from(profile.pre_open_minute) * 60_000));
+    }
+    None
 }
 
 fn m8_funding_decision(
@@ -5466,6 +5503,19 @@ mod tests {
             next_close
         ));
         assert!(anchor_refresh_allowed("CXMTUSDT", overnight));
+    }
+
+    #[test]
+    fn next_equity_pre_open_uses_region_specific_session_boundary() {
+        let timestamp_ms = 1_788_742_182_000_u64;
+        assert_eq!(
+            next_equity_pre_open_at_ms("CXMTUSDT", timestamp_ms),
+            Some(1_788_743_700_000)
+        );
+        assert_eq!(
+            next_equity_pre_open_at_ms("MINIMAXUSDT", timestamp_ms),
+            Some(1_788_742_800_000)
+        );
     }
 
     #[test]
