@@ -2535,16 +2535,19 @@ impl SimulationEngine {
             let entries_allowed = session_allowed && funding_allowed;
             let tail_reduce_only = strategy_variant.uses_tail_guard() && m5_tail_reduce_only(state);
             if !entries_allowed || tail_reduce_only {
-                let should_reduce = !session_allowed
-                    || (!funding_allowed && state.position != 0)
-                    || funding_reduce_only
-                    || tail_reduce_only;
+                let should_reduce = position_requires_reduction(
+                    state.position,
+                    session_allowed,
+                    funding_allowed,
+                    funding_reduce_only,
+                    tail_reduce_only,
+                );
                 if !should_reduce {
                     (
                         None,
                         true,
                         state.working.is_some(),
-                        "entry_restricted_without_position_reduction",
+                        entry_restriction_reason(state.position, session_allowed, funding_allowed),
                     )
                 } else {
                     let (desired, exit_reason) = maker_exit_intent_for_state(
@@ -3338,6 +3341,31 @@ fn m9_intent_for_state(
         M9Action::NoAction => None,
     };
     (intent, reduce_only, decision.reason)
+}
+
+fn position_requires_reduction(
+    position: i64,
+    session_allowed: bool,
+    funding_allowed: bool,
+    funding_reduce_only: bool,
+    tail_reduce_only: bool,
+) -> bool {
+    position != 0
+        && (!session_allowed || !funding_allowed || funding_reduce_only || tail_reduce_only)
+}
+
+fn entry_restriction_reason(
+    position: i64,
+    session_allowed: bool,
+    funding_allowed: bool,
+) -> &'static str {
+    if position == 0 && !session_allowed {
+        "equity_session_open"
+    } else if position == 0 && !funding_allowed {
+        "funding_entry_blocked"
+    } else {
+        "entry_restricted_without_position_reduction"
+    }
 }
 
 fn maker_exit_intent_for_state(
@@ -5206,6 +5234,22 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::{entry_restriction_reason, position_requires_reduction};
+
+    #[test]
+    fn flat_risk_gate_does_not_enter_maker_exit_path() {
+        assert!(!position_requires_reduction(0, false, true, false, false));
+        assert_eq!(
+            entry_restriction_reason(0, false, true),
+            "equity_session_open"
+        );
+        assert_eq!(
+            entry_restriction_reason(0, true, false),
+            "funding_entry_blocked"
+        );
+        assert!(position_requires_reduction(10, false, true, false, false));
+    }
+
     use super::*;
     use crate::market::binance::parse_market_message;
 
