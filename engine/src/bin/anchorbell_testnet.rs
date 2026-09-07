@@ -266,6 +266,10 @@ async fn run(args: Args) -> Result<i32, String> {
         let mut checkpoint =
             SessionCheckpoint::new(session_id, args.environment.as_str(), &args.symbol);
         checkpoint.position_ticks = state.position_ticks;
+        checkpoint.gross_position_ticks = state.position_ticks.checked_abs().unwrap_or(i64::MAX);
+        checkpoint
+            .portfolio_positions
+            .insert(args.symbol.to_ascii_uppercase(), state.position_ticks);
         checkpoint.working_order_ids = state
             .working
             .as_ref()

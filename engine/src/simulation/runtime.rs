@@ -1643,22 +1643,30 @@ impl SimulationEngine {
         }
     }
 
-    pub fn checkpoint_view(&self) -> (u64, i64, Vec<String>) {
-        let position_ticks = self
-            .states
-            .values()
-            .map(|state| state.position)
-            .fold(0_i64, i64::saturating_add);
-        let working_order_ids = self
-            .states
-            .values()
-            .filter_map(|state| {
-                state
-                    .working
-                    .map(|order| format!("{}:{}", self.strategy_variant.label(), order.client_id))
-            })
-            .collect();
-        (self.last_event_at_ms, position_ticks, working_order_ids)
+    pub fn checkpoint_view(
+        &self,
+        source_label: &str,
+    ) -> (u64, i64, i64, Vec<String>, BTreeMap<String, i64>) {
+        let mut position_ticks = 0_i64;
+        let mut gross_position_ticks = 0_i64;
+        let mut portfolio_positions = BTreeMap::new();
+        let mut working_order_ids = Vec::new();
+        for (symbol, state) in &self.states {
+            position_ticks = position_ticks.saturating_add(state.position);
+            gross_position_ticks = gross_position_ticks
+                .saturating_add(state.position.checked_abs().unwrap_or(i64::MAX));
+            portfolio_positions.insert(format!("{source_label}::{symbol}"), state.position);
+            if let Some(order) = state.working {
+                working_order_ids.push(format!("{source_label}::{symbol}:{}", order.client_id));
+            }
+        }
+        (
+            self.last_event_at_ms,
+            position_ticks,
+            gross_position_ticks,
+            working_order_ids,
+            portfolio_positions,
+        )
     }
 
     pub fn restore_calibration_states(&mut self, seeds: &BTreeMap<String, CalibrationState>) {

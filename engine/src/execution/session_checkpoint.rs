@@ -1,11 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub const SESSION_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
+pub const SESSION_CHECKPOINT_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionCheckpoint {
@@ -14,7 +15,12 @@ pub struct SessionCheckpoint {
     pub environment: String,
     pub symbol: String,
     pub last_event_at_ms: u64,
+    /// Signed net position. Independent ledgers may offset one another.
     pub position_ticks: i64,
+    /// Sum of absolute positions across the checkpoint scope.
+    pub gross_position_ticks: i64,
+    /// Per-ledger positions keyed by strategy_label::symbol.
+    pub portfolio_positions: BTreeMap<String, i64>,
     pub working_order_ids: Vec<String>,
     pub risk_stopped: bool,
 }
@@ -29,6 +35,8 @@ pub enum CheckpointError {
     UnsupportedSchema(u16),
     #[error("checkpoint session id is empty")]
     EmptySessionId,
+    #[error("checkpoint gross position does not match its position detail")]
+    GrossPositionMismatch,
 }
 
 impl SessionCheckpoint {
@@ -44,6 +52,8 @@ impl SessionCheckpoint {
             symbol: symbol.into(),
             last_event_at_ms: 0,
             position_ticks: 0,
+            gross_position_ticks: 0,
+            portfolio_positions: BTreeMap::new(),
             working_order_ids: Vec::new(),
             risk_stopped: true,
         }
@@ -55,6 +65,30 @@ impl SessionCheckpoint {
         }
         if self.session_id.trim().is_empty() {
             return Err(CheckpointError::EmptySessionId);
+        }
+        if self.gross_position_ticks < 0 {
+            return Err(CheckpointError::GrossPositionMismatch);
+        }
+        let computed_net = self
+            .portfolio_positions
+            .values()
+            .copied()
+            .fold(0_i64, i64::saturating_add);
+        if computed_net != self.position_ticks {
+            return Err(CheckpointError::GrossPositionMismatch);
+        }
+        let computed_gross = self
+            .portfolio_positions
+            .values()
+            .map(|position| position.checked_abs().unwrap_or(i64::MAX))
+            .fold(0_i64, i64::saturating_add);
+        let expected_gross = if self.symbol == "PORTFOLIO" {
+            computed_gross
+        } else {
+            self.position_ticks.checked_abs().unwrap_or(i64::MAX)
+        };
+        if self.gross_position_ticks != expected_gross {
+            return Err(CheckpointError::GrossPositionMismatch);
         }
         Ok(())
     }
@@ -138,12 +172,28 @@ mod tests {
         ));
         let mut checkpoint = SessionCheckpoint::new("session-1", "testnet", "BTCUSDT");
         checkpoint.position_ticks = -12;
+        checkpoint.gross_position_ticks = 12;
+        checkpoint.portfolio_positions.insert("BTCUSDT".into(), -12);
         checkpoint.working_order_ids = vec!["client-7".into()];
         checkpoint.write_atomic(&path).unwrap();
         let restored = SessionCheckpoint::read(&path).unwrap();
         assert_eq!(restored, checkpoint);
         assert!(restored.risk_stopped);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn portfolio_checkpoint_keeps_offsetting_positions_visible() {
+        let mut checkpoint = SessionCheckpoint::new("session-1", "simulation", "PORTFOLIO");
+        checkpoint
+            .portfolio_positions
+            .insert("M1::BTCUSDT".into(), 12);
+        checkpoint
+            .portfolio_positions
+            .insert("M2::BTCUSDT".into(), -12);
+        checkpoint.position_ticks = 0;
+        checkpoint.gross_position_ticks = 24;
+        assert!(checkpoint.validate().is_ok());
     }
 
     #[test]

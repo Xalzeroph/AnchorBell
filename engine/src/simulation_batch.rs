@@ -669,13 +669,22 @@ pub async fn run(
                             let mut checkpoint =
                                 SessionCheckpoint::new(session_id, "simulation", "PORTFOLIO");
                             for ledger in &ledgers {
-                                let (event_at_ms, position_ticks, working_order_ids) =
-                                    ledger.engine.checkpoint_view();
+                                let (
+                                    event_at_ms,
+                                    position_ticks,
+                                    gross_position_ticks,
+                                    working_order_ids,
+                                    portfolio_positions,
+                                ) = ledger.engine.checkpoint_view(&ledger.spec.label);
                                 checkpoint.last_event_at_ms =
                                     checkpoint.last_event_at_ms.max(event_at_ms);
                                 checkpoint.position_ticks =
                                     checkpoint.position_ticks.saturating_add(position_ticks);
+                                checkpoint.gross_position_ticks = checkpoint
+                                    .gross_position_ticks
+                                    .saturating_add(gross_position_ticks);
                                 checkpoint.working_order_ids.extend(working_order_ids);
+                                checkpoint.portfolio_positions.extend(portfolio_positions);
                             }
                             checkpoint.risk_stopped = last_received_at_ms == 0
                                 || observed_at.saturating_sub(last_received_at_ms)

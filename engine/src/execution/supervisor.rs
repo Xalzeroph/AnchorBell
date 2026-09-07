@@ -194,9 +194,11 @@ impl ExecutionSupervisor {
         let Some(state) = self.symbols.get(key.as_str()) else {
             return Err(GateReason::UnknownSymbol);
         };
-        let mut checkpoint = SessionCheckpoint::new(session_id, environment, key);
+        let mut checkpoint = SessionCheckpoint::new(session_id, environment, key.clone());
         checkpoint.last_event_at_ms = last_event_at_ms;
         checkpoint.position_ticks = state.position;
+        checkpoint.gross_position_ticks = state.position.checked_abs().unwrap_or(i64::MAX);
+        checkpoint.portfolio_positions.insert(key, state.position);
         checkpoint.working_order_ids = self.tracked_orders.iter().cloned().collect();
         checkpoint.risk_stopped = self.state != SupervisorState::Healthy;
         Ok(checkpoint)
