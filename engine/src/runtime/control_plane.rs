@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use crate::platform::{
-    HealthSnapshot, ReadinessReport, RegistryError, RuntimeProfile, SystemRegistry, SystemState,
+    HealthSnapshot, ReadinessReport, RegistryError, RuntimeProfile, SystemRegistry, SystemRole,
+    SystemState,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -65,7 +66,7 @@ impl RuntimeControlPlane {
         self.registry.mark_stale_at(now_ms);
         self.capture_health_transitions();
         self.registry
-            .readiness_for_capability("execution.submit", now_ms)
+            .readiness_for_role(SystemRole::ExecutionGateway, now_ms)
     }
 
     pub fn execution_ready(&mut self, now_ms: u64) -> bool {
@@ -78,43 +79,32 @@ impl RuntimeControlPlane {
         profile: RuntimeProfile,
         observed_at_ms: u64,
     ) -> Result<(), RegistryError> {
-        let systems = self.registry.profile_system_ids(profile)?;
-        for id in systems {
-            self.ready(id, observed_at_ms)?;
-        }
+        self.registry.profile_system_ids(profile)?;
+        // Profile activation only validates and discovers the registry-owned
+        // closure. A system becomes Ready only after its real producer reports
+        // a heartbeat; topology alone must never create liveness.
+        let _ = observed_at_ms;
         Ok(())
     }
 
     /// Report the minimum live bootstrap contract after credentials, market
     /// metadata and the initial exchange reconciliation have succeeded.
     pub fn bootstrap_ready(&mut self, observed_at_ms: u64) -> Result<(), RegistryError> {
-        for id in [
-            "control.kernel",
-            "observability.telemetry",
-            "decision.risk",
-            "execution.gateway",
-            "execution.lifecycle",
-        ] {
-            self.ready(id, observed_at_ms)?;
-        }
-        Ok(())
+        self.signal_ready("runtime_bootstrap", observed_at_ms)
     }
 
     pub fn observe_market(&mut self, observed_at_ms: u64) -> Result<(), RegistryError> {
-        self.ready("market.binance", observed_at_ms)?;
-        self.ready("market.anchor", observed_at_ms)?;
-        // Risk evaluation and the local gateway are event-loop participants.
-        // This is a liveness heartbeat, never an exchange acknowledgement.
-        self.ready("decision.risk", observed_at_ms)?;
-        self.ready("execution.gateway", observed_at_ms)
+        // Registered market participants declare this signal beside their
+        // implementation; the control plane never owns a system ID list.
+        self.signal_ready("market_events", observed_at_ms)
     }
 
     pub fn observe_reference(&mut self, observed_at_ms: u64) -> Result<(), RegistryError> {
-        self.ready("market.reference", observed_at_ms)
+        self.signal_ready("reference_data", observed_at_ms)
     }
 
     pub fn observe_user_data(&mut self, observed_at_ms: u64) -> Result<(), RegistryError> {
-        self.ready("execution.lifecycle", observed_at_ms)
+        self.signal_ready("user_data", observed_at_ms)
     }
 
     pub fn degrade(
@@ -163,6 +153,14 @@ impl RuntimeControlPlane {
             self.capture_health_transitions();
         }
         result
+    }
+
+    fn signal_ready(&mut self, signal: &str, observed_at_ms: u64) -> Result<(), RegistryError> {
+        let result = self.registry.heartbeat_signal(signal, observed_at_ms);
+        if result.is_ok() {
+            self.capture_health_transitions();
+        }
+        result.map(|_| ())
     }
 
     fn ready(&mut self, id: &str, observed_at_ms: u64) -> Result<(), RegistryError> {

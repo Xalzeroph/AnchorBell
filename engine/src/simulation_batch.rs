@@ -10,7 +10,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
+use tokio::{process::Command, sync::mpsc};
 
 use crate::{
     analytics_evidence::{EvidenceAccumulator, EvidenceConfig},
@@ -45,6 +45,8 @@ use crate::{
 
 /// M9 uses a declared calibration population instead of whichever ledger has
 /// the largest sample count. This keeps the warm-start source auditable and
+const MIN_SIMULATION_FREE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const STORAGE_SAFETY_SCHEMA_VERSION: u16 = 1;
 /// avoids mixing policy-specific order selection into a single unlabeled model.
 const M9_CALIBRATION_SOURCE_LABEL: &str = "F3_m3";
 
@@ -148,6 +150,51 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+async fn available_storage_bytes(path: &Path) -> Result<u64, SimulationError> {
+    let output = Command::new("df")
+        .arg("-Pk")
+        .arg(path)
+        .output()
+        .await
+        .map_err(|error| SimulationError::Io(format!("storage check failed: {error}")))?;
+    if !output.status.success() {
+        return Err(SimulationError::Io(format!(
+            "storage check exited with {}",
+            output.status
+        )));
+    }
+    let available_kb = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .skip(1)
+        .find_map(|line| line.split_whitespace().nth(3))
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| {
+            SimulationError::Io("storage check returned no available-space value".to_owned())
+        })?;
+    Ok(available_kb.saturating_mul(1024))
+}
+
+async fn enforce_storage_safety(
+    output_root: &Path,
+    observed_at_ms: u64,
+) -> Result<(), SimulationError> {
+    let available_bytes = available_storage_bytes(output_root).await?;
+    if available_bytes < MIN_SIMULATION_FREE_BYTES {
+        let status = serde_json::json!({
+            "schema_version": STORAGE_SAFETY_SCHEMA_VERSION,
+            "status": "risk_stopped",
+            "reason": "simulation_storage_free_space_below_floor",
+            "observed_at_ms": observed_at_ms,
+            "available_bytes": available_bytes,
+            "minimum_free_bytes": MIN_SIMULATION_FREE_BYTES,
+        });
+        write_json_atomic(&output_root.join("storage-safety.json"), &status).await?;
+        return Err(SimulationError::Io(format!(
+            "simulation storage safety stop: {available_bytes} bytes available"
+        )));
+    }
+    Ok(())
 }
 
 async fn load_calibration_seeds(
@@ -660,6 +707,7 @@ pub async fn run(
                 biased;
                 _ = metrics_interval.tick() => {
                     let observed_at = now_ms();
+                    enforce_storage_safety(&config.output_root, observed_at).await?;
                     if let (Some(path), Some(session_id)) =
                         (&config.checkpoint_path, config.checkpoint_session_id.as_deref())
                     {

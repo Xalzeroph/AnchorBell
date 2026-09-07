@@ -18,7 +18,7 @@ use anchorbell_engine::{
         BinanceMarketConfig, BinanceMarketStream, BinanceSubscription, PublicMarketMetadataClient,
         ReconnectPolicy,
     },
-    platform::{HealthSnapshot, RuntimeProfile, SystemRegistry},
+    platform::{HealthSnapshot, RuntimeProfile, SystemRegistry, SystemRole},
     strategy::{instrument_for, EquityRegion},
 };
 use serde::{Deserialize, Serialize};
@@ -831,7 +831,7 @@ fn probe_response(kind: &str, status: u16) -> (u16, &'static str, Vec<u8>) {
 
 async fn readiness_response(state: &DashboardState) -> (u16, &'static str, Vec<u8>) {
     let registry = state.registry.lock().await;
-    let report = registry.readiness_for_capability("control.operations", now_ms());
+    let report = registry.readiness_for_role(SystemRole::ControlConsole, now_ms());
     let status = if report.ready { 200 } else { 503 };
     json_response(
         status,

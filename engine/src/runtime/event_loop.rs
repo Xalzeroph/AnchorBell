@@ -1,6 +1,6 @@
 use crate::event::EngineEvent;
 use crate::execution::OrderIntent;
-use crate::platform::{HealthSnapshot, ReadinessReport, SystemRegistry};
+use crate::platform::{HealthSnapshot, ReadinessReport, SystemRegistry, SystemRole};
 use crate::runtime::RuntimeChannels;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -72,13 +72,13 @@ impl TradingRuntime {
 
     pub fn live_readiness(&self, now_ms: u64) -> ReadinessReport {
         self.registry
-            .readiness_for_capability("execution.submit", now_ms)
+            .readiness_for_role(SystemRole::ExecutionGateway, now_ms)
     }
 
     /// Live entrypoints must opt into this admission check before new risk.
     pub fn require_live_execution(&self, now_ms: u64) -> Result<(), DispatchError> {
         self.registry
-            .require_capability("execution.submit", now_ms)
+            .require_role(SystemRole::ExecutionGateway, now_ms)
             .map_err(|_| DispatchError::SystemNotReady)
     }
 

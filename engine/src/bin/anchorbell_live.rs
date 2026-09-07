@@ -92,12 +92,31 @@ struct ShadowRecordLine<'a> {
     record: &'a SimulationRecord,
 }
 
+#[derive(Debug, Default, serde::Serialize)]
+struct ShadowDivergenceSummary {
+    live_decision_count: u64,
+    shadow_decision_count: u64,
+    live_order_count: u64,
+    shadow_order_count: u64,
+    live_fill_count: u64,
+    shadow_fill_count: u64,
+    live_cancel_count: u64,
+    shadow_cancel_count: u64,
+    fill_latency_samples: u64,
+    fill_latency_total_ms: u64,
+    fill_latency_max_ms: u64,
+    position_divergence_samples: u64,
+    max_abs_position_divergence_ticks: i64,
+}
+
 struct ShadowSimulation {
     engine: SimulationEngine,
     records: BufWriter<File>,
     live_observations: BufWriter<File>,
     summary_path: PathBuf,
     live_market_event_sequence: u64,
+    divergence: ShadowDivergenceSummary,
+    live_order_submitted_at_ms: BTreeMap<String, u64>,
 }
 
 impl ShadowSimulation {
@@ -161,6 +180,8 @@ impl ShadowSimulation {
             live_observations: BufWriter::new(observations),
             summary_path: shadow_dir.join("summary.json"),
             live_market_event_sequence: 0,
+            divergence: ShadowDivergenceSummary::default(),
+            live_order_submitted_at_ms: BTreeMap::new(),
         })
     }
 
@@ -190,6 +211,13 @@ impl ShadowSimulation {
             .on_enveloped_event(&envelope)
             .map_err(|error| format!("shadow market event rejected at {sequence}: {error}"))?;
         for record in &records {
+            match record.kind.as_str() {
+                "decision" => self.divergence.shadow_decision_count += 1,
+                "order_placed" => self.divergence.shadow_order_count += 1,
+                "fill" => self.divergence.shadow_fill_count += 1,
+                "order_canceled" => self.divergence.shadow_cancel_count += 1,
+                _ => {}
+            }
             let line = ShadowRecordLine {
                 schema_version: SHADOW_SCHEMA_VERSION,
                 live_market_event_sequence: sequence,
@@ -222,10 +250,85 @@ impl ShadowSimulation {
         Ok(())
     }
 
+    fn live_decision(&mut self, value: serde_json::Value) -> Result<(), String> {
+        self.divergence.live_decision_count = self.divergence.live_decision_count.saturating_add(1);
+        self.live_observation(value)
+    }
+
+    fn live_order_submitted(&mut self, client_order_id: &str, submitted_at_ms: u64) {
+        self.divergence.live_order_count = self.divergence.live_order_count.saturating_add(1);
+        self.live_order_submitted_at_ms
+            .insert(client_order_id.to_owned(), submitted_at_ms);
+    }
+
+    fn live_user_event(
+        &mut self,
+        value: &UserDataEvent,
+        live_position_ticks: i64,
+        received_at_ms: u64,
+    ) -> Result<(), String> {
+        if let UserDataEvent::OrderUpdate(order) = value {
+            if order.execution_type == "TRADE" {
+                self.divergence.live_fill_count = self.divergence.live_fill_count.saturating_add(1);
+                if let Some(submitted_at_ms) =
+                    self.live_order_submitted_at_ms.get(&order.client_order_id)
+                {
+                    let latency_ms = received_at_ms.saturating_sub(*submitted_at_ms);
+                    self.divergence.fill_latency_samples =
+                        self.divergence.fill_latency_samples.saturating_add(1);
+                    self.divergence.fill_latency_total_ms = self
+                        .divergence
+                        .fill_latency_total_ms
+                        .saturating_add(latency_ms);
+                    self.divergence.fill_latency_max_ms =
+                        self.divergence.fill_latency_max_ms.max(latency_ms);
+                }
+            }
+            if matches!(order.status.as_str(), "CANCELED" | "EXPIRED" | "REJECTED") {
+                self.divergence.live_cancel_count =
+                    self.divergence.live_cancel_count.saturating_add(1);
+            }
+            if matches!(
+                order.status.as_str(),
+                "FILLED" | "CANCELED" | "EXPIRED" | "REJECTED"
+            ) {
+                self.live_order_submitted_at_ms
+                    .remove(&order.client_order_id);
+            }
+        }
+        let (_, shadow_position_ticks, _, _, _) = self.engine.checkpoint_view("shadow");
+        let delta = live_position_ticks.saturating_sub(shadow_position_ticks);
+        let abs_delta = if delta < 0 {
+            delta.saturating_neg()
+        } else {
+            delta
+        };
+        self.divergence.position_divergence_samples = self
+            .divergence
+            .position_divergence_samples
+            .saturating_add(1);
+        self.divergence.max_abs_position_divergence_ticks = self
+            .divergence
+            .max_abs_position_divergence_ticks
+            .max(abs_delta);
+        self.live_observation(serde_json::json!({
+            "kind": "live_user_event",
+            "market_event_sequence": self.live_market_event_sequence,
+            "received_at_ms": received_at_ms,
+            "payload": value,
+        }))
+    }
     fn finish(mut self, run_id: &str, timestamp_ms: u64) -> Result<(), String> {
         let records = self.engine.cancel_all(timestamp_ms, "live_shadow_shutdown");
         let sequence = self.live_market_event_sequence;
         for record in &records {
+            match record.kind.as_str() {
+                "decision" => self.divergence.shadow_decision_count += 1,
+                "order_placed" => self.divergence.shadow_order_count += 1,
+                "fill" => self.divergence.shadow_fill_count += 1,
+                "order_canceled" => self.divergence.shadow_cancel_count += 1,
+                _ => {}
+            }
             let line = ShadowRecordLine {
                 schema_version: SHADOW_SCHEMA_VERSION,
                 live_market_event_sequence: sequence,
@@ -255,6 +358,7 @@ impl ShadowSimulation {
             "gross_position_ticks": gross_position_ticks,
             "working_order_ids": working_order_ids,
             "portfolio_positions": positions,
+            "divergence": self.divergence,
             "summary": self.engine.summary(),
         });
         fs::write(
@@ -549,14 +653,10 @@ async fn run(args: Args) -> Result<i32, String> {
                     }
                     Event::User(value) => {
                         apply_user(&mut state, &mut working, &value, args.quantity_scale)?;
-                        let payload = serde_json::to_value(&value)
-                            .map_err(|error| format!("live user observation encode failed: {error}"))?;
-                        shadow.live_observation(serde_json::json!({
-                            "kind": "live_user_event",
-                            "market_event_sequence": last_shadow_event_sequence,
-                            "received_at_ms": now_ms(),
-                            "payload": payload,
-                        }))?;
+                        let live_position_ticks = state.values().fold(0_i64, |total, item| {
+                            total.saturating_add(item.position_ticks)
+                        });
+                        shadow.live_user_event(&value, live_position_ticks, now_ms())?;
                         control_plane
                             .observe_user_data(now_ms())
                             .map_err(|error| format!("lifecycle health report rejected: {error}"))?;
@@ -681,7 +781,7 @@ async fn run(args: Args) -> Result<i32, String> {
                             supervisor.evaluate_with_audit(symbol, intent, now);
                         let decision_payload = serde_json::to_value(&decision_audit)
                             .map_err(|error| format!("live decision observation encode failed: {error}"))?;
-                        shadow.live_observation(serde_json::json!({
+                        shadow.live_decision(serde_json::json!({
                             "kind": "live_decision",
                             "market_event_sequence": last_shadow_event_sequence,
                             "received_at_ms": now,
@@ -702,6 +802,7 @@ async fn run(args: Args) -> Result<i32, String> {
                                         args.price_scale, args.quantity_scale,
                                         now, order_sequence, false,
                                     ).await?;
+                                    shadow.live_order_submitted(&order.client_order_id, now);
                                     println!("{}", serde_json::json!({
                                         "event":"order_accepted",
                                         "symbol":symbol,

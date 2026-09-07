@@ -98,12 +98,23 @@ pub struct SystemContract {
     pub system_id: &'static str,
     pub requires: &'static [&'static str],
     pub provides: &'static [&'static str],
+    pub consumes: &'static [&'static str],
     pub recovery: RecoveryPolicy,
 }
 
+#[derive(Debug, Clone)]
+pub struct SystemRegistration {
+    pub descriptor: SystemDescriptor,
+    pub contract: SystemContract,
+    pub implementation: &'static str,
+    pub profile_roots: &'static [RuntimeProfile],
+    pub health_signals: &'static [&'static str],
+}
+inventory::collect!(SystemRegistration);
+
 /// Runtime composition profile. Profiles describe system roots; dependencies
 /// are expanded from the registry so entrypoints never maintain ID lists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RuntimeProfile {
     Live,
     Dashboard,
@@ -113,23 +124,13 @@ pub enum RuntimeProfile {
 }
 
 impl RuntimeProfile {
-    pub const fn roots(self) -> &'static [&'static str] {
-        match self {
-            Self::Live => &[
-                "operations.supervisor",
-                "decision.strategy",
-                "decision.portfolio",
-                "decision.funding",
-                "observability.audit",
-            ],
-            Self::Dashboard => &["operations.console"],
-            Self::Simulation | Self::Batch => &["simulation.runtime", "observability.audit"],
-            Self::Backtest => &[
-                "simulation.backtest",
-                "analytics.validation",
-                "observability.audit",
-            ],
-        }
+    pub fn roots(self) -> Vec<&'static str> {
+        let mut roots = inventory::iter::<SystemRegistration>()
+            .filter(|registration| registration.profile_roots.contains(&self))
+            .map(|registration| registration.descriptor.id)
+            .collect::<Vec<_>>();
+        roots.sort_unstable();
+        roots
     }
 }
 
@@ -139,6 +140,7 @@ pub const PLATFORM_MANIFEST_SCHEMA_VERSION: u16 = 1;
 pub struct PlatformManifestEntry {
     pub descriptor: SystemDescriptor,
     pub contract: SystemContract,
+    pub implementation: Option<&'static str>,
     pub health: HealthSnapshot,
 }
 
@@ -153,36 +155,14 @@ impl SystemDescriptor {
         SystemContract {
             system_id: self.id,
             requires: self.dependencies,
-            provides: capabilities_for(self.role),
+            provides: &[],
+            consumes: &[],
             recovery: recovery_for(self.role, self.restartable),
         }
     }
 }
 
-fn capabilities_for(role: SystemRole) -> &'static [&'static str] {
-    match role {
-        SystemRole::Registry => &["system.discovery", "system.topology"],
-        SystemRole::ExchangeAdapter => &["market.events", "market.connection"],
-        SystemRole::ReferenceData => &["reference.fx", "reference.metadata", "reference.close"],
-        SystemRole::Anchor => &["anchor.snapshot"],
-        SystemRole::Strategy => &["decision.intent"],
-        SystemRole::Portfolio => &["decision.allocation"],
-        SystemRole::Risk => &["risk.admission", "risk.flatten"],
-        SystemRole::Funding => &["funding.schedule", "funding.deadline"],
-        SystemRole::ExecutionGateway => &["execution.submit", "execution.cancel"],
-        SystemRole::Lifecycle => &["execution.lifecycle", "execution.reconcile"],
-        SystemRole::Simulation => &["simulation.run"],
-        SystemRole::Replay => &["simulation.replay"],
-        SystemRole::Backtest => &["simulation.validation"],
-        SystemRole::Observability => &["telemetry.health"],
-        SystemRole::Audit => &["audit.events"],
-        SystemRole::ControlConsole => &["control.operations"],
-        SystemRole::Recovery => &["recovery.orchestration"],
-        SystemRole::Analytics => &["analytics.evidence"],
-    }
-}
-
-fn recovery_for(role: SystemRole, restartable: bool) -> RecoveryPolicy {
+const fn recovery_for(role: SystemRole, restartable: bool) -> RecoveryPolicy {
     if matches!(
         role,
         SystemRole::Registry | SystemRole::Risk | SystemRole::Recovery
@@ -361,198 +341,119 @@ impl ReadinessReport {
 pub struct SystemRegistry {
     descriptors: BTreeMap<&'static str, SystemDescriptor>,
     health: BTreeMap<String, HealthSnapshot>,
+    contracts: BTreeMap<&'static str, SystemContract>,
+    implementations: BTreeMap<&'static str, &'static str>,
+    profile_roots: BTreeMap<RuntimeProfile, Vec<&'static str>>,
+    health_signal_systems: BTreeMap<&'static str, Vec<&'static str>>,
 }
 
 impl Default for SystemRegistry {
     fn default() -> Self {
-        Self::from_catalog(Self::catalog()).expect("built-in system catalog must be valid")
+        Self::from_registered().expect("registered system catalog must be valid")
     }
 }
 
 impl SystemRegistry {
+    pub fn registrations() -> Vec<&'static SystemRegistration> {
+        let mut registrations = inventory::iter::<SystemRegistration>().collect::<Vec<_>>();
+        registrations.sort_by_key(|registration| registration.descriptor.id);
+        registrations
+    }
+
+    pub fn from_registered() -> Result<Self, RegistryError> {
+        let registrations = Self::registrations();
+        let descriptors = registrations
+            .iter()
+            .map(|registration| registration.descriptor.clone())
+            .collect::<Vec<_>>();
+        let mut registry = Self::from_catalog(descriptors)?;
+        for registration in registrations {
+            if registration.implementation.trim().is_empty() {
+                return Err(RegistryError::InvalidSystemId(format!(
+                    "{} has no implementation binding",
+                    registration.descriptor.id
+                )));
+            }
+            registry
+                .contracts
+                .insert(registration.descriptor.id, registration.contract.clone());
+            registry
+                .implementations
+                .insert(registration.descriptor.id, registration.implementation);
+            for profile in registration.profile_roots {
+                registry
+                    .profile_roots
+                    .entry(*profile)
+                    .or_default()
+                    .push(registration.descriptor.id);
+            }
+            for signal in registration.health_signals {
+                registry
+                    .health_signal_systems
+                    .entry(*signal)
+                    .or_default()
+                    .push(registration.descriptor.id);
+            }
+        }
+        for roots in registry.profile_roots.values_mut() {
+            roots.sort_unstable();
+            roots.dedup();
+        }
+        for systems in registry.health_signal_systems.values_mut() {
+            systems.sort_unstable();
+            systems.dedup();
+        }
+        registry.validate_registration_contracts()?;
+        Ok(registry)
+    }
+
+    fn validate_registration_contracts(&self) -> Result<(), RegistryError> {
+        let providers = self
+            .contracts
+            .values()
+            .flat_map(|contract| contract.provides.iter().copied())
+            .collect::<BTreeSet<_>>();
+        for (id, contract) in &self.contracts {
+            let Some(descriptor) = self.descriptor(id) else {
+                return Err(RegistryError::InvalidSystemId(format!(
+                    "contract has no descriptor: {id}"
+                )));
+            };
+            if *id != contract.system_id || contract.requires != descriptor.dependencies {
+                return Err(RegistryError::InvalidSystemId(format!(
+                    "contract metadata mismatch for {id}"
+                )));
+            }
+            for capability in contract.provides.iter().chain(contract.consumes.iter()) {
+                if capability.trim().is_empty() || capability.chars().any(char::is_whitespace) {
+                    return Err(RegistryError::InvalidSystemId(format!(
+                        "invalid capability {capability}"
+                    )));
+                }
+            }
+            for required in contract.consumes {
+                if !providers.contains(required) {
+                    return Err(RegistryError::InvalidSystemId(format!(
+                        "{id} consumes unprovided capability {required}"
+                    )));
+                }
+            }
+        }
+        for id in self.descriptors.keys() {
+            if !self.implementations.contains_key(id) {
+                return Err(RegistryError::InvalidSystemId(format!(
+                    "{id} has no implementation binding"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn catalog() -> Vec<SystemDescriptor> {
-        vec![
-            SystemDescriptor {
-                id: "control.kernel",
-                layer: PlatformLayer::Control,
-                role: SystemRole::Registry,
-                authority: Authority::Internal,
-                mutability: Mutability::ImmutableCore,
-                dependencies: &[],
-                health_interval_ms: 5_000,
-                restartable: false,
-            },
-            SystemDescriptor {
-                id: "market.binance",
-                layer: PlatformLayer::MarketData,
-                role: SystemRole::ExchangeAdapter,
-                authority: Authority::Binance,
-                mutability: Mutability::ImmutableCore,
-                dependencies: &["control.kernel"],
-                health_interval_ms: 2_000,
-                restartable: true,
-            },
-            SystemDescriptor {
-                id: "market.reference",
-                layer: PlatformLayer::MarketData,
-                role: SystemRole::ReferenceData,
-                authority: Authority::ExternalReference,
-                mutability: Mutability::ImmutableCore,
-                dependencies: &["control.kernel"],
-                health_interval_ms: 30_000,
-                restartable: true,
-            },
-            SystemDescriptor {
-                id: "market.anchor",
-                layer: PlatformLayer::MarketData,
-                role: SystemRole::Anchor,
-                authority: Authority::Derived,
-                mutability: Mutability::ImmutableCore,
-                dependencies: &["market.binance", "market.reference"],
-                health_interval_ms: 2_000,
-                restartable: true,
-            },
-            SystemDescriptor {
-                id: "decision.strategy",
-                layer: PlatformLayer::Decision,
-                role: SystemRole::Strategy,
-                authority: Authority::Internal,
-                mutability: Mutability::GovernedPolicy,
-                dependencies: &["market.anchor"],
-                health_interval_ms: 1_000,
-                restartable: true,
-            },
-            SystemDescriptor {
-                id: "decision.portfolio",
-                layer: PlatformLayer::Decision,
-                role: SystemRole::Portfolio,
-                authority: Authority::Internal,
-                mutability: Mutability::GovernedPolicy,
-                dependencies: &["decision.strategy", "decision.risk"],
-                health_interval_ms: 1_000,
-                restartable: true,
-            },
-            SystemDescriptor {
-                id: "decision.risk",
-                layer: PlatformLayer::Decision,
-                role: SystemRole::Risk,
-                authority: Authority::Internal,
-                mutability: Mutability::ImmutableCore,
-                dependencies: &["market.binance", "market.anchor"],
-                health_interval_ms: 500,
-                restartable: false,
-            },
-            SystemDescriptor {
-                id: "decision.funding",
-                layer: PlatformLayer::Decision,
-                role: SystemRole::Funding,
-                authority: Authority::Binance,
-                mutability: Mutability::GovernedPolicy,
-                dependencies: &["market.binance", "decision.risk"],
-                health_interval_ms: 2_000,
-                restartable: true,
-            },
-            SystemDescriptor {
-                id: "execution.gateway",
-                layer: PlatformLayer::Execution,
-                role: SystemRole::ExecutionGateway,
-                authority: Authority::Binance,
-                mutability: Mutability::ImmutableCore,
-                dependencies: &["market.binance", "decision.risk"],
-                health_interval_ms: 1_000,
-                restartable: true,
-            },
-            SystemDescriptor {
-                id: "execution.lifecycle",
-                layer: PlatformLayer::Execution,
-                role: SystemRole::Lifecycle,
-                authority: Authority::Binance,
-                mutability: Mutability::ImmutableCore,
-                dependencies: &["execution.gateway", "decision.risk"],
-                health_interval_ms: 1_000,
-                restartable: true,
-            },
-            SystemDescriptor {
-                id: "simulation.runtime",
-                layer: PlatformLayer::Simulation,
-                role: SystemRole::Simulation,
-                authority: Authority::Derived,
-                mutability: Mutability::GovernedPolicy,
-                dependencies: &["market.anchor", "decision.strategy", "decision.risk"],
-                health_interval_ms: 5_000,
-                restartable: true,
-            },
-            SystemDescriptor {
-                id: "simulation.replay",
-                layer: PlatformLayer::Simulation,
-                role: SystemRole::Replay,
-                authority: Authority::Derived,
-                mutability: Mutability::GovernedPolicy,
-                dependencies: &["market.binance"],
-                health_interval_ms: 5_000,
-                restartable: true,
-            },
-            SystemDescriptor {
-                id: "simulation.backtest",
-                layer: PlatformLayer::Simulation,
-                role: SystemRole::Backtest,
-                authority: Authority::Derived,
-                mutability: Mutability::GovernedPolicy,
-                dependencies: &["simulation.replay", "decision.strategy"],
-                health_interval_ms: 5_000,
-                restartable: true,
-            },
-            SystemDescriptor {
-                id: "analytics.validation",
-                layer: PlatformLayer::Analytics,
-                role: SystemRole::Analytics,
-                authority: Authority::Derived,
-                mutability: Mutability::GovernedPolicy,
-                dependencies: &["simulation.backtest"],
-                health_interval_ms: 10_000,
-                restartable: true,
-            },
-            SystemDescriptor {
-                id: "observability.telemetry",
-                layer: PlatformLayer::Observability,
-                role: SystemRole::Observability,
-                authority: Authority::Internal,
-                mutability: Mutability::ImmutableCore,
-                dependencies: &["control.kernel"],
-                health_interval_ms: 5_000,
-                restartable: true,
-            },
-            SystemDescriptor {
-                id: "observability.audit",
-                layer: PlatformLayer::Observability,
-                role: SystemRole::Audit,
-                authority: Authority::Internal,
-                mutability: Mutability::ImmutableCore,
-                dependencies: &["observability.telemetry"],
-                health_interval_ms: 5_000,
-                restartable: true,
-            },
-            SystemDescriptor {
-                id: "operations.supervisor",
-                layer: PlatformLayer::Operations,
-                role: SystemRole::Recovery,
-                authority: Authority::Internal,
-                mutability: Mutability::ImmutableCore,
-                dependencies: &["control.kernel", "execution.lifecycle"],
-                health_interval_ms: 1_000,
-                restartable: false,
-            },
-            SystemDescriptor {
-                id: "operations.console",
-                layer: PlatformLayer::Operations,
-                role: SystemRole::ControlConsole,
-                authority: Authority::Operator,
-                mutability: Mutability::GovernedPolicy,
-                dependencies: &["control.kernel", "observability.telemetry"],
-                health_interval_ms: 10_000,
-                restartable: true,
-            },
-        ]
+        Self::registrations()
+            .into_iter()
+            .map(|registration| registration.descriptor.clone())
+            .collect()
     }
 
     /// Expand a profile from its registered roots and dependency closure.
@@ -592,6 +493,10 @@ impl SystemRegistry {
         let mut registry = Self {
             descriptors: BTreeMap::new(),
             health: BTreeMap::new(),
+            contracts: BTreeMap::new(),
+            implementations: BTreeMap::new(),
+            profile_roots: BTreeMap::new(),
+            health_signal_systems: BTreeMap::new(),
         };
         for descriptor in descriptors {
             if descriptor.id.trim().is_empty() || descriptor.id.chars().any(char::is_whitespace) {
@@ -632,11 +537,26 @@ impl SystemRegistry {
     }
 
     pub fn contract(&self, id: &str) -> Option<SystemContract> {
-        self.descriptor(id).map(SystemDescriptor::contract)
+        self.contracts.get(id).cloned().or_else(|| {
+            self.descriptor(id).map(|descriptor| {
+                let provides = Self::registrations()
+                    .into_iter()
+                    .find(|registration| registration.descriptor.role == descriptor.role)
+                    .map(|registration| registration.contract.provides)
+                    .unwrap_or(&[]);
+                SystemContract {
+                    system_id: descriptor.id,
+                    requires: descriptor.dependencies,
+                    provides,
+                    consumes: &[],
+                    recovery: recovery_for(descriptor.role, descriptor.restartable),
+                }
+            })
+        })
     }
 
     pub fn contracts(&self) -> impl Iterator<Item = SystemContract> + '_ {
-        self.descriptors.values().map(SystemDescriptor::contract)
+        self.descriptors.keys().filter_map(|id| self.contract(id))
     }
 
     pub fn health(&self, id: &str) -> Option<&HealthSnapshot> {
@@ -658,7 +578,10 @@ impl SystemRegistry {
                         .cloned()
                         .map(|health| PlatformManifestEntry {
                             descriptor: descriptor.clone(),
-                            contract: descriptor.contract(),
+                            contract: self
+                                .contract(descriptor.id)
+                                .unwrap_or_else(|| descriptor.contract()),
+                            implementation: self.implementations.get(descriptor.id).copied(),
                             health,
                         })
                 })
@@ -718,7 +641,10 @@ impl SystemRegistry {
         let providers = self
             .descriptors
             .values()
-            .filter(|descriptor| descriptor.contract().provides.contains(&capability))
+            .filter(|descriptor| {
+                self.contract(descriptor.id)
+                    .is_some_and(|contract| contract.provides.contains(&capability))
+            })
             .collect::<Vec<_>>();
         if providers.is_empty() {
             return ReadinessReport::blocked(
@@ -761,6 +687,60 @@ impl SystemRegistry {
 
     pub fn require_capability(&self, capability: &str, now_ms: u64) -> Result<(), ReadinessReport> {
         let report = self.readiness_for_capability(capability, now_ms);
+        if report.ready {
+            Ok(())
+        } else {
+            Err(report)
+        }
+    }
+
+    pub fn readiness_for_role(&self, role: SystemRole, now_ms: u64) -> ReadinessReport {
+        let providers = self
+            .descriptors
+            .values()
+            .filter(|descriptor| descriptor.role == role)
+            .collect::<Vec<_>>();
+        if providers.is_empty() {
+            return ReadinessReport::blocked(
+                format!("role:{role:?}"),
+                now_ms,
+                "role_not_registered",
+            );
+        }
+        let candidate_providers = providers
+            .iter()
+            .map(|provider| provider.id.to_owned())
+            .collect::<Vec<_>>();
+        let mut blockers = Vec::new();
+        let mut selected_provider = None;
+        for provider in providers {
+            let report = self.readiness_at(provider.id, now_ms);
+            if report.ready && selected_provider.is_none() {
+                selected_provider = Some(provider.id.to_owned());
+            } else if !report.ready {
+                blockers.extend(
+                    report
+                        .blockers
+                        .into_iter()
+                        .map(|reason| format!("{}:{reason}", provider.id)),
+                );
+            }
+        }
+        if selected_provider.is_some() {
+            blockers.clear();
+        }
+        ReadinessReport {
+            system_id: format!("role:{role:?}"),
+            checked_at_ms: now_ms,
+            ready: selected_provider.is_some(),
+            blockers,
+            candidate_providers,
+            selected_provider,
+        }
+    }
+
+    pub fn require_role(&self, role: SystemRole, now_ms: u64) -> Result<(), ReadinessReport> {
+        let report = self.readiness_for_role(role, now_ms);
         if report.ready {
             Ok(())
         } else {
@@ -858,6 +838,22 @@ impl SystemRegistry {
         })
     }
 
+    pub fn heartbeat_signal(
+        &mut self,
+        signal: &str,
+        observed_at_ms: u64,
+    ) -> Result<Vec<String>, RegistryError> {
+        let systems = self
+            .health_signal_systems
+            .get(signal)
+            .cloned()
+            .unwrap_or_default();
+        for id in &systems {
+            self.heartbeat(id, observed_at_ms)?;
+        }
+        Ok(systems.into_iter().map(str::to_owned).collect())
+    }
+
     pub fn unhealthy(&self) -> impl Iterator<Item = &HealthSnapshot> {
         self.health
             .values()
@@ -953,6 +949,330 @@ impl SystemRegistry {
         Ok(())
     }
 }
+
+macro_rules! register_system {
+    ($id:literal, $layer:expr, $role:expr, $authority:expr, $mutability:expr,
+     $dependencies:expr, $health_interval_ms:expr, $restartable:expr,
+     $provides:expr, $consumes:expr, $profile_roots:expr, $health_signals:expr,
+     $implementation:literal, $source:literal) => {
+        const _: &[u8] = include_bytes!($source);
+        inventory::submit! {
+            SystemRegistration {
+                descriptor: SystemDescriptor {
+                    id: $id, layer: $layer, role: $role, authority: $authority,
+                    mutability: $mutability, dependencies: $dependencies,
+                    health_interval_ms: $health_interval_ms, restartable: $restartable,
+                },
+                contract: SystemContract {
+                    system_id: $id, requires: $dependencies, provides: $provides,
+                    consumes: $consumes, recovery: recovery_for($role, $restartable),
+                },
+                implementation: $implementation,
+                profile_roots: $profile_roots,
+                health_signals: $health_signals,
+            }
+        }
+    };
+}
+
+register_system!(
+    "control.kernel",
+    PlatformLayer::Control,
+    SystemRole::Registry,
+    Authority::Internal,
+    Mutability::ImmutableCore,
+    &[],
+    5_000,
+    false,
+    &["system.discovery", "system.topology"],
+    &[],
+    &[],
+    &["runtime_bootstrap"],
+    "engine::platform",
+    "platform.rs"
+);
+register_system!(
+    "market.binance",
+    PlatformLayer::MarketData,
+    SystemRole::ExchangeAdapter,
+    Authority::Binance,
+    Mutability::ImmutableCore,
+    &["control.kernel"],
+    2_000,
+    true,
+    &["market.events", "market.connection"],
+    &[],
+    &[],
+    &["market_events"],
+    "engine::market::binance",
+    "market/binance.rs"
+);
+register_system!(
+    "market.reference",
+    PlatformLayer::MarketData,
+    SystemRole::ReferenceData,
+    Authority::ExternalReference,
+    Mutability::ImmutableCore,
+    &["control.kernel"],
+    30_000,
+    true,
+    &["reference.fx", "reference.metadata", "reference.close"],
+    &[],
+    &[],
+    &["reference_data"],
+    "engine::market::fx",
+    "market/fx.rs"
+);
+register_system!(
+    "market.anchor",
+    PlatformLayer::MarketData,
+    SystemRole::Anchor,
+    Authority::Derived,
+    Mutability::ImmutableCore,
+    &["market.binance", "market.reference"],
+    2_000,
+    true,
+    &["anchor.snapshot"],
+    &["market.events", "reference.close", "reference.fx"],
+    &[],
+    &["market_events"],
+    "engine::runtime::reference_authority",
+    "runtime/reference_authority.rs"
+);
+register_system!(
+    "decision.strategy",
+    PlatformLayer::Decision,
+    SystemRole::Strategy,
+    Authority::Internal,
+    Mutability::GovernedPolicy,
+    &["market.anchor"],
+    1_000,
+    true,
+    &["decision.intent"],
+    &["anchor.snapshot"],
+    &[RuntimeProfile::Live],
+    &[],
+    "engine::strategy",
+    "strategy/mod.rs"
+);
+register_system!(
+    "decision.portfolio",
+    PlatformLayer::Decision,
+    SystemRole::Portfolio,
+    Authority::Internal,
+    Mutability::GovernedPolicy,
+    &["decision.strategy", "decision.risk"],
+    1_000,
+    true,
+    &["decision.allocation"],
+    &["decision.intent", "risk.admission"],
+    &[RuntimeProfile::Live],
+    &[],
+    "engine::strategy::capital",
+    "strategy/capital.rs"
+);
+register_system!(
+    "decision.risk",
+    PlatformLayer::Decision,
+    SystemRole::Risk,
+    Authority::Internal,
+    Mutability::ImmutableCore,
+    &["market.binance", "market.anchor"],
+    500,
+    false,
+    &["risk.admission", "risk.flatten"],
+    &["market.events", "anchor.snapshot"],
+    &[RuntimeProfile::Live],
+    &["market_events"],
+    "engine::risk",
+    "risk.rs"
+);
+register_system!(
+    "decision.funding",
+    PlatformLayer::Decision,
+    SystemRole::Funding,
+    Authority::Binance,
+    Mutability::GovernedPolicy,
+    &["market.binance", "decision.risk"],
+    2_000,
+    true,
+    &["funding.schedule", "funding.deadline"],
+    &["market.events", "risk.admission"],
+    &[RuntimeProfile::Live],
+    &[],
+    "engine::execution::funding_risk",
+    "execution/funding_risk.rs"
+);
+register_system!(
+    "execution.gateway",
+    PlatformLayer::Execution,
+    SystemRole::ExecutionGateway,
+    Authority::Binance,
+    Mutability::ImmutableCore,
+    &["market.binance", "decision.risk"],
+    1_000,
+    true,
+    &["execution.submit", "execution.cancel"],
+    &["risk.admission", "decision.intent"],
+    &[RuntimeProfile::Live],
+    &["market_events"],
+    "engine::execution::gateway",
+    "execution/gateway.rs"
+);
+register_system!(
+    "execution.lifecycle",
+    PlatformLayer::Execution,
+    SystemRole::Lifecycle,
+    Authority::Binance,
+    Mutability::ImmutableCore,
+    &["execution.gateway", "decision.risk"],
+    1_000,
+    true,
+    &["execution.lifecycle", "execution.reconcile"],
+    &["execution.submit", "execution.cancel"],
+    &[RuntimeProfile::Live],
+    &["user_data"],
+    "engine::execution::lifecycle",
+    "execution/lifecycle.rs"
+);
+register_system!(
+    "simulation.runtime",
+    PlatformLayer::Simulation,
+    SystemRole::Simulation,
+    Authority::Derived,
+    Mutability::GovernedPolicy,
+    &["market.anchor", "decision.strategy", "decision.risk"],
+    5_000,
+    true,
+    &["simulation.run"],
+    &[
+        "market.events",
+        "anchor.snapshot",
+        "decision.intent",
+        "risk.admission"
+    ],
+    &[RuntimeProfile::Simulation, RuntimeProfile::Batch],
+    &[],
+    "engine::simulation",
+    "simulation.rs"
+);
+register_system!(
+    "simulation.replay",
+    PlatformLayer::Simulation,
+    SystemRole::Replay,
+    Authority::Derived,
+    Mutability::GovernedPolicy,
+    &["market.binance"],
+    5_000,
+    true,
+    &["simulation.replay"],
+    &["market.events"],
+    &[],
+    &[],
+    "engine::simulation::replay",
+    "simulation/replay.rs"
+);
+register_system!(
+    "simulation.backtest",
+    PlatformLayer::Simulation,
+    SystemRole::Backtest,
+    Authority::Derived,
+    Mutability::GovernedPolicy,
+    &["simulation.replay", "decision.strategy"],
+    5_000,
+    true,
+    &["simulation.validation"],
+    &["simulation.replay", "decision.intent"],
+    &[RuntimeProfile::Backtest],
+    &[],
+    "engine::backtest",
+    "backtest.rs"
+);
+register_system!(
+    "analytics.validation",
+    PlatformLayer::Analytics,
+    SystemRole::Analytics,
+    Authority::Derived,
+    Mutability::GovernedPolicy,
+    &["simulation.backtest"],
+    10_000,
+    true,
+    &["analytics.evidence"],
+    &["simulation.validation"],
+    &[RuntimeProfile::Backtest],
+    &[],
+    "engine::analytics_validation",
+    "analytics_validation.rs"
+);
+register_system!(
+    "observability.telemetry",
+    PlatformLayer::Observability,
+    SystemRole::Observability,
+    Authority::Internal,
+    Mutability::ImmutableCore,
+    &["control.kernel"],
+    5_000,
+    true,
+    &["telemetry.health"],
+    &[],
+    &[],
+    &["runtime_bootstrap"],
+    "engine::observability",
+    "observability.rs"
+);
+register_system!(
+    "observability.audit",
+    PlatformLayer::Observability,
+    SystemRole::Audit,
+    Authority::Internal,
+    Mutability::ImmutableCore,
+    &["observability.telemetry"],
+    5_000,
+    true,
+    &["audit.events"],
+    &["telemetry.health"],
+    &[
+        RuntimeProfile::Live,
+        RuntimeProfile::Simulation,
+        RuntimeProfile::Batch,
+        RuntimeProfile::Backtest
+    ],
+    &[],
+    "engine::runtime::audit",
+    "runtime/audit.rs"
+);
+register_system!(
+    "operations.supervisor",
+    PlatformLayer::Operations,
+    SystemRole::Recovery,
+    Authority::Internal,
+    Mutability::ImmutableCore,
+    &["control.kernel", "execution.lifecycle"],
+    1_000,
+    false,
+    &["recovery.orchestration"],
+    &["execution.lifecycle", "risk.admission"],
+    &[RuntimeProfile::Live],
+    &[],
+    "engine::runtime::supervisor",
+    "runtime/supervisor.rs"
+);
+register_system!(
+    "operations.console",
+    PlatformLayer::Operations,
+    SystemRole::ControlConsole,
+    Authority::Operator,
+    Mutability::GovernedPolicy,
+    &["control.kernel", "observability.telemetry"],
+    10_000,
+    true,
+    &["control.operations"],
+    &["telemetry.health"],
+    &[RuntimeProfile::Dashboard],
+    &[],
+    "engine::bin::anchorbell_dashboard",
+    "bin/anchorbell_dashboard.rs"
+);
 
 #[cfg(test)]
 mod tests {

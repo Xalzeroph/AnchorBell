@@ -1,6 +1,7 @@
 use std::{
     io,
     path::{Path, PathBuf},
+    process::Stdio,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -9,7 +10,9 @@ use std::{
 };
 
 use serde::Serialize;
-use tokio::{io::AsyncWriteExt, sync::mpsc, task::JoinHandle};
+use tokio::{io::AsyncWriteExt, process::Command, sync::mpsc, task::JoinHandle};
+
+const LINE_WRITER_SEGMENT_BYTES: u64 = 256 * 1024 * 1024;
 
 pub struct AsyncLineWriter {
     pub sender: mpsc::Sender<String>,
@@ -40,11 +43,16 @@ pub async fn spawn_line_writer(
                 .await
                 .map_err(|error| io_context("create line-writer directory", parent, error))?;
         }
-        let file = tokio::fs::File::create(&path)
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
             .await
             .map_err(|error| io_context("open line-writer file", &path, error))?;
         let mut writer = tokio::io::BufWriter::with_capacity(buffer_capacity.max(1), file);
         let mut pending = 0_u32;
+        let mut segment = 0_u64;
+        let mut segment_bytes = 0_u64;
         let mut flush_tick = tokio::time::interval(std::time::Duration::from_secs(1));
         flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         flush_tick.tick().await;
@@ -52,6 +60,26 @@ pub async fn spawn_line_writer(
             tokio::select! {
                 line = receiver.recv() => {
                     let Some(line) = line else { break };
+                    let line_bytes = line.len() as u64 + 1;
+                    if segment_bytes > 0
+                        && segment_bytes.saturating_add(line_bytes) > LINE_WRITER_SEGMENT_BYTES
+                    {
+                        writer
+                            .flush()
+                            .await
+                            .map_err(|error| io_context("rotate line-writer file", &path, error))?;
+                        drop(writer);
+                        compress_segment(&path, segment).await?;
+                        segment = segment.saturating_add(1);
+                        let file = tokio::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&path)
+                            .await
+                            .map_err(|error| io_context("reopen line-writer file", &path, error))?;
+                        writer = tokio::io::BufWriter::with_capacity(buffer_capacity.max(1), file);
+                        segment_bytes = 0;
+                    }
                     writer
                         .write_all(line.as_bytes())
                         .await
@@ -62,6 +90,7 @@ pub async fn spawn_line_writer(
                         .map_err(|error| io_context("write line-writer newline", &path, error))?;
                     written_count.fetch_add(1, Ordering::Relaxed);
                     pending = pending.saturating_add(1);
+                    segment_bytes = segment_bytes.saturating_add(line_bytes);
                     if pending >= flush_every.max(1) {
                         writer
                             .flush()
@@ -91,6 +120,75 @@ pub async fn spawn_line_writer(
         written,
         dropped,
     }
+}
+async fn compress_segment(path: &Path, segment: u64) -> Result<(), io::Error> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::other("line-writer path has no UTF-8 file name"))?;
+    let raw_path = path.with_file_name(format!("{file_name}.segment-{segment:06}"));
+    let archive_path = raw_path.with_extension("gz");
+    tokio::fs::rename(path, &raw_path)
+        .await
+        .map_err(|error| io_context("archive line-writer segment", &raw_path, error))?;
+
+    let raw_size = tokio::fs::metadata(&raw_path)
+        .await
+        .map_err(|error| io_context("inspect line-writer segment", &raw_path, error))?
+        .len();
+    if raw_size == 0 {
+        tokio::fs::remove_file(&raw_path)
+            .await
+            .map_err(|error| io_context("discard empty line-writer segment", &raw_path, error))?;
+        return Ok(());
+    }
+
+    let archive = std::fs::File::create(&archive_path).map_err(|error| {
+        io_context(
+            "create compressed line-writer archive",
+            &archive_path,
+            error,
+        )
+    })?;
+    let output = Command::new("gzip")
+        .arg("-n")
+        .arg("-c")
+        .arg(&raw_path)
+        .stdout(Stdio::from(archive))
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|error| io_context("compress line-writer segment", &raw_path, error))?;
+    if !output.status.success() {
+        let _ = tokio::fs::remove_file(&archive_path).await;
+        return Err(io_context(
+            "compress line-writer segment",
+            &raw_path,
+            io::Error::other(String::from_utf8_lossy(&output.stderr).trim().to_owned()),
+        ));
+    }
+    let archive_size = tokio::fs::metadata(&archive_path)
+        .await
+        .map_err(|error| {
+            io_context(
+                "verify compressed line-writer archive",
+                &archive_path,
+                error,
+            )
+        })?
+        .len();
+    if archive_size == 0 {
+        let _ = tokio::fs::remove_file(&archive_path).await;
+        return Err(io_context(
+            "verify compressed line-writer archive",
+            &archive_path,
+            io::Error::other("compressed archive is empty"),
+        ));
+    }
+    tokio::fs::remove_file(&raw_path)
+        .await
+        .map_err(|error| io_context("remove verified raw line-writer segment", &raw_path, error))?;
+    Ok(())
 }
 
 pub async fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), io::Error> {

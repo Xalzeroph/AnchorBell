@@ -20,6 +20,7 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+inventory = "0.3"
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_Storage_FileSystem"] }
