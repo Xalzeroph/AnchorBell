@@ -5,6 +5,10 @@ use std::collections::VecDeque;
 pub const CALIBRATION_SCHEMA_VERSION: u32 = 1;
 pub const CALIBRATION_MODEL_VERSION: &str = "m9-data-driven-calibration-v1";
 const ROLLING_WINDOW_CAPACITY: usize = 4096;
+/// A calibration is not usable merely because every field has one sample.
+/// This floor matches the minimum history required before the runtime reports
+/// risk statistics as usable and keeps M9 fail-closed during warm-up.
+const MIN_CALIBRATION_EFFECTIVE_SAMPLE_SIZE: u64 = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -226,6 +230,9 @@ impl CalibrationSnapshot {
         if state.fill_events == 0 {
             missing.push("fill_events");
         }
+        if effective < MIN_CALIBRATION_EFFECTIVE_SAMPLE_SIZE {
+            missing.push("effective_sample_size");
+        }
         let residual_mad = residual.map(|(_, mad)| mad).unwrap_or(0);
         let spread_center = spread.map(|(center, _)| center).unwrap_or(0);
         let markout_center = markout.map(|(center, _)| center).unwrap_or(0);
@@ -269,7 +276,7 @@ impl CalibrationSnapshot {
                 Some(_),
                 Some(_),
                 Some(_),
-            ) if fill_hazard > 0 => {
+            ) if fill_hazard > 0 && effective >= MIN_CALIBRATION_EFFECTIVE_SAMPLE_SIZE => {
                 let value = M9Calibration {
                     half_life_ms,
                     exit_lead_ms: fill_horizon_ms,
@@ -470,7 +477,34 @@ mod tests {
     #[test]
     fn calibrated_snapshot_uses_observed_values() {
         let mut state = CalibrationState::new("TESTUSDT");
-        for time in 1..=4 {
+        for time in 1..=61 {
+            state.observe_market(
+                time,
+                Some(2_000_000_000_000),
+                Some(1_000_000_000_000),
+                Some(if time % 2 == 0 {
+                    4_000_000_000_000
+                } else {
+                    8_000_000_000_000
+                }),
+            );
+        }
+        for index in 0..30 {
+            let placed_at = 100 + index * 3;
+            state.observe_order_placed(placed_at);
+            state.observe_fill(placed_at + 1, placed_at, 10, 100);
+            state.observe_order_terminal(placed_at + 1, placed_at);
+            state.observe_markout(placed_at + 2, 1_000_000_000_000);
+        }
+        let snapshot = state.snapshot(2_000_000_000_000);
+        assert_eq!(snapshot.status, CalibrationStatus::Calibrated);
+        assert_eq!(snapshot.calibration.unwrap().fill_horizon_ms, 1);
+    }
+
+    #[test]
+    fn one_fill_is_not_enough_to_calibrate() {
+        let mut state = CalibrationState::new("TESTUSDT");
+        for time in 1..=5 {
             state.observe_market(
                 time,
                 Some(2_000_000_000_000),
@@ -478,18 +512,12 @@ mod tests {
                 Some(8_000_000_000_000),
             );
         }
-        state.observe_market(
-            5,
-            Some(2_000_000_000_000),
-            Some(1_000_000_000_000),
-            Some(4_000_000_000_000),
-        );
         state.observe_order_placed(5);
         state.observe_fill(6, 5, 10, 100);
         state.observe_order_terminal(6, 5);
         state.observe_markout(7, 1_000_000_000_000);
         let snapshot = state.snapshot(2_000_000_000_000);
-        assert_eq!(snapshot.status, CalibrationStatus::Calibrated);
-        assert_eq!(snapshot.calibration.unwrap().fill_horizon_ms, 1);
+        assert_eq!(snapshot.status, CalibrationStatus::InsufficientHistory);
+        assert!(snapshot.reason.contains("effective_sample_size"));
     }
 }
