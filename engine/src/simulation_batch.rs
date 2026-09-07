@@ -43,6 +43,11 @@ use crate::{
     },
 };
 
+/// M9 uses a declared calibration population instead of whichever ledger has
+/// the largest sample count. This keeps the warm-start source auditable and
+/// avoids mixing policy-specific order selection into a single unlabeled model.
+const M9_CALIBRATION_SOURCE_LABEL: &str = "F3_m3";
+
 #[derive(Debug, Clone)]
 pub struct SimulationBatchSpec {
     pub label: String,
@@ -145,7 +150,10 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-async fn load_calibration_seeds(path: &Path) -> BTreeMap<String, CalibrationState> {
+async fn load_calibration_seeds(
+    path: &Path,
+    source_label: &str,
+) -> BTreeMap<String, CalibrationState> {
     let Ok(bytes) = tokio::fs::read(path).await else {
         return BTreeMap::new();
     };
@@ -160,14 +168,22 @@ async fn load_calibration_seeds(path: &Path) -> BTreeMap<String, CalibrationStat
     store
         .snapshots
         .into_iter()
-        .filter_map(|(symbol, snapshot)| {
-            if symbol != snapshot.instrument || snapshot.replay().is_err() {
+        .filter_map(|(key, snapshot)| {
+            let (stored_source, symbol) = key.split_once("::")?;
+            if stored_source != source_label
+                || symbol != snapshot.instrument
+                || snapshot.replay().is_err()
+            {
                 None
             } else {
-                Some((symbol, snapshot.state))
+                Some((symbol.to_owned(), snapshot.state))
             }
         })
         .collect()
+}
+
+fn calibration_key(source_label: &str, symbol: &str) -> String {
+    format!("{source_label}::{symbol}")
 }
 
 fn calibration_rank(snapshot: &CalibrationSnapshot) -> (u64, u64, u64, u64) {
@@ -183,12 +199,13 @@ async fn persist_calibration_store(path: &Path, ledgers: &[Ledger]) -> Result<()
     let mut snapshots = BTreeMap::<String, CalibrationSnapshot>::new();
     for ledger in ledgers {
         for (symbol, snapshot) in ledger.engine.calibration_snapshots(0) {
+            let key = calibration_key(&ledger.spec.label, &symbol);
             let replace = snapshots
-                .get(&symbol)
+                .get(&key)
                 .map(|previous| calibration_rank(&snapshot) > calibration_rank(previous))
                 .unwrap_or(true);
             if replace {
-                snapshots.insert(symbol, snapshot);
+                snapshots.insert(key, snapshot);
             }
         }
     }
@@ -328,7 +345,6 @@ pub async fn run(
         ));
     }
     let calibration_store_path = config.output_root.join("calibration/latest.json");
-    let calibration_seeds = load_calibration_seeds(&calibration_store_path).await;
     if let Some(parent) = calibration_store_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -433,6 +449,14 @@ pub async fn run(
 
     let mut ledgers = Vec::with_capacity(config.specs.len());
     for spec in &config.specs {
+        let calibration_source = if spec.variant == SimulationPolicyVariant::M9DeadlineCausalDroMpc
+        {
+            M9_CALIBRATION_SOURCE_LABEL
+        } else {
+            spec.label.as_str()
+        };
+        let calibration_seeds =
+            load_calibration_seeds(&calibration_store_path, calibration_source).await;
         let dir = config.output_root.join(&spec.label);
         tokio::fs::create_dir_all(&dir).await?;
         let AsyncLineWriter {
@@ -976,4 +1000,18 @@ pub async fn run(
         evidence_records_dropped: evidence_dropped.load(Ordering::Relaxed),
         ledgers: ledger_results,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::calibration_key;
+
+    #[test]
+    fn calibration_store_keys_are_strategy_scoped() {
+        assert_eq!(calibration_key("F3_m3", "CXMTUSDT"), "F3_m3::CXMTUSDT");
+        assert_ne!(
+            calibration_key("F3_m3", "CXMTUSDT"),
+            calibration_key("F4_m4", "CXMTUSDT")
+        );
+    }
 }

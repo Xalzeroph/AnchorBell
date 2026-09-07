@@ -2,7 +2,7 @@ use super::m9::M9Calibration;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
-pub const CALIBRATION_SCHEMA_VERSION: u32 = 1;
+pub const CALIBRATION_SCHEMA_VERSION: u32 = 2;
 pub const CALIBRATION_MODEL_VERSION: &str = "m9-data-driven-calibration-v2";
 const ROLLING_WINDOW_CAPACITY: usize = 4096;
 /// A calibration is not usable merely because every field has one sample.
