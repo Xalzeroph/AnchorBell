@@ -50,6 +50,8 @@ struct Args {
     output_root: PathBuf,
     capital_usdt: i64,
     duration_secs: u64,
+    fold_id: Option<String>,
+    stress_fold: bool,
     include_m9: bool,
 }
 
@@ -212,6 +214,8 @@ fn main() {
             checkpoint_session_id: Some(run_id.clone()),
             checkpoint_interval_ms: 5_000,
             duration_secs: args.duration_secs,
+            validation_fold_id: args.fold_id,
+            validation_stress: args.stress_fold,
             evidence: EvidenceConfig::default(),
         };
         let result = match run(config).await {
@@ -249,6 +253,8 @@ fn parse_args() -> Result<Args, String> {
     let mut output_root = PathBuf::from("target\\simulation-batch-20260904-M7");
     let mut capital_usdt = 1_500_i64.checked_mul(100_000_000).unwrap();
     let mut duration_secs = 0;
+    let mut fold_id = None;
+    let mut stress_fold = false;
     let mut include_m9 = false;
     let mut args = env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -270,6 +276,8 @@ fn parse_args() -> Result<Args, String> {
             "--output-root" => output_root = PathBuf::from(next(&mut args, &flag)?),
             "--capital-usdt" => capital_usdt = parse_decimal(&next(&mut args, &flag)?, 8)?,
             "--duration-secs" => duration_secs = parse(&mut args, &flag)?,
+            "--fold-id" => fold_id = Some(next(&mut args, &flag)?),
+            "--stress-fold" => stress_fold = true,
             "--include-m9" => include_m9 = true,
             "--help" | "-h" => {
                 print_usage();
@@ -281,6 +289,18 @@ fn parse_args() -> Result<Args, String> {
     if symbols.is_empty() {
         return Err("--symbols cannot be empty".to_owned());
     }
+    if stress_fold && fold_id.is_none() {
+        return Err("--stress-fold requires --fold-id".to_owned());
+    }
+    if fold_id
+        .as_ref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err("--fold-id cannot be empty".to_owned());
+    }
+    if fold_id.is_some() && duration_secs == 0 {
+        return Err("--fold-id requires finite --duration-secs".to_owned());
+    }
     Ok(Args {
         policy_id,
         environment,
@@ -289,6 +309,8 @@ fn parse_args() -> Result<Args, String> {
         output_root,
         capital_usdt,
         duration_secs,
+        fold_id,
+        stress_fold,
         include_m9,
     })
 }

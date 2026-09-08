@@ -1,8 +1,8 @@
 use std::{collections::BTreeSet, env, fs, path::PathBuf, process};
 
 use anchorbell_engine::oos_validation::{
-    compare_robust_candidates, evaluate_robust_candidate, OosFoldMetrics,
-    RobustCandidateEvaluation, RobustSelectionConstraints,
+    compare_robust_candidates, evaluate_robust_candidate, merge_fold_bundles, OosFoldBundle,
+    OosFoldMetrics, RobustCandidateEvaluation, RobustSelectionConstraints,
 };
 use serde::{Deserialize, Serialize};
 
@@ -32,12 +32,46 @@ struct SelectionOutput {
     candidates: Vec<CandidateOutput>,
 }
 
+enum SelectionSource {
+    Input(PathBuf),
+    Bundles(Vec<PathBuf>),
+}
+
 fn main() {
-    let input = parse_args().unwrap_or_else(|message| fail(message));
-    let bytes = fs::read(&input)
-        .unwrap_or_else(|error| fail(format!("cannot read {}: {error}", input.display())));
-    let request: SelectionInput = serde_json::from_slice(&bytes)
-        .unwrap_or_else(|error| fail(format!("invalid selection input: {error}")));
+    let source = parse_args().unwrap_or_else(|message| fail(message));
+    let request = match source {
+        SelectionSource::Input(input) => {
+            let bytes = fs::read(&input)
+                .unwrap_or_else(|error| fail(format!("cannot read {}: {error}", input.display())));
+            serde_json::from_slice::<SelectionInput>(&bytes)
+                .unwrap_or_else(|error| fail(format!("invalid selection input: {error}")))
+        }
+        SelectionSource::Bundles(paths) => {
+            let bundles = paths
+                .iter()
+                .map(|path| {
+                    let bytes = fs::read(path).unwrap_or_else(|error| {
+                        fail(format!("cannot read {}: {error}", path.display()))
+                    });
+                    serde_json::from_slice::<OosFoldBundle>(&bytes).unwrap_or_else(|error| {
+                        fail(format!("invalid fold bundle {}: {error}", path.display()))
+                    })
+                })
+                .collect::<Vec<_>>();
+            let grouped = merge_fold_bundles(&bundles)
+                .unwrap_or_else(|reason| fail(format!("cannot merge fold bundles: {reason}")));
+            SelectionInput {
+                constraints: None,
+                candidates: grouped
+                    .into_iter()
+                    .map(|(candidate_id, folds)| CandidateInput {
+                        candidate_id,
+                        folds,
+                    })
+                    .collect(),
+            }
+        }
+    };
     if request.candidates.is_empty() {
         fail("candidate list cannot be empty");
     }
@@ -78,15 +112,33 @@ fn main() {
     );
 }
 
-fn parse_args() -> Result<PathBuf, String> {
+fn parse_args() -> Result<SelectionSource, String> {
+    let mut input = None;
+    let mut bundles = Vec::new();
     let mut args = env::args().skip(1);
-    match (args.next().as_deref(), args.next()) {
-        (Some("--input"), Some(path)) if args.next().is_none() => Ok(PathBuf::from(path)),
-        (Some("--help" | "-h"), None) => {
-            eprintln!("usage: anchorbell_oos_select --input CANDIDATES.json");
-            process::exit(0);
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--input" => {
+                let path = args.next().ok_or("--input requires a path")?;
+                input = Some(PathBuf::from(path));
+            }
+            "--bundle" => {
+                let path = args.next().ok_or("--bundle requires a path")?;
+                bundles.push(PathBuf::from(path));
+            }
+            "--help" | "-h" => {
+                eprintln!(
+                    "usage: anchorbell_oos_select --input CANDIDATES.json | --bundle FOLD.json [--bundle FOLD.json ...]"
+                );
+                process::exit(0);
+            }
+            _ => return Err(format!("unknown option {flag}")),
         }
-        _ => Err("usage: anchorbell_oos_select --input CANDIDATES.json".to_owned()),
+    }
+    match (input, bundles.is_empty()) {
+        (Some(path), true) => Ok(SelectionSource::Input(path)),
+        (None, false) => Ok(SelectionSource::Bundles(bundles)),
+        _ => Err("use exactly one --input or one-or-more --bundle arguments".to_owned()),
     }
 }
 

@@ -27,6 +27,7 @@ use crate::{
         BinanceC2cFxClient, BinanceC2cFxPoller, BinanceMarketConfig, BinanceMarketFeed,
         BinanceMarketStream, FxPollerConfig, FxUpdate, PublicMarketMetadataClient, ReconnectPolicy,
     },
+    oos_validation::{OosFoldBundle, OosFoldMetrics},
     orderbook::{LocalOrderBook, OrderBookError},
     runtime::{
         io::{spawn_line_writer, write_json_atomic, AsyncLineWriter},
@@ -34,8 +35,8 @@ use crate::{
         DataQuality, EventEnvelope, EventSource,
     },
     simulation::engine::{
-        AnchorSnapshot, PerformancePoint, PositionAllocation, SimulationEngine, SimulationError,
-        SimulationPolicyVariant, SimulationSummary,
+        AnchorSnapshot, PerformancePoint, PositionAllocation, RiskMetrics, SimulationEngine,
+        SimulationError, SimulationPolicyVariant, SimulationSummary,
     },
     strategy::{
         CalibrationSnapshot, CalibrationState, CALIBRATION_MODEL_VERSION,
@@ -98,6 +99,9 @@ pub struct SimulationBatchConfig {
     pub checkpoint_session_id: Option<String>,
     pub checkpoint_interval_ms: u64,
     pub duration_secs: u64,
+    /// Optional reproducible OOS/stress fold identity. Formal folds must be finite runs.
+    pub validation_fold_id: Option<String>,
+    pub validation_stress: bool,
     /// Shared, deterministic evidence test fed exactly once per public event.
     pub evidence: EvidenceConfig,
 }
@@ -109,6 +113,7 @@ pub struct SimulationLedgerResult {
     pub ablations: Vec<String>,
     pub evidence_record_id: String,
     pub summary: SimulationSummary,
+    pub risk_metrics: Option<RiskMetrics>,
     pub settlement_status: String,
     pub flatten_requested: bool,
     pub records_written: u64,
@@ -125,6 +130,7 @@ pub struct SimulationBatchResult {
     pub analytics_validation_summary: ValidationSummary,
     pub promotion_gate: SimulationPromotionGate,
     pub candidate_readiness: BTreeMap<String, CandidateReadinessGate>,
+    pub oos_fold_bundle: Option<OosFoldBundle>,
     pub evidence_records_written: u64,
     pub evidence_records_dropped: u64,
     pub ledgers: Vec<SimulationLedgerResult>,
@@ -148,6 +154,7 @@ struct Ledger {
     metrics_path: PathBuf,
     history: VecDeque<PerformancePoint>,
     risk_history: VecDeque<PerformancePoint>,
+    final_risk_metrics: Option<RiskMetrics>,
     settlement_status: String,
     flatten_requested: bool,
 }
@@ -429,6 +436,27 @@ fn validate(config: &SimulationBatchConfig) -> Result<(), SimulationError> {
             "batch execution contains duplicate candidate semantics",
         ));
     }
+    if let Some(fold_id) = config.validation_fold_id.as_deref() {
+        if fold_id.trim().is_empty() {
+            return Err(SimulationError::InvalidConfig(
+                "validation folds require a non-empty fold id",
+            ));
+        }
+        if config.duration_secs == 0 {
+            return Err(SimulationError::InvalidConfig(
+                "validation folds require a finite duration",
+            ));
+        }
+        if config.position_allocations.is_none() {
+            return Err(SimulationError::InvalidConfig(
+                "validation folds require explicit capital allocations",
+            ));
+        }
+    } else if config.validation_stress {
+        return Err(SimulationError::InvalidConfig(
+            "stress validation requires a fold id",
+        ));
+    }
     Ok(())
 }
 pub async fn run(
@@ -514,6 +542,8 @@ pub async fn run(
         "dynamic_capital_refresh_ms": config.dynamic_capital_refresh_ms,
         "depth_snapshot_limit": config.depth_snapshot_limit,
         "duration_secs": config.duration_secs,
+        "validation_fold_id": config.validation_fold_id,
+        "validation_stress": config.validation_stress,
         "evidence": config.evidence.clone(),
     });
     write_json_atomic(&config.output_root.join("run-manifest.json"), &manifest).await?;
@@ -572,6 +602,7 @@ pub async fn run(
             metrics_path: dir.join("metrics.json"),
             history: VecDeque::with_capacity(DISPLAY_HISTORY_CAPACITY),
             risk_history: VecDeque::with_capacity(RISK_HISTORY_CAPACITY),
+            final_risk_metrics: None,
             settlement_status: "not_started".to_owned(),
             flatten_requested: false,
         });
@@ -1038,6 +1069,7 @@ pub async fn run(
             &display,
             &risk,
         );
+        ledger.final_risk_metrics = snapshot.risk_metrics.clone();
         write_json_atomic(&ledger.metrics_path, &snapshot).await?;
     }
     write_json_atomic(&evidence_summary_path, &evidence.summary()).await?;
@@ -1067,6 +1099,7 @@ pub async fn run(
             ablations: ledger.spec.ablations,
             evidence_record_id: evidence.evidence_id(),
             summary: ledger.engine.summary(),
+            risk_metrics: ledger.final_risk_metrics,
             settlement_status: ledger.settlement_status,
             flatten_requested: ledger.flatten_requested,
             records_written: count.max(ledger.record_written.load(Ordering::Relaxed)),
@@ -1109,6 +1142,64 @@ pub async fn run(
         &candidate_readiness,
     )
     .await?;
+    let oos_fold_bundle = if let Some(fold_id) = config.validation_fold_id.as_deref() {
+        let capital_ticks = config
+            .position_allocations
+            .as_ref()
+            .map(|allocations| {
+                allocations
+                    .values()
+                    .map(|allocation| allocation.budget_usdt_ticks)
+                    .sum::<i64>()
+            })
+            .unwrap_or(0);
+        if capital_ticks <= 0 {
+            return Err(SimulationError::InvalidConfig(
+                "validation fold capital must be positive",
+            ));
+        }
+        let mut candidates = BTreeMap::new();
+        for ledger in &ledger_results {
+            let risk = ledger
+                .risk_metrics
+                .as_ref()
+                .ok_or(SimulationError::InvalidConfig(
+                    "validation fold requires complete risk metrics",
+                ))?;
+            let mut ablations = ledger.ablations.clone();
+            ablations.sort();
+            ablations.dedup();
+            let candidate_id = format!("{}|{}", ledger.strategy_variant, ablations.join(","));
+            let fee_drag_bps =
+                (ledger.summary.fees_ticks.max(0) as f64) * 10_000.0 / capital_ticks as f64;
+            candidates.insert(
+                candidate_id,
+                OosFoldMetrics {
+                    fold_id: fold_id.to_owned(),
+                    stress: config.validation_stress,
+                    net_return_bps: risk.total_return_pct * 100.0,
+                    sharpe_ratio: risk.sharpe_ratio,
+                    sortino_ratio: risk.sortino_ratio,
+                    max_drawdown_pct: risk.max_drawdown_pct,
+                    fee_drag_bps,
+                    trades: ledger.summary.fill_count,
+                },
+            );
+        }
+        let bundle = OosFoldBundle {
+            methodology_id: "anchorbell-oos-fold-bundle-v1".to_owned(),
+            fold_id: fold_id.to_owned(),
+            stress: config.validation_stress,
+            candidates,
+        };
+        bundle
+            .validate()
+            .map_err(|_| SimulationError::InvalidConfig("generated validation fold is invalid"))?;
+        write_json_atomic(&config.output_root.join("oos-fold-bundle.json"), &bundle).await?;
+        Some(bundle)
+    } else {
+        None
+    };
     let promotion_input = SimulationPromotionInput {
         ledger_count: ledger_results.len() as u64,
         orders: ledger_results
@@ -1151,6 +1242,7 @@ pub async fn run(
         analytics_validation_summary,
         promotion_gate,
         candidate_readiness,
+        oos_fold_bundle,
         evidence_records_written: evidence_count.max(evidence_written.load(Ordering::Relaxed)),
         evidence_records_dropped: evidence_dropped.load(Ordering::Relaxed),
         ledgers: ledger_results,

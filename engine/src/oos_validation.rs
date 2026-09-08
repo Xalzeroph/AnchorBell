@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::cmp::Ordering;
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OosFoldMetrics {
@@ -24,6 +27,60 @@ impl OosFoldMetrics {
             && self.sharpe_ratio.is_none_or(f64::is_finite)
             && self.sortino_ratio.is_none_or(f64::is_finite)
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OosFoldBundle {
+    pub methodology_id: String,
+    pub fold_id: String,
+    pub stress: bool,
+    pub candidates: BTreeMap<String, OosFoldMetrics>,
+}
+
+impl OosFoldBundle {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.methodology_id != "anchorbell-oos-fold-bundle-v1"
+            || self.fold_id.trim().is_empty()
+            || self.candidates.is_empty()
+        {
+            return Err("invalid_fold_bundle_identity");
+        }
+        if self.candidates.iter().any(|(candidate_id, metrics)| {
+            candidate_id.trim().is_empty()
+                || !metrics.valid()
+                || metrics.fold_id != self.fold_id
+                || metrics.stress != self.stress
+        }) {
+            return Err("invalid_fold_bundle_metrics");
+        }
+        Ok(())
+    }
+}
+
+pub fn merge_fold_bundles(
+    bundles: &[OosFoldBundle],
+) -> Result<BTreeMap<String, Vec<OosFoldMetrics>>, &'static str> {
+    if bundles.is_empty() {
+        return Err("fold_bundles_required");
+    }
+    let mut seen_folds = BTreeSet::new();
+    let mut candidates = BTreeMap::<String, Vec<OosFoldMetrics>>::new();
+    for bundle in bundles {
+        bundle.validate()?;
+        if !seen_folds.insert(bundle.fold_id.clone()) {
+            return Err("duplicate_fold_id");
+        }
+        for (candidate_id, metrics) in &bundle.candidates {
+            candidates
+                .entry(candidate_id.clone())
+                .or_default()
+                .push(metrics.clone());
+        }
+    }
+    for folds in candidates.values_mut() {
+        folds.sort_by(|left, right| left.fold_id.cmp(&right.fold_id));
+    }
+    Ok(candidates)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -123,14 +180,8 @@ pub fn evaluate_robust_candidate(
         return base("invalid_fold_metrics");
     }
 
-    let oos = folds
-        .iter()
-        .filter(|fold| !fold.stress)
-        .collect::<Vec<_>>();
-    let stress = folds
-        .iter()
-        .filter(|fold| fold.stress)
-        .collect::<Vec<_>>();
+    let oos = folds.iter().filter(|fold| !fold.stress).collect::<Vec<_>>();
+    let stress = folds.iter().filter(|fold| fold.stress).collect::<Vec<_>>();
     if oos.len() < constraints.min_oos_folds {
         return base("insufficient_oos_folds");
     }
@@ -162,10 +213,7 @@ pub fn evaluate_robust_candidate(
         .iter()
         .filter_map(|fold| fold.sortino_ratio)
         .collect::<Vec<_>>();
-    let fees = oos
-        .iter()
-        .map(|fold| fold.fee_drag_bps)
-        .collect::<Vec<_>>();
+    let fees = oos.iter().map(|fold| fold.fee_drag_bps).collect::<Vec<_>>();
     let worst_drawdown = oos
         .iter()
         .map(|fold| fold.max_drawdown_pct)
@@ -177,8 +225,7 @@ pub fn evaluate_robust_candidate(
                 && fold.max_drawdown_pct <= constraints.max_stress_drawdown_pct
         })
         .count();
-    let stress_survival_ppm =
-        (survivors as u128 * 1_000_000 / stress.len().max(1) as u128) as u32;
+    let stress_survival_ppm = (survivors as u128 * 1_000_000 / stress.len().max(1) as u128) as u32;
 
     let lower_quartile = percentile(&returns, 250_000);
     let median_return = median(&returns);
@@ -267,6 +314,32 @@ mod tests {
     }
 
     #[test]
+    fn merge_fold_bundles_groups_candidates_and_rejects_duplicate_fold_identity() {
+        let mut first_candidates = BTreeMap::new();
+        first_candidates.insert("m7|".to_owned(), fold("o1", false, 5.0, 1.0, 1.0));
+        let first = OosFoldBundle {
+            methodology_id: "anchorbell-oos-fold-bundle-v1".to_owned(),
+            fold_id: "o1".to_owned(),
+            stress: false,
+            candidates: first_candidates,
+        };
+        let mut second_candidates = BTreeMap::new();
+        second_candidates.insert("m7|".to_owned(), fold("s1", true, -2.0, 0.2, 2.0));
+        let second = OosFoldBundle {
+            methodology_id: "anchorbell-oos-fold-bundle-v1".to_owned(),
+            fold_id: "s1".to_owned(),
+            stress: true,
+            candidates: second_candidates,
+        };
+        let merged = merge_fold_bundles(&[first.clone(), second]).unwrap();
+        assert_eq!(merged["m7|"].len(), 2);
+        assert_eq!(
+            merge_fold_bundles(&[first.clone(), first]).unwrap_err(),
+            "duplicate_fold_id"
+        );
+    }
+
+    #[test]
     fn stable_candidate_passes_hard_oos_and_stress_gates() {
         let folds = vec![
             fold("o1", false, 12.0, 1.1, 1.2),
@@ -316,6 +389,9 @@ mod tests {
         let mut fragile = safe.clone();
         fragile.median_net_return_bps = 50.0;
         fragile.stress_survival_ppm = 666_667;
-        assert_eq!(compare_robust_candidates(&safe, &fragile), Ordering::Greater);
+        assert_eq!(
+            compare_robust_candidates(&safe, &fragile),
+            Ordering::Greater
+        );
     }
 }
