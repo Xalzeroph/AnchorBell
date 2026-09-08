@@ -7,10 +7,7 @@ pub mod config;
 pub mod flatten;
 pub mod instrument_profile;
 pub mod inventory;
-<<<<<<< HEAD
 pub mod m9;
-=======
->>>>>>> refs/remotes/github/codex/safety-core
 pub mod maker_exit;
 pub mod market_context;
 pub mod method_catalog;
@@ -38,12 +35,9 @@ pub use config::{StrategyProfile, STRATEGY_PROFILE_SCHEMA_VERSION};
 pub use flatten::{DualFlattenPlan, FlattenPhase, FlattenReason};
 pub use instrument_profile::{profile_for, AnchorCurrency, InstrumentKind, InstrumentProfile};
 pub use inventory::InventoryState;
-<<<<<<< HEAD
 pub use m9::{
     decide as decide_m9, M9Action, M9Calibration, M9Decision, M9Input, M9Phase, M9_MODEL_VERSION,
 };
-=======
->>>>>>> refs/remotes/github/codex/safety-core
 pub use maker_exit::{
     decide_maker_exit, ExitBlockReason, ExitBook, ExitConstraints, ExitWorkingOrder,
     MakerExitDecision, MakerExitInput,
