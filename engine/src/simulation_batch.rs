@@ -380,6 +380,7 @@ fn build_engine(
     .with_realism(realism)
     .with_live_risk_gates()
     .with_strategy_variant(spec.variant)
+    .with_funding_controller_enabled(!spec.ablations.iter().any(|ablation| ablation == "funding"))
     .with_quote_reprice_min_interval_ms(config.quote_reprice_min_interval_ms)
     .with_dynamic_capital_refresh_ms(config.dynamic_capital_refresh_ms)
     .with_threshold_scale_ppm(config.threshold_scale_ppm);

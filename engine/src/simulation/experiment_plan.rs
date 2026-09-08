@@ -99,10 +99,6 @@ impl ExperimentPlan {
         self.experiments
             .iter()
             .map(|experiment| {
-                let funding_disabled = experiment
-                    .ablations
-                    .iter()
-                    .any(|ablation| ablation == "funding");
                 let variant = match experiment.strategy.as_str() {
                     "m1" => SimulationPolicyVariant::M1AdaptiveRisk,
                     "m2" => SimulationPolicyVariant::M2Microstructure,
@@ -111,7 +107,6 @@ impl ExperimentPlan {
                     "m5" => SimulationPolicyVariant::M5Robust,
                     "m6" => SimulationPolicyVariant::M6DynamicCapital,
                     "m7" => SimulationPolicyVariant::M7EvidenceGated,
-                    "m8" if funding_disabled => SimulationPolicyVariant::M7EvidenceGated,
                     "m8" => SimulationPolicyVariant::M8FundingAware,
                     "m9" => SimulationPolicyVariant::M9DeadlineCausalDroMpc,
                     _ => return Err("unknown experiment strategy"),
@@ -154,7 +149,7 @@ mod tests {
             .iter()
             .find(|(label, _, _)| label == "M8_no_funding")
             .unwrap();
-        assert_eq!(*variant, SimulationPolicyVariant::M7EvidenceGated);
+        assert_eq!(*variant, SimulationPolicyVariant::M8FundingAware);
         assert_eq!(ablations, &vec!["funding".to_owned()]);
     }
 

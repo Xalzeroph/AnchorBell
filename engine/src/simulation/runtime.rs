@@ -123,6 +123,10 @@ impl SimulationPolicyVariant {
     fn uses_dynamic_capital(self) -> bool {
         self >= Self::M6DynamicCapital
     }
+
+    fn uses_evidence_gate(self) -> bool {
+        matches!(self, Self::M7EvidenceGated | Self::M8FundingAware)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1036,6 +1040,7 @@ pub struct SimulationEngine {
     realism: crate::backtest::realism::RealisticFillModel,
     quote_reprice_min_interval_ms: u64,
     live_risk_gates: bool,
+    funding_controller_enabled: bool,
     threshold_scale_ppm: i64,
     position_allocations: BTreeMap<String, PositionAllocation>,
     capital_usdt_ticks: Option<i64>,
@@ -1159,6 +1164,7 @@ impl SimulationEngine {
             realism: crate::backtest::realism::RealisticFillModel::default(),
             quote_reprice_min_interval_ms: 0,
             live_risk_gates: false,
+            funding_controller_enabled: true,
             threshold_scale_ppm: 1_000_000,
             position_allocations,
             capital_usdt_ticks: None,
@@ -1188,6 +1194,30 @@ impl SimulationEngine {
     pub fn with_live_risk_gates(mut self) -> Self {
         self.live_risk_gates = true;
         self
+    }
+
+    pub fn with_funding_controller_enabled(mut self, enabled: bool) -> Self {
+        self.funding_controller_enabled = enabled;
+        self
+    }
+
+    fn funding_controller_active(&self) -> bool {
+        self.strategy_variant == SimulationPolicyVariant::M8FundingAware
+            && self.funding_controller_enabled
+    }
+
+    fn funding_entry_allowed_for_strategy(
+        &self,
+        state: &SimulationSymbolState,
+        now_ms: u64,
+    ) -> bool {
+        if self.strategy_variant == SimulationPolicyVariant::M8FundingAware
+            && !self.funding_controller_enabled
+        {
+            funding_entry_allowed(state, now_ms)
+        } else {
+            funding_entry_allowed_variant(state, now_ms, self.strategy_variant, self.fee_ppm)
+        }
     }
 
     /// Hold a same-side quote briefly before replacing it. This models the
@@ -1373,12 +1403,7 @@ impl SimulationEngine {
                     == DataQualityStatus::Fresh
                     && state.anchor.valid_at(timestamp_ms, self.max_anchor_age_ms)
                     && (!self.live_risk_gates
-                        || funding_entry_allowed_variant(
-                            state,
-                            timestamp_ms,
-                            self.strategy_variant,
-                            self.fee_ppm,
-                        ));
+                        || self.funding_entry_allowed_for_strategy(state, timestamp_ms));
                 (symbol.clone(), CapitalRiskInput { risk_bps, eligible })
             })
             .collect::<BTreeMap<_, _>>();
@@ -1777,16 +1802,12 @@ impl SimulationEngine {
                     funding_decision.funding_carry_bps,
                     state.position,
                 );
+                let funding_controller_active = self.funding_controller_active();
                 let funding_allowed = !self.live_risk_gates
-                    || if self.strategy_variant == SimulationPolicyVariant::M8FundingAware {
+                    || if funding_controller_active {
                         funding_overlay.allow_base_strategy
                     } else {
-                        funding_entry_allowed_variant(
-                            state,
-                            self.last_event_at_ms,
-                            self.strategy_variant,
-                            self.fee_ppm,
-                        )
+                        self.funding_entry_allowed_for_strategy(state, self.last_event_at_ms)
                     };
                 let risk_state = if !equity_entry_allowed {
                     SimulationRiskState::ReduceOnlyEquitySession
@@ -1798,7 +1819,7 @@ impl SimulationEngine {
                     SimulationRiskState::ReduceOnlyTailRisk
                 } else if !funding_known {
                     SimulationRiskState::HaltFundingMetadata
-                } else if self.strategy_variant == SimulationPolicyVariant::M8FundingAware {
+                } else if funding_controller_active {
                     match funding_overlay.state {
                         crate::risk::FundingRiskState::ReduceOnly => {
                             SimulationRiskState::ReduceOnlyFundingRisk
@@ -1919,13 +1940,27 @@ impl SimulationEngine {
                     calendar_state: calendar_state.to_owned(),
                     next_funding_time_ms: state.next_funding_time_ms,
                     latest_funding_rate_e8: state.latest_funding_rate_e8,
-                    funding_flatten_deadline_ms: (self.strategy_variant
-                        != SimulationPolicyVariant::M8FundingAware)
+                    funding_flatten_deadline_ms: (!funding_controller_active)
                         .then(|| funding_flatten_deadline(state.next_funding_time_ms))
                         .flatten(),
-                    funding_action: format!("{:?}", funding_decision.action),
-                    funding_carry_bps: funding_decision.funding_carry_bps,
-                    funding_net_edge_bps: funding_decision.net_edge_bps,
+                    funding_action: if self.strategy_variant
+                        == SimulationPolicyVariant::M8FundingAware
+                        && !self.funding_controller_enabled
+                    {
+                        "Ablated".to_owned()
+                    } else {
+                        format!("{:?}", funding_decision.action)
+                    },
+                    funding_carry_bps: if funding_controller_active {
+                        funding_decision.funding_carry_bps
+                    } else {
+                        0
+                    },
+                    funding_net_edge_bps: if funding_controller_active {
+                        funding_decision.net_edge_bps
+                    } else {
+                        0
+                    },
                     risk_state: risk_state.label().to_owned(),
                     entry_block_reason: entry_block_reason.to_owned(),
                     data_quality,
@@ -2527,8 +2562,8 @@ impl SimulationEngine {
             };
             let session_allowed =
                 !self.live_risk_gates || simulation_session_allows_entry(symbol, timestamp_ms);
-            let funding_decision = (self.strategy_variant
-                == SimulationPolicyVariant::M8FundingAware)
+            let funding_controller_active = self.funding_controller_active();
+            let funding_decision = funding_controller_active
                 .then(|| m8_funding_decision(state, timestamp_ms, max_position, self.fee_ppm));
             // Funding is an incremental overlay. Neutral/zero funding delegates
             // admission back to the inherited M7 signal and risk layers.
@@ -2546,14 +2581,7 @@ impl SimulationEngine {
             });
             let funding_allowed = !self.live_risk_gates
                 || funding_decision.as_ref().map_or_else(
-                    || {
-                        funding_entry_allowed_variant(
-                            state,
-                            timestamp_ms,
-                            self.strategy_variant,
-                            self.fee_ppm,
-                        )
-                    },
+                    || self.funding_entry_allowed_for_strategy(state, timestamp_ms),
                     |decision| {
                         funding_overlay
                             .as_ref()
@@ -2660,7 +2688,7 @@ impl SimulationEngine {
                         .and_then(|value| value.required_pico_bps())
                         .map(|required| required.saturating_sub(state.adaptive_relief_pico_bps))
                         .unwrap_or(0);
-                    let m7_blocked = strategy_variant == SimulationPolicyVariant::M7EvidenceGated
+                    let m7_blocked = strategy_variant.uses_evidence_gate()
                         && !m7_entry_admissible(state, m7_required_pico_bps);
                     let intent = if strategy_variant == SimulationPolicyVariant::M0Fixed {
                         if m7_blocked {
@@ -2748,7 +2776,7 @@ impl SimulationEngine {
                     };
                     let reason = if intent.is_some() {
                         "admissible"
-                    } else if strategy_variant == SimulationPolicyVariant::M7EvidenceGated {
+                    } else if strategy_variant.uses_evidence_gate() {
                         "m7_evidence_gate"
                     } else {
                         "signal_below_threshold"
