@@ -28,6 +28,9 @@ jobs:
       - name: Apply coherent risk-window repair
         run: python3 .github/scripts/anchorbell_risk_window_fix.py
 
+      - name: Repair risk-history allocation ownership
+        run: python3 .github/scripts/anchorbell_risk_window_compile_fix.py
+
       - name: Format
         run: cargo fmt --all
 
