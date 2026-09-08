@@ -1,11 +1,15 @@
+#[cfg(windows)]
 use std::{ffi::c_void, ptr};
 
+#[cfg(any(windows, test))]
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::{BinanceCredentials, BinanceEnvironment, CredentialsError};
 
+#[cfg(any(windows, test))]
 const TARGET_PREFIX: &str = "AnchorBell/Binance/";
+#[cfg(windows)]
 const MAX_CREDENTIAL_BLOB_BYTES: usize = 2_560;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +27,7 @@ pub enum CredentialStoreError {
     Os { operation: &'static str, code: u32 },
 }
 
+#[cfg(any(windows, test))]
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredCredentials {
     api_key: String,
@@ -64,6 +69,7 @@ impl PersistentCredentialStore {
     }
 }
 
+#[cfg(any(windows, test))]
 fn target_name(environment: BinanceEnvironment) -> String {
     format!("{TARGET_PREFIX}{}", environment.as_str())
 }
@@ -204,6 +210,7 @@ fn platform_delete(environment: BinanceEnvironment) -> Result<(), CredentialStor
     Ok(())
 }
 
+#[cfg(windows)]
 fn to_credentials(stored: StoredCredentials) -> Result<BinanceCredentials, CredentialStoreError> {
     BinanceCredentials::from_values(stored.api_key, stored.api_secret)
         .map_err(CredentialStoreError::InvalidCredential)
