@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::{backtest::realism::RealisticFillModel, strategy::CalibrationState};
+use crate::strategy::CalibrationState;
 
 use super::runtime::SimulationPolicyVariant;
 

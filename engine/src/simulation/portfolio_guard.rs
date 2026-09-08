@@ -83,10 +83,7 @@ impl PortfolioDrawdownGuard {
 
     /// Observe a causal marked-to-market portfolio PnL. Missing valuation is
     /// fail-closed to reduce-only, but it does not poison the historical peak.
-    pub fn observe(
-        &mut self,
-        mark_to_market_pnl_ticks: Option<i64>,
-    ) -> PortfolioDrawdownAction {
+    pub fn observe(&mut self, mark_to_market_pnl_ticks: Option<i64>) -> PortfolioDrawdownAction {
         if self.hard_stopped {
             self.action = PortfolioDrawdownAction::HardStop;
             return self.action;
@@ -99,8 +96,7 @@ impl PortfolioDrawdownGuard {
         self.current_mark_to_market_pnl_ticks = Some(pnl);
         self.peak_pnl_ticks = self.peak_pnl_ticks.max(pnl);
         let loss_from_peak = self.peak_pnl_ticks.saturating_sub(pnl).max(0);
-        self.drawdown_bps = (i128::from(loss_from_peak)
-            .saturating_mul(10_000)
+        self.drawdown_bps = (i128::from(loss_from_peak).saturating_mul(10_000)
             / i128::from(self.capital_ticks))
         .clamp(0, i128::from(i64::MAX)) as i64;
         self.action = if self.drawdown_bps >= self.hard_limit_bps {
@@ -146,12 +142,18 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(guard.observe(Some(2_000)), PortfolioDrawdownAction::Trading);
-        assert_eq!(guard.observe(Some(1_000)), PortfolioDrawdownAction::ReduceOnly);
+        assert_eq!(
+            guard.observe(Some(1_000)),
+            PortfolioDrawdownAction::ReduceOnly
+        );
         assert_eq!(guard.snapshot().drawdown_bps, 100);
         assert_eq!(guard.observe(Some(1_500)), PortfolioDrawdownAction::Trading);
         assert_eq!(guard.observe(Some(0)), PortfolioDrawdownAction::HardStop);
         assert!(guard.snapshot().hard_stopped);
-        assert_eq!(guard.observe(Some(2_500)), PortfolioDrawdownAction::HardStop);
+        assert_eq!(
+            guard.observe(Some(2_500)),
+            PortfolioDrawdownAction::HardStop
+        );
     }
 
     #[test]
