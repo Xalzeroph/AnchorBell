@@ -34,12 +34,6 @@ jobs:
       - name: Add calibration store round-trip regression
         run: python3 .github/scripts/anchorbell_calibration_store_roundtrip_fix.py
 
-      - name: Integrate portfolio drawdown runtime guard
-        run: python3 .github/scripts/anchorbell_portfolio_drawdown_runtime_fix.py
-
-      - name: Compact portfolio drawdown runtime glue
-        run: python3 .github/scripts/anchorbell_portfolio_drawdown_budget_fix.py
-
       - name: Expose portfolio drawdown controls
         run: python3 .github/scripts/anchorbell_drawdown_config_surface_fix.py
 
