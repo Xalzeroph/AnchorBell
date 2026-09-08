@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - risk-optimizer-20260908
+  workflow_dispatch:
 
 permissions:
   contents: write
