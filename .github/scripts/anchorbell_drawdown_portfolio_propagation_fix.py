@@ -29,6 +29,27 @@ old_event_tail = '''        records.extend(match event {
         records
     }
 '''
+old_propagated_tail = '''        records.extend(match event {
+            BinanceMarketEvent::BookTicker(ticker) => self.on_book_ticker(ticker),
+            BinanceMarketEvent::MarkPrice(mark) => self.on_mark_price(mark, received_at_ms),
+            BinanceMarketEvent::AggTrade(trade) => self.on_agg_trade(trade),
+            BinanceMarketEvent::DepthUpdate(depth) => self.on_depth_update(depth),
+        });
+        if self.observe_portfolio_drawdown().blocks_new_risk() {
+            let source = event_symbol(event);
+            let source_rebalanced = matches!(
+                event,
+                BinanceMarketEvent::BookTicker(_) | BinanceMarketEvent::MarkPrice(_)
+            );
+            for symbol in self.states.keys().cloned().collect::<Vec<_>>() {
+                if !source_rebalanced || !symbol.eq_ignore_ascii_case(source) {
+                    records.extend(self.rebalance_symbol(&symbol, self.last_event_at_ms));
+                }
+            }
+        }
+        records
+    }
+'''
 new_event_tail = '''        records.extend(match event {
             BinanceMarketEvent::BookTicker(ticker) => self.on_book_ticker(ticker),
             BinanceMarketEvent::MarkPrice(mark) => self.on_mark_price(mark, received_at_ms),
@@ -48,9 +69,13 @@ new_event_tail = '''        records.extend(match event {
         records
     }
 '''
-if old_event_tail in runtime:
+if new_event_tail in runtime:
+    pass
+elif old_propagated_tail in runtime:
+    runtime = runtime.replace(old_propagated_tail, new_event_tail, 1)
+elif old_event_tail in runtime:
     runtime = runtime.replace(old_event_tail, new_event_tail, 1)
-elif new_event_tail not in runtime:
+else:
     raise SystemExit("missing anchor: portfolio drawdown event propagation")
 
 RUNTIME.write_text(runtime, encoding="utf-8")
