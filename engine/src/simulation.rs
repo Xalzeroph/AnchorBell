@@ -11,8 +11,14 @@ pub mod engine;
 pub mod experiment_plan;
 #[path = "simulation/orchestration.rs"]
 pub mod orchestration;
+#[path = "simulation/portfolio_guard.rs"]
+pub mod portfolio_guard;
 #[path = "simulation/replay.rs"]
 pub mod replay;
+#[path = "simulation/replay_config.rs"]
+pub mod replay_config;
+#[path = "simulation/risk_metrics.rs"]
+pub mod risk_metrics;
 #[path = "simulation/runtime.rs"]
 pub mod runtime;
 

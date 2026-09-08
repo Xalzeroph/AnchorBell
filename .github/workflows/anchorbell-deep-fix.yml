@@ -1,0 +1,141 @@
+name: AnchorBell deep fix
+
+on:
+  push:
+    branches:
+      - diag-risk-20260908
+
+permissions:
+  contents: write
+
+jobs:
+  deep-fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout diagnostic branch
+        uses: actions/checkout@v4
+        with:
+          ref: diag-risk-20260908
+          fetch-depth: 0
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Apply M9 cumulative semantics repair
+        run: python3 .github/scripts/anchorbell_m9_cumulative_semantics_fix.py
+
+      - name: Extract risk metrics module
+        run: python3 .github/scripts/anchorbell_risk_metrics_module_fix.py
+
+      - name: Add calibration store round-trip regression
+        run: python3 .github/scripts/anchorbell_calibration_store_roundtrip_fix.py
+
+      - name: Expose portfolio drawdown controls
+        shell: bash
+        run: |
+          if grep -q 'pub portfolio_drawdown_limits_bps: Option<(i64, i64)>' engine/src/simulation/replay_config.rs \
+            && grep -q 'portfolio_drawdown_soft_limit_bps' engine/src/bin/anchorbell_backtest.rs \
+            && grep -q 'pub portfolio_drawdown_soft_limit_bps: i64' engine/src/simulation_batch.rs \
+            && grep -q 'pub portfolio_drawdown_hard_limit_bps: i64' engine/src/simulation_batch.rs \
+            && grep -q 'pub portfolio_drawdown_soft_limit_bps: i64' engine/src/strategy/config.rs \
+            && grep -q 'profile.portfolio_drawdown_soft_limit_bps' engine/src/bin/anchorbell_simulation_batch.rs; then
+            echo "portfolio drawdown config surface already present"
+          else
+            python3 .github/scripts/anchorbell_drawdown_config_surface_fix.py
+          fi
+
+      - name: Extract replay configuration module
+        run: python3 .github/scripts/anchorbell_replay_config_module_fix.py
+
+      - name: Repair drawdown fixtures and replay imports
+        run: python3 .github/scripts/anchorbell_drawdown_fixture_cleanup_fix.py
+
+      - name: Propagate portfolio drawdown across symbols
+        shell: bash
+        run: |
+          if grep -q 'let portfolio_drawdown_action = self.observe_portfolio_drawdown();' engine/src/simulation/runtime.rs \
+            && grep -q 'self.observe_portfolio_drawdown().blocks_new_risk()' engine/src/simulation/runtime.rs \
+            && grep -q 'eq_ignore_ascii_case(source)' engine/src/simulation/runtime.rs; then
+            echo "portfolio drawdown propagation already present"
+          else
+            python3 .github/scripts/anchorbell_drawdown_portfolio_propagation_fix.py
+          fi
+
+      - name: Align drawdown metrics semantics
+        shell: bash
+        run: |
+          if grep -q 'pub fn metric_labels' engine/src/simulation/portfolio_guard.rs \
+            && grep -q 'then_some(s.net_pnl_ticks)' engine/src/simulation/runtime.rs \
+            && grep -q 'risk_state: labels.0.to_owned()' engine/src/simulation/runtime.rs; then
+            echo "portfolio drawdown observability already aligned"
+          else
+            python3 .github/scripts/anchorbell_drawdown_metrics_semantics_fix.py
+          fi
+
+      - name: Make OOS risk sampling deterministic
+        shell: bash
+        run: |
+          if grep -q 'Risk statistics are sampled on exchange event time' engine/src/simulation_batch.rs \
+            && ! grep -A3 'let point = ledger.engine.performance_point(observed_at);' engine/src/simulation_batch.rs | grep -q 'append_risk_history_sample'; then
+            echo "exchange-time OOS risk sampling already present"
+          else
+            python3 .github/scripts/anchorbell_deterministic_risk_sampling_fix.py
+          fi
+
+      - name: Bind OOS folds to candidate parameters
+        shell: bash
+        run: |
+          if grep -q 'pub parameter_digest: String' engine/src/oos_validation.rs \
+            && grep -q 'anchorbell-oos-fold-bundle-v3' engine/src/oos_validation.rs \
+            && grep -q 'fn candidate_behavior_digest' engine/src/simulation_batch.rs; then
+            echo "OOS candidate parameter provenance already present"
+          else
+            python3 .github/scripts/anchorbell_oos_parameter_provenance_fix.py
+          fi
+
+      - name: Harden OOS parameter binding
+        shell: bash
+        run: |
+          if grep -q 'candidate_parameter_digest_mismatch' engine/src/oos_validation.rs \
+            && grep -q 'candidate_id.ends_with' engine/src/oos_validation.rs; then
+            echo "OOS candidate parameter binding already hardened"
+          else
+            python3 .github/scripts/anchorbell_oos_parameter_binding_hardening_fix.py
+          fi
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Architecture gate
+        run: python3 scripts/architecture_gate.py
+
+      - name: Resource gate
+        run: python3 scripts/resource_gate.py
+
+      - name: Check workspace
+        run: cargo check --workspace --locked
+
+      - name: Test workspace
+        run: cargo test --workspace --locked
+
+      - name: Clippy regression scan
+        run: cargo clippy --workspace --all-targets --all-features
+
+      - name: Commit validated repairs
+        shell: bash
+        run: |
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "No source changes to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: harden OOS candidate parameter binding"
+          git fetch origin diag-risk-20260908
+          git rebase origin/diag-risk-20260908
+          git push origin HEAD:diag-risk-20260908

@@ -1,4 +1,291 @@
-use std::{collections::BTreeMap, env, fs::File, io::Read, path::PathBuf, process, str::FromStr};
+from pathlib import Path
+
+runtime = Path("engine/src/simulation/runtime.rs")
+text = runtime.read_text()
+start = text.index("// The explicit arguments keep replay assumptions visible and deterministic.")
+end = text.index("\nfn now_ms()", start)
+replacement = r'''// Legacy wrappers preserve the stable replay API. New research and OOS
+// validation should use ReplayConfig so strategy and execution assumptions are
+// carried by one auditable object.
+#[derive(Debug, Clone)]
+pub struct ReplayConfig {
+    pub price_scale: u32,
+    pub quantity_scale: u32,
+    pub entry_threshold_bps: i64,
+    pub max_position: i64,
+    pub requested_quantity: i64,
+    pub max_mark_index_gap_bps: i64,
+    pub max_anchor_age_ms: u64,
+    pub fee_ppm: i64,
+    pub realism: crate::backtest::realism::RealisticFillModel,
+    pub strategy_variant: SimulationPolicyVariant,
+    pub threshold_scale_ppm: i64,
+    pub quote_reprice_min_interval_ms: u64,
+    pub dynamic_capital_refresh_ms: u64,
+    pub live_risk_gates: bool,
+    pub funding_controller_enabled: bool,
+    pub capital_usdt_ticks: Option<i64>,
+    pub calibration_seeds: BTreeMap<String, CalibrationState>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplayEvaluation {
+    pub summary: SimulationSummary,
+    pub risk_metrics: Option<RiskMetrics>,
+    pub risk_samples: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn replay_jsonl(
+    input_path: &Path,
+    output_path: Option<&Path>,
+    anchors: BTreeMap<String, AnchorSnapshot>,
+    price_scale: u32,
+    quantity_scale: u32,
+    entry_threshold_bps: i64,
+    max_position: i64,
+    requested_quantity: i64,
+    max_mark_index_gap_bps: i64,
+    max_anchor_age_ms: u64,
+    fee_ppm: i64,
+) -> Result<SimulationSummary, SimulationError> {
+    replay_jsonl_with_realism(
+        input_path,
+        output_path,
+        anchors,
+        price_scale,
+        quantity_scale,
+        entry_threshold_bps,
+        max_position,
+        requested_quantity,
+        max_mark_index_gap_bps,
+        max_anchor_age_ms,
+        fee_ppm,
+        crate::backtest::realism::RealisticFillModel::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn replay_jsonl_with_realism(
+    input_path: &Path,
+    output_path: Option<&Path>,
+    anchors: BTreeMap<String, AnchorSnapshot>,
+    price_scale: u32,
+    quantity_scale: u32,
+    entry_threshold_bps: i64,
+    max_position: i64,
+    requested_quantity: i64,
+    max_mark_index_gap_bps: i64,
+    max_anchor_age_ms: u64,
+    fee_ppm: i64,
+    realism: crate::backtest::realism::RealisticFillModel,
+) -> Result<SimulationSummary, SimulationError> {
+    replay_jsonl_with_config(
+        input_path,
+        output_path,
+        anchors,
+        ReplayConfig {
+            price_scale,
+            quantity_scale,
+            entry_threshold_bps,
+            max_position,
+            requested_quantity,
+            max_mark_index_gap_bps,
+            max_anchor_age_ms,
+            fee_ppm,
+            realism,
+            strategy_variant: SimulationPolicyVariant::M0Fixed,
+            threshold_scale_ppm: 1_000_000,
+            quote_reprice_min_interval_ms: 0,
+            dynamic_capital_refresh_ms: 60_000,
+            live_risk_gates: false,
+            funding_controller_enabled: true,
+            capital_usdt_ticks: None,
+            calibration_seeds: BTreeMap::new(),
+        },
+    )
+    .map(|evaluation| evaluation.summary)
+}
+
+pub fn replay_jsonl_with_config(
+    input_path: &Path,
+    output_path: Option<&Path>,
+    anchors: BTreeMap<String, AnchorSnapshot>,
+    config: ReplayConfig,
+) -> Result<ReplayEvaluation, SimulationError> {
+    if config.threshold_scale_ppm <= 0
+        || config.threshold_scale_ppm > 1_000_000
+        || config.dynamic_capital_refresh_ms == 0
+        || config.capital_usdt_ticks.is_some_and(|capital| capital <= 0)
+        || (!config.funding_controller_enabled
+            && config.strategy_variant != SimulationPolicyVariant::M8FundingAware)
+    {
+        return Err(SimulationError::InvalidConfig(
+            "invalid replay policy configuration",
+        ));
+    }
+    let allocations = config
+        .capital_usdt_ticks
+        .map(|capital| {
+            allocate_positions(
+                &anchors,
+                capital,
+                &BTreeMap::new(),
+                config.quantity_scale,
+            )
+        })
+        .transpose()?;
+    let mut engine = SimulationEngine::new(
+        anchors,
+        config.entry_threshold_bps,
+        config.max_position,
+        config.requested_quantity,
+        config.max_mark_index_gap_bps,
+        config.max_anchor_age_ms,
+        config.fee_ppm,
+        config.quantity_scale,
+    )?
+    .with_price_scale(config.price_scale)
+    .with_strategy_variant(config.strategy_variant)
+    .with_funding_controller_enabled(config.funding_controller_enabled)
+    .with_realism(config.realism)
+    .with_threshold_scale_ppm(config.threshold_scale_ppm)
+    .with_quote_reprice_min_interval_ms(config.quote_reprice_min_interval_ms)
+    .with_dynamic_capital_refresh_ms(config.dynamic_capital_refresh_ms);
+    if config.live_risk_gates {
+        engine = engine.with_live_risk_gates();
+    }
+    engine.restore_calibration_states(&config.calibration_seeds);
+    if let Some(allocations) = allocations {
+        engine = engine.with_position_allocations(allocations)?;
+    }
+
+    let reader = BufReader::new(File::open(input_path)?);
+    if let Some(parent) = output_path
+        .and_then(Path::parent)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut output = output_path
+        .map(|path| File::create(path).map(BufWriter::new))
+        .transpose()?;
+    let mut previous_ms = None;
+    let mut event_sequence = 0_u64;
+    let mut last_risk_sample_ms = None;
+    let mut risk_points = Vec::<(u64, i64)>::new();
+
+    for (index, line) in reader.lines().enumerate() {
+        let line_number = index + 1;
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let envelope = serde_json::from_str::<serde_json::Value>(&line).ok();
+        let payload = envelope
+            .as_ref()
+            .and_then(|value| value.get("payload"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(line.as_str());
+        if payload.contains("\"id\"") && payload.contains("\"result\"") {
+            continue;
+        }
+        let received_at_ms = envelope
+            .as_ref()
+            .and_then(|value| value.get("received_at_ms"))
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|value| u64::try_from(value).ok())
+            .or_else(|| {
+                envelope
+                    .as_ref()
+                    .and_then(|value| value.get("_anchorbell_received_at_ms"))
+                    .and_then(serde_json::Value::as_u64)
+            });
+        let event = crate::market::binance::parse_market_message(
+            payload.as_bytes(),
+            config.price_scale,
+            config.quantity_scale,
+        )
+        .map_err(|error| SimulationError::ReplayParse {
+            line: line_number,
+            error,
+        })?;
+        let symbol = event_symbol(&event).to_ascii_uppercase();
+        if !engine.states.contains_key(&symbol) {
+            return Err(SimulationError::ReplaySymbolNotConfigured(symbol));
+        }
+        let event_timestamp_ms = event_time_ms(&event);
+        let timestamp_ms = received_at_ms.unwrap_or(event_timestamp_ms);
+        if previous_ms.is_some_and(|previous| timestamp_ms < previous) {
+            return Err(SimulationError::ReplayOutOfOrder {
+                previous_ms: previous_ms.unwrap(),
+                current_ms: timestamp_ms,
+            });
+        }
+        previous_ms = Some(timestamp_ms);
+        event_sequence = event_sequence.saturating_add(1);
+        let event_envelope = EventEnvelope {
+            event_id: format!("replay-{event_sequence}").into(),
+            run_id: "replay".into(),
+            causality_id: format!("replay-cause-{event_sequence}").into(),
+            source: EventSource::Replay,
+            observed_at_ms: event_timestamp_ms,
+            received_at_ms: timestamp_ms,
+            sequence: event_sequence,
+            state_version: event_sequence,
+            quality: DataQuality::Trusted,
+            payload: event,
+        };
+        for record in engine.on_enveloped_event(&event_envelope)? {
+            if let Some(output) = output.as_mut() {
+                serde_json::to_writer(&mut *output, &record)?;
+                output.write_all(b"\n")?;
+            }
+        }
+        if config.capital_usdt_ticks.is_some()
+            && last_risk_sample_ms.is_none_or(|last| {
+                timestamp_ms.saturating_sub(last) >= RISK_SAMPLE_INTERVAL_MS
+            })
+        {
+            let point = engine.performance_point(timestamp_ms);
+            risk_points.push((timestamp_ms, point.net_pnl_ticks));
+            last_risk_sample_ms = Some(timestamp_ms);
+        }
+    }
+
+    let final_timestamp_ms = previous_ms.unwrap_or(0);
+    for record in engine.cancel_all(final_timestamp_ms, "replay window ended") {
+        if let Some(output) = output.as_mut() {
+            serde_json::to_writer(&mut *output, &record)?;
+            output.write_all(b"\n")?;
+        }
+    }
+    if let Some(output) = output.as_mut() {
+        output.flush()?;
+    }
+    let summary = engine.summary();
+    if config.capital_usdt_ticks.is_some() {
+        match risk_points.last_mut() {
+            Some(last) if last.0 == final_timestamp_ms => last.1 = summary.net_pnl_ticks,
+            _ => risk_points.push((final_timestamp_ms, summary.net_pnl_ticks)),
+        }
+    }
+    let risk_metrics = config
+        .capital_usdt_ticks
+        .map(|capital| calculate_risk_metrics(&risk_points, capital));
+    Ok(ReplayEvaluation {
+        summary,
+        risk_metrics,
+        risk_samples: risk_points.len(),
+    })
+}
+'''
+runtime.write_text(text[:start] + replacement + text[end:])
+
+backtest = Path("engine/src/bin/anchorbell_backtest.rs")
+backtest.write_text(r'''use std::{
+    collections::BTreeMap, env, fs::File, io::Read, path::PathBuf, process, str::FromStr,
+};
 
 use anchorbell_engine::{
     backtest::realism::{LatencyModel, QueueModel, RealisticFillModel},
@@ -7,10 +294,7 @@ use anchorbell_engine::{
     simulation::{
         load_anchor_file, replay_jsonl_with_config, ReplayConfig, SimulationPolicyVariant,
     },
-    strategy::{
-        universe::instrument_for, CalibrationSnapshot, CalibrationState, CALIBRATION_MODEL_VERSION,
-        CALIBRATION_SCHEMA_VERSION,
-    },
+    strategy::{universe::instrument_for, CalibrationSnapshot, CalibrationState},
 };
 use sha2::{Digest, Sha256};
 
@@ -20,9 +304,7 @@ struct Args {
     anchors: PathBuf,
     records: Option<PathBuf>,
     calibration_store: Option<PathBuf>,
-    calibration_output: Option<PathBuf>,
     calibration_source_label: String,
-    freeze_calibration: bool,
     price_scale: u32,
     quantity_scale: u32,
     entry_threshold_bps: i64,
@@ -43,8 +325,6 @@ struct Args {
     live_risk_gates: bool,
     funding_controller_enabled: bool,
     capital_usdt_ticks: Option<i64>,
-    portfolio_drawdown_soft_limit_bps: i64,
-    portfolio_drawdown_hard_limit_bps: i64,
     require_flat_at_end: bool,
 }
 
@@ -58,10 +338,7 @@ async fn main() {
     let args = parse_args().unwrap_or_else(|message| fail(message));
     let anchors = load_anchor_file(&args.anchors)
         .unwrap_or_else(|error| fail(format!("cannot load anchors: {error}")));
-    if let Some(symbol) = anchors
-        .keys()
-        .find(|symbol| instrument_for(symbol).is_none())
-    {
+    if let Some(symbol) = anchors.keys().find(|symbol| instrument_for(symbol).is_none()) {
         fail(format!(
             "anchor symbol is outside the selected execution universe: {symbol}"
         ));
@@ -78,19 +355,6 @@ async fn main() {
     {
         fail("M9 replay requires --calibration-store from the training window");
     }
-    if args.freeze_calibration && calibration_seeds.is_empty() {
-        fail("--freeze-calibration requires --calibration-store from a prior training window");
-    }
-    if args.freeze_calibration && args.calibration_output.is_some() {
-        fail("--calibration-output cannot be combined with --freeze-calibration");
-    }
-    let calibration_seed_count = calibration_seeds.len();
-    let calibration_store_sha256 = args
-        .calibration_store
-        .as_deref()
-        .map(sha256_file)
-        .transpose()
-        .unwrap_or_else(|error| fail(format!("cannot hash calibration store: {error}")));
     let input_sha256 = sha256_file(&args.input)
         .unwrap_or_else(|error| fail(format!("cannot hash input: {error}")));
     let evaluation = match replay_jsonl_with_config(
@@ -124,11 +388,6 @@ async fn main() {
             live_risk_gates: args.live_risk_gates,
             funding_controller_enabled: args.funding_controller_enabled,
             capital_usdt_ticks: args.capital_usdt_ticks,
-            portfolio_drawdown_limits_bps: drawdown_limits(
-                args.portfolio_drawdown_soft_limit_bps,
-                args.portfolio_drawdown_hard_limit_bps,
-            ),
-            calibration_updates_enabled: !args.freeze_calibration,
             calibration_seeds,
         },
     ) {
@@ -151,20 +410,6 @@ async fn main() {
             evaluation.summary.current_absolute_position, evaluation.summary.working_orders
         ));
     }
-    let calibration_output_sha256 = args.calibration_output.as_deref().map(|path| {
-        write_calibration_store(
-            path,
-            &args.calibration_source_label,
-            &evaluation.calibration_snapshots,
-        )
-        .unwrap_or_else(|error| fail(error));
-        sha256_file(path).unwrap_or_else(|error| {
-            fail(format!(
-                "cannot hash calibration output {}: {error}",
-                path.display()
-            ))
-        })
-    });
     let report = serde_json::json!({
         "input": args.input,
         "input_sha256": input_sha256,
@@ -172,13 +417,7 @@ async fn main() {
         "strategy_variant": args.strategy_variant.label(),
         "funding_controller_enabled": args.funding_controller_enabled,
         "calibration_source_label": args.calibration_source_label,
-        "calibration_model_version": CALIBRATION_MODEL_VERSION,
-        "calibration_updates_enabled": !args.freeze_calibration,
-        "calibration_seed_count": calibration_seed_count,
-        "calibration_snapshot_count": evaluation.calibration_snapshots.len(),
-        "calibration_store_sha256": calibration_store_sha256,
-        "calibration_output": args.calibration_output,
-        "calibration_output_sha256": calibration_output_sha256,
+        "calibration_seed_count": args.calibration_store.as_ref().map(|_| 1).unwrap_or(0),
         "price_scale": args.price_scale,
         "quantity_scale": args.quantity_scale,
         "entry_threshold_bps": args.entry_threshold_bps,
@@ -186,8 +425,6 @@ async fn main() {
         "max_position": args.max_position,
         "requested_quantity": args.requested_quantity,
         "capital_usdt_ticks": args.capital_usdt_ticks,
-        "portfolio_drawdown_soft_limit_bps": args.portfolio_drawdown_soft_limit_bps,
-        "portfolio_drawdown_hard_limit_bps": args.portfolio_drawdown_hard_limit_bps,
         "max_mark_index_gap_bps": args.max_mark_index_gap_bps,
         "max_anchor_age_ms": args.max_anchor_age_ms,
         "maker_fee_ppm": args.fee_ppm,
@@ -210,62 +447,6 @@ async fn main() {
     );
 }
 
-fn write_calibration_store(
-    path: &std::path::Path,
-    source_label: &str,
-    snapshots: &BTreeMap<String, CalibrationSnapshot>,
-) -> Result<(), String> {
-    if source_label.trim().is_empty() {
-        return Err("calibration source label cannot be empty".to_owned());
-    }
-    if snapshots.is_empty() {
-        return Err("training replay produced no calibration snapshots".to_owned());
-    }
-    let keyed = snapshots
-        .iter()
-        .map(|(symbol, snapshot)| (format!("{source_label}::{symbol}"), snapshot.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let updated_at_event_time_ms = snapshots
-        .values()
-        .map(|snapshot| snapshot.window_end_event_time_ms)
-        .max()
-        .unwrap_or(0);
-    let store = serde_json::json!({
-        "schema_version": CALIBRATION_SCHEMA_VERSION,
-        "model_version": CALIBRATION_MODEL_VERSION,
-        "updated_at_event_time_ms": updated_at_event_time_ms,
-        "source_label": source_label,
-        "snapshots": keyed,
-    });
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "cannot create calibration output {}: {error}",
-                parent.display()
-            )
-        })?;
-    }
-    let bytes = serde_json::to_vec_pretty(&store)
-        .map_err(|error| format!("cannot encode calibration output: {error}"))?;
-    let temporary = path.with_extension("tmp");
-    std::fs::write(&temporary, bytes).map_err(|error| {
-        format!(
-            "cannot write calibration output {}: {error}",
-            temporary.display()
-        )
-    })?;
-    std::fs::rename(&temporary, path).map_err(|error| {
-        format!(
-            "cannot install calibration output {}: {error}",
-            path.display()
-        )
-    })?;
-    Ok(())
-}
-
 fn load_calibration_seeds(
     path: &std::path::Path,
     source_label: &str,
@@ -274,24 +455,6 @@ fn load_calibration_seeds(
         .map_err(|error| format!("cannot read calibration store {}: {error}", path.display()))?;
     let root: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|error| format!("invalid calibration store {}: {error}", path.display()))?;
-    let schema_version = root
-        .get("schema_version")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| "calibration store is missing schema_version".to_owned())?;
-    if schema_version != u64::from(CALIBRATION_SCHEMA_VERSION) {
-        return Err(format!(
-            "unsupported calibration schema {schema_version}; expected {CALIBRATION_SCHEMA_VERSION}"
-        ));
-    }
-    let model_version = root
-        .get("model_version")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "calibration store is missing model_version".to_owned())?;
-    if model_version != CALIBRATION_MODEL_VERSION {
-        return Err(format!(
-            "unsupported calibration model {model_version}; expected {CALIBRATION_MODEL_VERSION}"
-        ));
-    }
     let snapshots = root
         .get("snapshots")
         .and_then(serde_json::Value::as_object)
@@ -326,9 +489,7 @@ fn parse_args() -> Result<Args, String> {
     let mut anchors = None;
     let mut records = None;
     let mut calibration_store = None;
-    let mut calibration_output = None;
     let mut calibration_source_label = "F3_m3".to_owned();
-    let mut freeze_calibration = false;
     let mut price_scale = 8;
     let mut quantity_scale = 8;
     let mut entry_threshold_bps = 0;
@@ -349,8 +510,6 @@ fn parse_args() -> Result<Args, String> {
     let mut live_risk_gates = false;
     let mut funding_controller_enabled = true;
     let mut capital_usdt_ticks = None;
-    let mut portfolio_drawdown_soft_limit_bps = 0;
-    let mut portfolio_drawdown_hard_limit_bps = 0;
     let mut require_flat_at_end = false;
     let mut args = env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -365,11 +524,7 @@ fn parse_args() -> Result<Args, String> {
             "--calibration-store" => {
                 calibration_store = Some(PathBuf::from(next(&mut args, &flag)?))
             }
-            "--calibration-output" => {
-                calibration_output = Some(PathBuf::from(next(&mut args, &flag)?))
-            }
             "--calibration-source-label" => calibration_source_label = next(&mut args, &flag)?,
-            "--freeze-calibration" => freeze_calibration = true,
             "--price-scale" => price_scale = parse(&mut args, &flag)?,
             "--quantity-scale" => quantity_scale = parse(&mut args, &flag)?,
             "--entry-threshold-bps" => entry_threshold_bps = parse(&mut args, &flag)?,
@@ -390,17 +545,13 @@ fn parse_args() -> Result<Args, String> {
             "--quote-reprice-min-interval-ms" => {
                 quote_reprice_min_interval_ms = parse(&mut args, &flag)?
             }
-            "--dynamic-capital-refresh-ms" => dynamic_capital_refresh_ms = parse(&mut args, &flag)?,
+            "--dynamic-capital-refresh-ms" => {
+                dynamic_capital_refresh_ms = parse(&mut args, &flag)?
+            }
             "--live-risk-gates" => live_risk_gates = true,
             "--ablate-funding" => funding_controller_enabled = false,
             "--capital-usdt" => {
                 capital_usdt_ticks = Some(parse_usdt_ticks(&next(&mut args, &flag)?)?)
-            }
-            "--portfolio-drawdown-soft-bps" => {
-                portfolio_drawdown_soft_limit_bps = parse(&mut args, &flag)?
-            }
-            "--portfolio-drawdown-hard-bps" => {
-                portfolio_drawdown_hard_limit_bps = parse(&mut args, &flag)?
             }
             "--require-flat-at-end" => require_flat_at_end = true,
             unknown => return Err(format!("unknown option {unknown}; use --help")),
@@ -409,29 +560,12 @@ fn parse_args() -> Result<Args, String> {
     if !funding_controller_enabled && strategy_variant != SimulationPolicyVariant::M8FundingAware {
         return Err("--ablate-funding is valid only with --strategy-variant m8".to_owned());
     }
-    drawdown_limits(
-        portfolio_drawdown_soft_limit_bps,
-        portfolio_drawdown_hard_limit_bps,
-    )
-    .map(|_| ())
-    .ok_or_else(|| "portfolio drawdown requires 0/0 or 0 < soft < hard <= 10000 bps".to_owned())?;
-    if drawdown_limits(
-        portfolio_drawdown_soft_limit_bps,
-        portfolio_drawdown_hard_limit_bps,
-    )
-    .is_some()
-        && capital_usdt_ticks.is_none()
-    {
-        return Err("portfolio drawdown limits require --capital-usdt".to_owned());
-    }
     Ok(Args {
         input: input.ok_or("missing --input")?,
         anchors: anchors.ok_or("missing --anchors")?,
         records,
         calibration_store,
-        calibration_output,
         calibration_source_label,
-        freeze_calibration,
         price_scale,
         quantity_scale,
         entry_threshold_bps,
@@ -452,8 +586,6 @@ fn parse_args() -> Result<Args, String> {
         live_risk_gates,
         funding_controller_enabled,
         capital_usdt_ticks,
-        portfolio_drawdown_soft_limit_bps,
-        portfolio_drawdown_hard_limit_bps,
         require_flat_at_end,
     })
 }
@@ -474,21 +606,13 @@ fn parse_strategy_variant(value: &str) -> Result<SimulationPolicyVariant, String
         "m7" | "m7_evidence_gated" | "evidence_gated" => {
             Ok(SimulationPolicyVariant::M7EvidenceGated)
         }
-        "m8" | "m8_funding_aware" | "funding_aware" => Ok(SimulationPolicyVariant::M8FundingAware),
+        "m8" | "m8_funding_aware" | "funding_aware" => {
+            Ok(SimulationPolicyVariant::M8FundingAware)
+        }
         "m9" | "m9_deadline_causal_dro_mpc" | "deadline_causal_dro_mpc" => {
             Ok(SimulationPolicyVariant::M9DeadlineCausalDroMpc)
         }
         _ => Err("invalid --strategy-variant; expected m0..m9".to_owned()),
-    }
-}
-
-fn drawdown_limits(soft: i64, hard: i64) -> Option<(i64, i64)> {
-    if soft == 0 && hard == 0 {
-        None
-    } else if soft > 0 && hard > soft && hard <= 10_000 {
-        Some((soft, hard))
-    } else {
-        None
     }
 }
 
@@ -533,7 +657,7 @@ where
         .map_err(|error| format!("invalid {flag}: {error:?}"))
 }
 
-fn sha256_file(path: &std::path::Path) -> Result<String, std::io::Error> {
+fn sha256_file(path: &PathBuf) -> Result<String, std::io::Error> {
     let mut file = File::open(path)?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
@@ -543,8 +667,8 @@ fn sha256_file(path: &std::path::Path) -> Result<String, std::io::Error> {
 fn print_usage() {
     eprintln!(
         "usage: anchorbell_backtest --input EVENTS.jsonl --anchors ANCHORS.csv [options]\n\
-         options: --records PATH --strategy-variant m0..m9 --capital-usdt N --portfolio-drawdown-soft-bps N --portfolio-drawdown-hard-bps N\n\
-         --calibration-store PATH --calibration-output PATH --calibration-source-label LABEL --freeze-calibration --ablate-funding\n\
+         options: --records PATH --strategy-variant m0..m9 --capital-usdt N\n\
+         --calibration-store PATH --calibration-source-label LABEL --ablate-funding\n\
          --price-scale N --quantity-scale N --entry-threshold-bps N\n\
          --threshold-scale-ppm N --max-position N --quantity N\n\
          --max-mark-index-gap-bps N --max-anchor-age-ms N --maker-fee-ppm N\n\
@@ -560,96 +684,4 @@ fn fail(message: impl std::fmt::Display) -> ! {
     print_usage();
     process::exit(2);
 }
-
-#[cfg(test)]
-mod calibration_store_regression_tests {
-    use super::*;
-
-    fn temporary_store(name: &str) -> PathBuf {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "anchorbell-{name}-{}-{nonce}.json",
-            std::process::id()
-        ))
-    }
-
-    #[test]
-    fn calibration_store_round_trip_preserves_replayable_state() {
-        let path = temporary_store("calibration-round-trip");
-        let mut state = CalibrationState::new("TESTUSDT");
-        state.observe_market(
-            100,
-            Some(2_000_000_000_000),
-            Some(1_000_000_000_000),
-            Some(3_000_000_000_000),
-        );
-        state.observe_order_placed(101);
-        state.observe_fill(102, 101, 5, 20);
-        state.observe_order_terminal(103, 101);
-        state.observe_markout(104, 750_000_000_000);
-        let snapshots =
-            BTreeMap::from([("TESTUSDT".to_owned(), state.snapshot(2_000_000_000_000))]);
-
-        write_calibration_store(&path, "TRAIN", &snapshots).unwrap();
-        let loaded = load_calibration_seeds(&path, "TRAIN").unwrap();
-        let restored = loaded.get("TESTUSDT").unwrap();
-        assert_eq!(restored.instrument, state.instrument);
-        assert_eq!(restored.first_event_time_ms, state.first_event_time_ms);
-        assert_eq!(restored.last_event_time_ms, state.last_event_time_ms);
-        assert_eq!(restored.orders_placed, state.orders_placed);
-        assert_eq!(restored.fill_events, state.fill_events);
-        assert_eq!(restored.completed_orders, state.completed_orders);
-
-        let root: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(
-            root.get("schema_version")
-                .and_then(serde_json::Value::as_u64),
-            Some(u64::from(CALIBRATION_SCHEMA_VERSION))
-        );
-        assert_eq!(
-            root.get("model_version")
-                .and_then(serde_json::Value::as_str),
-            Some(CALIBRATION_MODEL_VERSION)
-        );
-        assert_eq!(
-            root.get("source_label").and_then(serde_json::Value::as_str),
-            Some("TRAIN")
-        );
-        assert!(root
-            .get("snapshots")
-            .and_then(serde_json::Value::as_object)
-            .is_some_and(|snapshots| snapshots.contains_key("TRAIN::TESTUSDT")));
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn calibration_store_rejects_schema_and_model_drift() {
-        let path = temporary_store("calibration-version-drift");
-        let state = CalibrationState::new("TESTUSDT");
-        let snapshots =
-            BTreeMap::from([("TESTUSDT".to_owned(), state.snapshot(2_000_000_000_000))]);
-        write_calibration_store(&path, "TRAIN", &snapshots).unwrap();
-
-        let mut root: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        root["schema_version"] = serde_json::json!(u64::from(CALIBRATION_SCHEMA_VERSION) + 1);
-        std::fs::write(&path, serde_json::to_vec_pretty(&root).unwrap()).unwrap();
-        assert!(load_calibration_seeds(&path, "TRAIN")
-            .unwrap_err()
-            .contains("unsupported calibration schema"));
-
-        root["schema_version"] = serde_json::json!(CALIBRATION_SCHEMA_VERSION);
-        root["model_version"] = serde_json::json!("future-calibration-model");
-        std::fs::write(&path, serde_json::to_vec_pretty(&root).unwrap()).unwrap();
-        assert!(load_calibration_seeds(&path, "TRAIN")
-            .unwrap_err()
-            .contains("unsupported calibration model"));
-
-        let _ = std::fs::remove_file(path);
-    }
-}
+''')
