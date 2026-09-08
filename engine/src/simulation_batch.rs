@@ -156,6 +156,27 @@ fn now_ms() -> u64 {
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
 }
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
 async fn available_storage_bytes(path: &Path) -> Result<u64, SimulationError> {
     let output = Command::new("df")
         .arg("-Pk")
@@ -749,6 +770,8 @@ pub async fn run(
     } else {
         Duration::from_secs(config.duration_secs)
     };
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
     let mut metrics_interval =
         tokio::time::interval(Duration::from_millis(config.metrics_refresh_ms.max(250)));
     let mut last_received_at_ms = 0_u64;
@@ -759,6 +782,9 @@ pub async fn run(
         loop {
             tokio::select! {
                 biased;
+                _ = &mut shutdown => {
+                    return Ok::<(), SimulationError>(());
+                }
                 _ = metrics_interval.tick() => {
                     let observed_at = now_ms();
                     enforce_storage_safety(&config.output_root, observed_at).await?;
