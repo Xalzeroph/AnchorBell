@@ -21,6 +21,9 @@ use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+use super::portfolio_guard::{
+    PortfolioDrawdownAction, PortfolioDrawdownGuard, PortfolioDrawdownSnapshot,
+};
 pub use super::risk_metrics::RiskMetrics;
 use super::risk_metrics::{calculate_risk_metrics, RISK_SAMPLE_INTERVAL_MS};
 
@@ -1014,6 +1017,8 @@ pub struct MetricsSnapshot {
     pub symbols: Vec<SymbolMetrics>,
     pub history: Vec<PerformancePoint>,
     pub risk_metrics: Option<RiskMetrics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub portfolio_drawdown: Option<PortfolioDrawdownSnapshot>,
     pub calendar_snapshot: String,
     pub maker_fee_source: String,
     pub funding_model: String,
@@ -1040,6 +1045,7 @@ pub struct SimulationEngine {
     live_risk_gates: bool,
     funding_controller_enabled: bool,
     threshold_scale_ppm: i64,
+    portfolio_drawdown_guard: Option<PortfolioDrawdownGuard>,
     position_allocations: BTreeMap<String, PositionAllocation>,
     capital_usdt_ticks: Option<i64>,
     states: BTreeMap<String, SimulationSymbolState>,
@@ -1164,6 +1170,7 @@ impl SimulationEngine {
             live_risk_gates: false,
             funding_controller_enabled: true,
             threshold_scale_ppm: 1_000_000,
+            portfolio_drawdown_guard: None,
             position_allocations,
             capital_usdt_ticks: None,
             states,
@@ -1226,6 +1233,34 @@ impl SimulationEngine {
     pub fn with_threshold_scale_ppm(mut self, scale_ppm: i64) -> Self {
         self.threshold_scale_ppm = scale_ppm.clamp(0, 1_000_000);
         self
+    }
+
+    pub fn with_portfolio_drawdown_limits_bps(
+        mut self,
+        capital: i64,
+        soft: i64,
+        hard: i64,
+    ) -> Result<Self, SimulationError> {
+        if self.capital_usdt_ticks.is_some_and(|v| v != capital) {
+            return Err(SimulationError::InvalidConfig("drawdown capital mismatch"));
+        }
+        self.portfolio_drawdown_guard = PortfolioDrawdownGuard::new(capital, soft, hard)
+            .map_err(SimulationError::InvalidConfig)?;
+        self.capital_usdt_ticks = Some(capital);
+        Ok(self)
+    }
+
+    fn observe_portfolio_drawdown(&mut self) -> PortfolioDrawdownAction {
+        let summary = self.summary();
+        self.portfolio_drawdown_guard
+            .as_mut()
+            .map_or(PortfolioDrawdownAction::Trading, |guard| {
+                guard.observe(summary.unrealized_valuation_complete.then(|| {
+                    summary
+                        .net_pnl_ticks
+                        .saturating_add(summary.unrealized_pnl_ticks)
+                }))
+            })
     }
 
     pub fn with_strategy_variant(mut self, variant: SimulationPolicyVariant) -> Self {
@@ -2093,6 +2128,10 @@ impl SimulationEngine {
             symbols,
             history: Vec::new(),
             risk_metrics: None,
+            portfolio_drawdown: self
+                .portfolio_drawdown_guard
+                .as_ref()
+                .map(PortfolioDrawdownGuard::snapshot),
             calendar_snapshot: "sse-hkex-2026".to_owned(),
             maker_fee_source: "binance_usdm_base_maker_schedule".to_owned(),
             funding_model: "m8_exact_mark_settlement_plus_strategy_funding_controller".to_owned(),
@@ -2630,6 +2669,11 @@ impl SimulationEngine {
             .map(|allocation| allocation.requested_quantity)
             .unwrap_or(self.requested_quantity);
         let strategy_variant = self.strategy_variant;
+        let portfolio_drawdown_action = if strategy_variant.uses_tail_guard() {
+            self.observe_portfolio_drawdown()
+        } else {
+            PortfolioDrawdownAction::Trading
+        };
         self.update_adaptive_threshold_controller(
             symbol,
             timestamp_ms,
@@ -2675,22 +2719,32 @@ impl SimulationEngine {
             let funding_reduce_only = funding_overlay
                 .as_ref()
                 .is_some_and(|overlay| overlay.reduce_only);
-            let entries_allowed = session_allowed && funding_allowed;
+            let portfolio_reduce_only = portfolio_drawdown_action.blocks_new_risk();
+            let entries_allowed = session_allowed && funding_allowed && !portfolio_reduce_only;
             let tail_reduce_only = strategy_variant.uses_tail_guard() && m5_tail_reduce_only(state);
             if !entries_allowed || tail_reduce_only {
-                let should_reduce = position_requires_reduction(
-                    state.position,
-                    session_allowed,
-                    funding_allowed,
-                    funding_reduce_only,
-                    tail_reduce_only,
-                );
+                let should_reduce = (portfolio_reduce_only && state.position != 0)
+                    || position_requires_reduction(
+                        state.position,
+                        session_allowed,
+                        funding_allowed,
+                        funding_reduce_only,
+                        tail_reduce_only,
+                    );
                 if !should_reduce {
                     (
                         None,
                         true,
                         state.working.is_some(),
-                        entry_restriction_reason(state.position, session_allowed, funding_allowed),
+                        if portfolio_reduce_only {
+                            portfolio_drawdown_action.label()
+                        } else {
+                            entry_restriction_reason(
+                                state.position,
+                                session_allowed,
+                                funding_allowed,
+                            )
+                        },
                     )
                 } else {
                     let (desired, exit_reason) = maker_exit_intent_for_state(
