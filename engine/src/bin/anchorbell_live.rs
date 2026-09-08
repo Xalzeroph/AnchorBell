@@ -5,7 +5,10 @@ use std::{
     io::{BufWriter, Write},
     path::{Path, PathBuf},
     process,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -530,7 +533,7 @@ async fn run(args: Args) -> Result<i32, String> {
     let mut truth_sequence = 0_u64;
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(16_384);
-    spawn_market(&args, tx.clone(), &symbols)?;
+    let market_overflow = spawn_market(&args, tx.clone(), &symbols)?;
     spawn_fx(&args, tx.clone())?;
     spawn_user_data(&args, client.clone(), credentials.clone(), tx.clone()).await?;
 
@@ -562,6 +565,13 @@ async fn run(args: Args) -> Result<i32, String> {
         tokio::select! {
             _ = &mut deadline => break,
             _ = health_tick.tick() => {
+                if market_overflow.load(Ordering::Acquire) {
+                    supervisor.on_disconnect();
+                    return Err(
+                        "market event queue overflowed or market producer stopped; risk stopped"
+                            .into(),
+                    );
+                }
                 let now = now_ms();
                 let readiness = control_plane.readiness(now);
                 emit_health_transitions(&mut control_plane, &mut audit_sink).await?;
@@ -693,7 +703,9 @@ async fn run(args: Args) -> Result<i32, String> {
 
                 let now = now_ms();
                 for symbol in &symbols {
-                    let local = state.get(symbol).expect("initialized symbol");
+                    let local = state
+                        .get(symbol)
+                        .ok_or_else(|| format!("initialized state missing for {symbol}"))?;
                     let profile = profile_for(symbol)
                         .ok_or_else(|| format!("no profile for {symbol}"))?;
                     let market_at = local.mark.as_ref().map(|v| v.event_time_ms)
@@ -772,12 +784,17 @@ async fn run(args: Args) -> Result<i32, String> {
                     && supervisor.state() == SupervisorState::Healthy
                 {
                     for symbol in &symbols {
-                        let Some(intent) = make_intent(
-                            symbol,
-                            state.get(symbol).expect("initialized symbol"),
-                            anchors.get(symbol).expect("validated anchor").close_price_ticks,
-                            &args,
-                        ) else { continue };
+                        let local = state
+                            .get(symbol)
+                            .ok_or_else(|| format!("initialized state missing for {symbol}"))?;
+                        let anchor = anchors
+                            .get(symbol)
+                            .ok_or_else(|| format!("validated anchor missing for {symbol}"))?;
+                        let Some(intent) =
+                            make_intent(symbol, local, anchor.close_price_ticks, &args)
+                        else {
+                            continue;
+                        };
                         let (gate_decision, decision_audit) =
                             supervisor.evaluate_with_audit(symbol, intent, now);
                         let decision_payload = serde_json::to_value(&decision_audit)
@@ -836,7 +853,9 @@ async fn run(args: Args) -> Result<i32, String> {
                                     }));
                                 }
                                 if args.send_orders {
-                                    let local = state.get(symbol).expect("initialized symbol");
+                                    let local = state
+                                        .get(symbol)
+                                        .ok_or_else(|| format!("initialized state missing for {symbol}"))?;
                                     if local.position_ticks != 0 {
                                         if let Some(book) = local.book.as_ref() {
                                             let side = if local.position_ticks > 0 {
@@ -1159,7 +1178,7 @@ fn spawn_market(
     args: &Args,
     tx: tokio::sync::mpsc::Sender<Event>,
     symbols: &[String],
-) -> Result<(), String> {
+) -> Result<Arc<AtomicBool>, String> {
     let endpoints = args.environment.endpoints();
     let shards = BinanceMarketConfig::for_symbols(
         endpoints.market_ws_base,
@@ -1178,16 +1197,20 @@ fn spawn_market(
         args.max_subscriptions_per_shard,
     )
     .map_err(|e| format!("{e:?}"))?;
+    let market_overflow = Arc::new(AtomicBool::new(false));
     for shard in shards {
         let producer = tx.clone();
+        let overflow = Arc::clone(&market_overflow);
         tokio::spawn(async move {
             BinanceMarketStream::run_forever(shard, |event| {
-                let _ = producer.try_send(Event::Market(event));
+                if producer.try_send(Event::Market(event)).is_err() {
+                    overflow.store(true, Ordering::Release);
+                }
             })
             .await;
         });
     }
-    Ok(())
+    Ok(market_overflow)
 }
 
 fn spawn_fx(args: &Args, tx: tokio::sync::mpsc::Sender<Event>) -> Result<(), String> {

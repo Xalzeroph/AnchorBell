@@ -426,12 +426,15 @@ pub async fn run(
             "simulation policy identity must be non-empty",
         ));
     }
+    config.output_root = unique_output_root(&config.output_root).await?;
+    tokio::fs::create_dir_all(&config.output_root).await?;
+    // Calibration is reusable within one batch run, but must never leak across
+    // run-### directories. Cross-run warm starts would silently contaminate
+    // M9 evidence after a restart or policy change.
     let calibration_store_path = config.output_root.join("calibration/latest.json");
     if let Some(parent) = calibration_store_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    config.output_root = unique_output_root(&config.output_root).await?;
-    tokio::fs::create_dir_all(&config.output_root).await?;
     let manifest_created_at_ms = now_ms();
     let parameter_material = serde_json::json!({
         "policy_id": config.policy_id,
@@ -505,6 +508,7 @@ pub async fn run(
         "dynamic_capital_refresh_ms": config.dynamic_capital_refresh_ms,
         "depth_snapshot_limit": config.depth_snapshot_limit,
         "duration_secs": config.duration_secs,
+        "calibration_scope": "run_local",
         "evidence": config.evidence.clone(),
     });
     write_json_atomic(&config.output_root.join("run-manifest.json"), &manifest).await?;
