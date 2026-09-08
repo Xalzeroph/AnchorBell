@@ -4764,7 +4764,7 @@ pub async fn run_simulation(
     let quantity_scale = config.quantity_scale;
     let mut fx_latest_by_currency = BTreeMap::<String, FxUpdate>::new();
     let mut fx_last_update_at_ms = 0_u64;
-    let mut performance_history = VecDeque::with_capacity(900);
+    let mut performance_history = VecDeque::with_capacity(PERFORMANCE_HISTORY_CAPACITY);
     let run_result = tokio::time::timeout(run_duration, async {
         loop {
             tokio::select! {
@@ -4815,7 +4815,7 @@ pub async fn run_simulation(
                     if let Some(path) = metrics_output_path.as_deref() {
                         let observed_at_ms = now_ms();
                         performance_history.push_back(engine.performance_point(observed_at_ms));
-                        while performance_history.len() > 900 {
+                        while performance_history.len() > PERFORMANCE_HISTORY_CAPACITY {
                             performance_history.pop_front();
                         }
                         write_json_atomic(
@@ -4908,7 +4908,7 @@ pub async fn run_simulation(
     if let Some(path) = metrics_output_path.as_deref() {
         let observed_at_ms = now_ms();
         performance_history.push_back(engine.performance_point(observed_at_ms));
-        while performance_history.len() > 900 {
+        while performance_history.len() > PERFORMANCE_HISTORY_CAPACITY {
             performance_history.pop_front();
         }
         write_json_atomic(
@@ -4969,6 +4969,7 @@ pub async fn run_simulation(
     })
 }
 
+const PERFORMANCE_HISTORY_CAPACITY: usize = 901;
 const RISK_SAMPLE_INTERVAL_MS: u64 = 30_000;
 
 fn calculate_risk_metrics(points: &[(u64, i64)], capital_ticks: i64) -> RiskMetrics {
@@ -5260,6 +5261,17 @@ mod tests {
 
     use super::*;
     use crate::market::binance::parse_market_message;
+
+    #[test]
+    fn retained_history_reaches_the_risk_sample_threshold() {
+        let points = (0..PERFORMANCE_HISTORY_CAPACITY)
+            .map(|index| (index as u64 * 1_000, (index * index) as i64))
+            .collect::<Vec<_>>();
+        let metrics = calculate_risk_metrics(&points, 100_000);
+        assert_eq!(metrics.sample_count, 30);
+        assert_eq!(metrics.status, "ok");
+        assert!(metrics.sharpe_ratio.is_some());
+    }
 
     fn anchors() -> BTreeMap<String, AnchorSnapshot> {
         [(

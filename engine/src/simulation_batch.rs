@@ -43,11 +43,12 @@ use crate::{
     },
 };
 
-/// M9 uses a declared calibration population instead of whichever ledger has
-/// the largest sample count. This keeps the warm-start source auditable and
 const MIN_SIMULATION_FREE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const STORAGE_SAFETY_SCHEMA_VERSION: u16 = 1;
-/// avoids mixing policy-specific order selection into a single unlabeled model.
+const METRICS_HISTORY_CAPACITY: usize = 901;
+/// M9 uses a declared calibration population instead of whichever ledger has
+/// the largest sample count. This keeps the source auditable and avoids mixing
+/// policy-specific order selection into a single unlabeled model.
 const M9_CALIBRATION_SOURCE_LABEL: &str = "F3_m3";
 
 #[derive(Debug, Clone)]
@@ -269,6 +270,29 @@ async fn persist_calibration_store(path: &Path, ledgers: &[Ledger]) -> Result<()
     };
     write_json_atomic(path, &store).await?;
     Ok(())
+}
+
+fn synchronize_m9_calibration(ledgers: &mut [Ledger]) {
+    let Some(seeds) = ledgers
+        .iter()
+        .find(|ledger| ledger.spec.label == M9_CALIBRATION_SOURCE_LABEL)
+        .map(|ledger| {
+            ledger
+                .engine
+                .calibration_snapshots(0)
+                .into_iter()
+                .map(|(symbol, snapshot)| (symbol, snapshot.state))
+                .collect::<BTreeMap<_, _>>()
+        })
+    else {
+        return;
+    };
+    for ledger in ledgers
+        .iter_mut()
+        .filter(|ledger| ledger.spec.variant == SimulationPolicyVariant::M9DeadlineCausalDroMpc)
+    {
+        ledger.engine.restore_calibration_states(&seeds);
+    }
 }
 
 #[allow(clippy::type_complexity)]
@@ -520,7 +544,7 @@ pub async fn run(
             record_written,
             record_dropped,
             metrics_path: dir.join("metrics.json"),
-            history: VecDeque::with_capacity(900),
+            history: VecDeque::with_capacity(METRICS_HISTORY_CAPACITY),
             settlement_status: "not_started".to_owned(),
             flatten_requested: false,
         });
@@ -744,9 +768,14 @@ pub async fn run(
                         }
                     }
                     write_json_atomic(&evidence_summary_path, &evidence.summary()).await?;
+                    // Copy only state learned before the next market event. M9 therefore
+                    // consumes the declared F3 population without same-event lookahead.
+                    synchronize_m9_calibration(&mut ledgers);
                     for ledger in &mut ledgers {
                         ledger.history.push_back(ledger.engine.performance_point(observed_at));
-                        while ledger.history.len() > 900 { ledger.history.pop_front(); }
+                        while ledger.history.len() > METRICS_HISTORY_CAPACITY {
+                            ledger.history.pop_front();
+                        }
                         let snapshot = ledger.engine.metrics_snapshot_with_history(observed_at, last_received_at_ms, ledger.history.make_contiguous());
                         write_json_atomic(&ledger.metrics_path, &snapshot).await?;
                     }
@@ -958,7 +987,7 @@ pub async fn run(
         ledger
             .history
             .push_back(ledger.engine.performance_point(observed_at));
-        while ledger.history.len() > 900 {
+        while ledger.history.len() > METRICS_HISTORY_CAPACITY {
             ledger.history.pop_front();
         }
         let snapshot = ledger.engine.metrics_snapshot_with_history(
