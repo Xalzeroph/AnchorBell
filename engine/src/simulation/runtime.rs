@@ -125,7 +125,11 @@ impl SimulationPolicyVariant {
     }
 
     fn uses_evidence_gate(self) -> bool {
-        matches!(self, Self::M7EvidenceGated | Self::M8FundingAware)
+        self >= Self::M7EvidenceGated
+    }
+
+    fn uses_funding_controller(self) -> bool {
+        self >= Self::M8FundingAware
     }
 }
 
@@ -1207,8 +1211,7 @@ impl SimulationEngine {
     }
 
     fn funding_controller_active(&self) -> bool {
-        self.strategy_variant == SimulationPolicyVariant::M8FundingAware
-            && self.funding_controller_enabled
+        self.strategy_variant.uses_funding_controller() && self.funding_controller_enabled
     }
 
     fn funding_entry_allowed_for_strategy(
@@ -1216,9 +1219,7 @@ impl SimulationEngine {
         state: &SimulationSymbolState,
         now_ms: u64,
     ) -> bool {
-        if self.strategy_variant == SimulationPolicyVariant::M8FundingAware
-            && !self.funding_controller_enabled
-        {
+        if self.strategy_variant.uses_funding_controller() && !self.funding_controller_enabled {
             funding_entry_allowed(state, now_ms)
         } else {
             funding_entry_allowed_variant(state, now_ms, self.strategy_variant, self.fee_ppm)
@@ -2016,8 +2017,7 @@ impl SimulationEngine {
                     funding_flatten_deadline_ms: (!funding_controller_active)
                         .then(|| funding_flatten_deadline(state.next_funding_time_ms))
                         .flatten(),
-                    funding_action: if self.strategy_variant
-                        == SimulationPolicyVariant::M8FundingAware
+                    funding_action: if self.strategy_variant.uses_funding_controller()
                         && !self.funding_controller_enabled
                     {
                         "Ablated".to_owned()
@@ -2707,15 +2707,32 @@ impl SimulationEngine {
                     (desired, true, state.working.is_some(), exit_reason)
                 }
             } else if strategy_variant == SimulationPolicyVariant::M9DeadlineCausalDroMpc {
-                let (intent, reduce_only, reason) = m9_intent_for_state(
+                let inherited_required_pico_bps = dynamic_threshold_for(
                     state,
-                    timestamp_ms,
-                    max_position,
-                    requested_quantity,
-                    self.max_mark_index_gap_bps,
+                    strategy_variant,
+                    self.strategy.entry_threshold_bps,
                     self.fee_ppm,
-                );
-                (intent, reduce_only, state.working.is_some(), reason)
+                    requested_quantity,
+                    max_position,
+                    timestamp_ms,
+                )
+                .map(|value| scale_threshold_non_fee(value, self.threshold_scale_ppm))
+                .and_then(|value| value.required_pico_bps())
+                .map(|value| value.saturating_sub(state.adaptive_relief_pico_bps))
+                .unwrap_or(0);
+                if state.position == 0 && !m7_entry_admissible(state, inherited_required_pico_bps) {
+                    (None, false, state.working.is_some(), "m7_evidence_gate")
+                } else {
+                    let (intent, reduce_only, reason) = m9_intent_for_state(
+                        state,
+                        timestamp_ms,
+                        max_position,
+                        requested_quantity,
+                        self.max_mark_index_gap_bps,
+                        self.fee_ppm,
+                    );
+                    (intent, reduce_only, state.working.is_some(), reason)
+                }
             } else {
                 let mark_index_ok = match (state.mark_price_ticks, state.index_price_ticks) {
                     (Some(mark), Some(index)) => {
@@ -3734,7 +3751,7 @@ fn funding_entry_allowed_variant(
     variant: SimulationPolicyVariant,
     fee_ppm: i64,
 ) -> bool {
-    if variant != SimulationPolicyVariant::M8FundingAware {
+    if !variant.uses_funding_controller() {
         return funding_entry_allowed(state, now_ms);
     }
     m8_funding_decision(
@@ -5429,7 +5446,7 @@ pub fn replay_jsonl_with_config(
             .capital_usdt_ticks
             .is_some_and(|capital| capital <= 0)
         || (!config.funding_controller_enabled
-            && config.strategy_variant != SimulationPolicyVariant::M8FundingAware)
+            && !config.strategy_variant.uses_funding_controller())
     {
         return Err(SimulationError::InvalidConfig(
             "invalid replay policy configuration",
@@ -5974,6 +5991,16 @@ mod tests {
             SimulationEngine::fee_efficiency_penalty_bps(-1, 200, 100),
             0
         );
+    }
+
+    #[test]
+    fn m9_inherits_m7_and_m8_capabilities() {
+        let variant = SimulationPolicyVariant::M9DeadlineCausalDroMpc;
+        assert!(variant.uses_evidence_gate());
+        assert!(variant.uses_funding_controller());
+        assert!(engine()
+            .with_strategy_variant(variant)
+            .funding_controller_active());
     }
 
     #[test]
