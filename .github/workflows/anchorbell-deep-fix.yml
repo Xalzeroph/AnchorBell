@@ -28,6 +28,9 @@ jobs:
       - name: Apply authoritative strategy-profile migration
         run: python3 .github/scripts/anchorbell_strategy_profile_fix.py
 
+      - name: Repair Rust 1.98 profile CLI inference
+        run: python3 .github/scripts/anchorbell_strategy_profile_compile_fix.py
+
       - name: Format
         run: cargo fmt --all
 
