@@ -76,6 +76,16 @@ jobs:
             python3 .github/scripts/anchorbell_drawdown_metrics_semantics_fix.py
           fi
 
+      - name: Make OOS risk sampling deterministic
+        shell: bash
+        run: |
+          if grep -q 'Risk statistics are sampled on exchange event time' engine/src/simulation_batch.rs \
+            && ! grep -A3 'let point = ledger.engine.performance_point(observed_at);' engine/src/simulation_batch.rs | grep -q 'append_risk_history_sample'; then
+            echo "exchange-time OOS risk sampling already present"
+          else
+            python3 .github/scripts/anchorbell_deterministic_risk_sampling_fix.py
+          fi
+
       - name: Format
         run: cargo fmt --all
 
@@ -104,7 +114,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "fix: align portfolio drawdown observability"
+          git commit -m "fix: make OOS risk statistics deterministic"
           git fetch origin diag-risk-20260908
           git rebase origin/diag-risk-20260908
           git push origin HEAD:diag-risk-20260908
