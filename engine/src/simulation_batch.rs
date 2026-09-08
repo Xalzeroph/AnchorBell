@@ -473,6 +473,55 @@ fn candidate_identity(spec: &SimulationBatchSpec) -> String {
     format!("{}|{}", spec.variant.label(), ablations.join(","))
 }
 
+fn candidate_behavior_digest(
+    config: &SimulationBatchConfig,
+    spec: &SimulationBatchSpec,
+) -> Result<String, SimulationError> {
+    let mut symbols = config.symbols.clone();
+    symbols.sort();
+    symbols.dedup();
+    let source_semantics = config
+        .specs
+        .iter()
+        .find(|candidate| candidate.label == config.m9_calibration_source_label)
+        .map(candidate_identity);
+    let mut ablations = spec.ablations.clone();
+    ablations.sort();
+    ablations.dedup();
+    let material = serde_json::json!({
+        "strategy_variant": spec.variant.label(),
+        "ablations": ablations,
+        "symbols": symbols,
+        "m9_calibration_source_semantics": if spec.variant == SimulationPolicyVariant::M9DeadlineCausalDroMpc { source_semantics } else { None },
+        "entry_threshold_bps": config.entry_threshold_bps,
+        "threshold_scale_ppm": config.threshold_scale_ppm,
+        "max_position": config.max_position,
+        "requested_quantity": config.requested_quantity,
+        "max_mark_index_gap_bps": config.max_mark_index_gap_bps,
+        "max_anchor_age_ms": config.max_anchor_age_ms,
+        "fee_ppm": config.fee_ppm,
+        "quantity_scale": config.quantity_scale,
+        "price_scale": config.price_scale,
+        "position_allocations": config.position_allocations,
+        "portfolio_drawdown_soft_limit_bps": config.portfolio_drawdown_soft_limit_bps,
+        "portfolio_drawdown_hard_limit_bps": config.portfolio_drawdown_hard_limit_bps,
+        "queue_ahead": config.queue_ahead,
+        "trade_through": config.trade_through,
+        "market_to_decision_ms": config.market_to_decision_ms,
+        "decision_to_exchange_ms": config.decision_to_exchange_ms,
+        "cancel_to_exchange_ms": config.cancel_to_exchange_ms,
+        "quote_reprice_min_interval_ms": config.quote_reprice_min_interval_ms,
+        "dynamic_capital_refresh_ms": config.dynamic_capital_refresh_ms,
+        "depth_snapshot_limit": config.depth_snapshot_limit,
+        "index_anchor_refresh_ms": config.index_anchor_refresh_ms,
+        "fx_refresh_ms": config.fx_refresh_ms,
+        "fx_max_age_ms": config.fx_max_age_ms,
+    });
+    let encoded = serde_json::to_vec(&material)
+        .map_err(|_| SimulationError::InvalidConfig("cannot encode candidate behavior digest"))?;
+    Ok(format!("sha256:{}", hex::encode(Sha256::digest(encoded))))
+}
+
 fn validate(config: &SimulationBatchConfig) -> Result<(), SimulationError> {
     if config.symbols.is_empty()
         || config.specs.is_empty()
@@ -565,6 +614,18 @@ pub async fn run(
     mut config: SimulationBatchConfig,
 ) -> Result<SimulationBatchResult, SimulationError> {
     validate(&config)?;
+    // Candidate identity must describe the unstressed policy so ordinary OOS
+    // and its synthetic stress fold remain the same candidate.
+    let candidate_parameter_digests = config
+        .specs
+        .iter()
+        .map(|spec| {
+            Ok((
+                candidate_identity(spec),
+                candidate_behavior_digest(&config, spec)?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, SimulationError>>()?;
     apply_validation_stress_profile(&mut config)?;
     if config.policy_id.trim().is_empty() {
         return Err(SimulationError::InvalidConfig(
@@ -1330,7 +1391,14 @@ pub async fn run(
             let mut ablations = ledger.ablations.clone();
             ablations.sort();
             ablations.dedup();
-            let candidate_id = format!("{}|{}", ledger.strategy_variant, ablations.join(","));
+            let semantics = format!("{}|{}", ledger.strategy_variant, ablations.join(","));
+            let parameter_digest = candidate_parameter_digests
+                .get(&semantics)
+                .ok_or(SimulationError::InvalidConfig(
+                    "candidate behavior digest missing",
+                ))?
+                .clone();
+            let candidate_id = format!("{semantics}|{parameter_digest}");
             let fee_drag_bps =
                 (ledger.summary.fees_ticks.max(0) as f64) * 10_000.0 / capital_ticks as f64;
             candidates.insert(
@@ -1341,6 +1409,7 @@ pub async fn run(
                         .as_ref()
                         .expect("validation digest exists when fold id is configured")
                         .clone(),
+                    parameter_digest,
                     stress: is_stress,
                     stress_profile: stress_profile.clone(),
                     net_return_bps: risk.total_return_pct * 100.0,
@@ -1353,7 +1422,7 @@ pub async fn run(
             );
         }
         let bundle = OosFoldBundle {
-            methodology_id: "anchorbell-oos-fold-bundle-v2".to_owned(),
+            methodology_id: "anchorbell-oos-fold-bundle-v3".to_owned(),
             fold_id: fold_id.to_owned(),
             stress: is_stress,
             stress_profile,

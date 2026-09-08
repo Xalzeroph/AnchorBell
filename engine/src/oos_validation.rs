@@ -13,6 +13,8 @@ pub struct OosFoldMetrics {
     pub fold_id: String,
     /// SHA-256 of the exact shared market-event ledger used by this fold.
     pub data_digest: String,
+    /// SHA-256 of candidate behavior parameters before any stress transformation.
+    pub parameter_digest: String,
     pub stress: bool,
     /// None for ordinary OOS folds; recognized explicit scenario id for stress folds.
     pub stress_profile: Option<String>,
@@ -43,6 +45,7 @@ impl OosFoldMetrics {
     fn valid(&self) -> bool {
         !self.fold_id.trim().is_empty()
             && valid_sha256_digest(&self.data_digest)
+            && valid_sha256_digest(&self.parameter_digest)
             && valid_stress_profile(self.stress, self.stress_profile.as_deref())
             && self.net_return_bps.is_finite()
             && self.max_drawdown_pct.is_finite()
@@ -65,7 +68,7 @@ pub struct OosFoldBundle {
 
 impl OosFoldBundle {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.methodology_id != "anchorbell-oos-fold-bundle-v2"
+        if self.methodology_id != "anchorbell-oos-fold-bundle-v3"
             || self.fold_id.trim().is_empty()
             || self.candidates.is_empty()
             || !valid_stress_profile(self.stress, self.stress_profile.as_deref())
@@ -407,6 +410,7 @@ mod tests {
         OosFoldMetrics {
             fold_id: id.to_owned(),
             data_digest: format!("sha256:{digest_seed:064x}"),
+            parameter_digest: format!("sha256:{:064x}", 7_u64),
             stress,
             stress_profile: stress.then(|| EXECUTION_ADVERSE_STRESS_PROFILE_V1.to_owned()),
             net_return_bps: ret,
@@ -423,7 +427,7 @@ mod tests {
         let mut first_candidates = BTreeMap::new();
         first_candidates.insert("m7|".to_owned(), fold("o1", false, 5.0, 1.0, 1.0));
         let first = OosFoldBundle {
-            methodology_id: "anchorbell-oos-fold-bundle-v2".to_owned(),
+            methodology_id: "anchorbell-oos-fold-bundle-v3".to_owned(),
             fold_id: "o1".to_owned(),
             stress: false,
             stress_profile: None,
@@ -432,7 +436,7 @@ mod tests {
         let mut second_candidates = BTreeMap::new();
         second_candidates.insert("m7|".to_owned(), fold("s1", true, -2.0, 0.2, 2.0));
         let second = OosFoldBundle {
-            methodology_id: "anchorbell-oos-fold-bundle-v2".to_owned(),
+            methodology_id: "anchorbell-oos-fold-bundle-v3".to_owned(),
             fold_id: "s1".to_owned(),
             stress: true,
             stress_profile: Some(EXECUTION_ADVERSE_STRESS_PROFILE_V1.to_owned()),
@@ -444,6 +448,14 @@ mod tests {
             merge_fold_bundles(&[first.clone(), first]).unwrap_err(),
             "duplicate_fold_id"
         );
+    }
+
+    #[test]
+    fn candidate_parameter_digest_is_required_and_distinguishes_policy_identity() {
+        let mut value = fold("o1", false, 1.0, 1.0, 1.0);
+        assert!(value.valid());
+        value.parameter_digest = "sha256:bad".to_owned();
+        assert!(!value.valid());
     }
 
     #[test]
