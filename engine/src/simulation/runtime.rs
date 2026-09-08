@@ -5212,7 +5212,37 @@ fn event_symbol(event: &BinanceMarketEvent) -> &str {
     }
 }
 
-// The explicit arguments keep replay assumptions visible and deterministic.
+// Legacy wrappers preserve the stable replay API. New research and OOS
+// validation should use ReplayConfig so strategy and execution assumptions are
+// carried by one auditable object.
+#[derive(Debug, Clone)]
+pub struct ReplayConfig {
+    pub price_scale: u32,
+    pub quantity_scale: u32,
+    pub entry_threshold_bps: i64,
+    pub max_position: i64,
+    pub requested_quantity: i64,
+    pub max_mark_index_gap_bps: i64,
+    pub max_anchor_age_ms: u64,
+    pub fee_ppm: i64,
+    pub realism: crate::backtest::realism::RealisticFillModel,
+    pub strategy_variant: SimulationPolicyVariant,
+    pub threshold_scale_ppm: i64,
+    pub quote_reprice_min_interval_ms: u64,
+    pub dynamic_capital_refresh_ms: u64,
+    pub live_risk_gates: bool,
+    pub funding_controller_enabled: bool,
+    pub capital_usdt_ticks: Option<i64>,
+    pub calibration_seeds: BTreeMap<String, CalibrationState>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplayEvaluation {
+    pub summary: SimulationSummary,
+    pub risk_metrics: Option<RiskMetrics>,
+    pub risk_samples: usize,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn replay_jsonl(
     input_path: &Path,
@@ -5258,19 +5288,83 @@ pub fn replay_jsonl_with_realism(
     fee_ppm: i64,
     realism: crate::backtest::realism::RealisticFillModel,
 ) -> Result<SimulationSummary, SimulationError> {
+    replay_jsonl_with_config(
+        input_path,
+        output_path,
+        anchors,
+        ReplayConfig {
+            price_scale,
+            quantity_scale,
+            entry_threshold_bps,
+            max_position,
+            requested_quantity,
+            max_mark_index_gap_bps,
+            max_anchor_age_ms,
+            fee_ppm,
+            realism,
+            strategy_variant: SimulationPolicyVariant::M0Fixed,
+            threshold_scale_ppm: 1_000_000,
+            quote_reprice_min_interval_ms: 0,
+            dynamic_capital_refresh_ms: 60_000,
+            live_risk_gates: false,
+            funding_controller_enabled: true,
+            capital_usdt_ticks: None,
+            calibration_seeds: BTreeMap::new(),
+        },
+    )
+    .map(|evaluation| evaluation.summary)
+}
+
+pub fn replay_jsonl_with_config(
+    input_path: &Path,
+    output_path: Option<&Path>,
+    anchors: BTreeMap<String, AnchorSnapshot>,
+    config: ReplayConfig,
+) -> Result<ReplayEvaluation, SimulationError> {
+    if config.threshold_scale_ppm <= 0
+        || config.threshold_scale_ppm > 1_000_000
+        || config.dynamic_capital_refresh_ms == 0
+        || config
+            .capital_usdt_ticks
+            .is_some_and(|capital| capital <= 0)
+        || (!config.funding_controller_enabled
+            && config.strategy_variant != SimulationPolicyVariant::M8FundingAware)
+    {
+        return Err(SimulationError::InvalidConfig(
+            "invalid replay policy configuration",
+        ));
+    }
+    let allocations = config
+        .capital_usdt_ticks
+        .map(|capital| {
+            allocate_positions(&anchors, capital, &BTreeMap::new(), config.quantity_scale)
+        })
+        .transpose()?;
     let mut engine = SimulationEngine::new(
         anchors,
-        entry_threshold_bps,
-        max_position,
-        requested_quantity,
-        max_mark_index_gap_bps,
-        max_anchor_age_ms,
-        fee_ppm,
-        quantity_scale,
+        config.entry_threshold_bps,
+        config.max_position,
+        config.requested_quantity,
+        config.max_mark_index_gap_bps,
+        config.max_anchor_age_ms,
+        config.fee_ppm,
+        config.quantity_scale,
     )?
-    .with_price_scale(price_scale)
-    .with_strategy_variant(SimulationPolicyVariant::M0Fixed)
-    .with_realism(realism);
+    .with_price_scale(config.price_scale)
+    .with_strategy_variant(config.strategy_variant)
+    .with_funding_controller_enabled(config.funding_controller_enabled)
+    .with_realism(config.realism)
+    .with_threshold_scale_ppm(config.threshold_scale_ppm)
+    .with_quote_reprice_min_interval_ms(config.quote_reprice_min_interval_ms)
+    .with_dynamic_capital_refresh_ms(config.dynamic_capital_refresh_ms);
+    if config.live_risk_gates {
+        engine = engine.with_live_risk_gates();
+    }
+    engine.restore_calibration_states(&config.calibration_seeds);
+    if let Some(allocations) = allocations {
+        engine = engine.with_position_allocations(allocations)?;
+    }
+
     let reader = BufReader::new(File::open(input_path)?);
     if let Some(parent) = output_path
         .and_then(Path::parent)
@@ -5283,6 +5377,9 @@ pub fn replay_jsonl_with_realism(
         .transpose()?;
     let mut previous_ms = None;
     let mut event_sequence = 0_u64;
+    let mut last_risk_sample_ms = None;
+    let mut risk_points = Vec::<(u64, i64)>::new();
+
     for (index, line) in reader.lines().enumerate() {
         let line_number = index + 1;
         let line = line?;
@@ -5311,8 +5408,8 @@ pub fn replay_jsonl_with_realism(
             });
         let event = crate::market::binance::parse_market_message(
             payload.as_bytes(),
-            price_scale,
-            quantity_scale,
+            config.price_scale,
+            config.quantity_scale,
         )
         .map_err(|error| SimulationError::ReplayParse {
             line: line_number,
@@ -5322,12 +5419,7 @@ pub fn replay_jsonl_with_realism(
         if !engine.states.contains_key(&symbol) {
             return Err(SimulationError::ReplaySymbolNotConfigured(symbol));
         }
-        let event_timestamp_ms = match &event {
-            BinanceMarketEvent::BookTicker(value) => value.event_time_ms,
-            BinanceMarketEvent::MarkPrice(value) => value.event_time_ms,
-            BinanceMarketEvent::AggTrade(value) => value.event_time_ms,
-            BinanceMarketEvent::DepthUpdate(value) => value.event_time_ms,
-        };
+        let event_timestamp_ms = event_time_ms(&event);
         let timestamp_ms = received_at_ms.unwrap_or(event_timestamp_ms);
         if previous_ms.is_some_and(|previous| timestamp_ms < previous) {
             return Err(SimulationError::ReplayOutOfOrder {
@@ -5355,9 +5447,16 @@ pub fn replay_jsonl_with_realism(
                 output.write_all(b"\n")?;
             }
         }
+        if config.capital_usdt_ticks.is_some()
+            && last_risk_sample_ms
+                .is_none_or(|last| timestamp_ms.saturating_sub(last) >= RISK_SAMPLE_INTERVAL_MS)
+        {
+            let point = engine.performance_point(timestamp_ms);
+            risk_points.push((timestamp_ms, point.net_pnl_ticks));
+            last_risk_sample_ms = Some(timestamp_ms);
+        }
     }
-    // A replay window cannot assume an order remains live after its last event.
-    // Cancel working quotes at EOF, but never synthesize a position flatten fill.
+
     let final_timestamp_ms = previous_ms.unwrap_or(0);
     for record in engine.cancel_all(final_timestamp_ms, "replay window ended") {
         if let Some(output) = output.as_mut() {
@@ -5368,7 +5467,21 @@ pub fn replay_jsonl_with_realism(
     if let Some(output) = output.as_mut() {
         output.flush()?;
     }
-    Ok(engine.summary())
+    let summary = engine.summary();
+    if config.capital_usdt_ticks.is_some() {
+        match risk_points.last_mut() {
+            Some(last) if last.0 == final_timestamp_ms => last.1 = summary.net_pnl_ticks,
+            _ => risk_points.push((final_timestamp_ms, summary.net_pnl_ticks)),
+        }
+    }
+    let risk_metrics = config
+        .capital_usdt_ticks
+        .map(|capital| calculate_risk_metrics(&risk_points, capital));
+    Ok(ReplayEvaluation {
+        summary,
+        risk_metrics,
+        risk_samples: risk_points.len(),
+    })
 }
 
 fn now_ms() -> u64 {
