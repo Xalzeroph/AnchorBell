@@ -25,8 +25,8 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Apply profile lineage and M9 source repair
-        run: python3 .github/scripts/anchorbell_profile_lineage_fix.py
+      - name: Apply stateful maker queue repair
+        run: python3 .github/scripts/anchorbell_stateful_queue_fix.py
 
       - name: Format
         run: cargo fmt --all
@@ -55,7 +55,6 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add engine/src/strategy/config.rs \
-                  engine/src/simulation_batch.rs
-          git commit -m "fix: bind experiment matrix into simulation lineage"
+          git add engine/src/simulation/runtime.rs
+          git commit -m "fix: consume observed maker queue before fills"
           git push origin HEAD:diag-risk-20260908
