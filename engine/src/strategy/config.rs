@@ -206,6 +206,10 @@ mod tests {
                 label: "M1".into(),
                 strategy: "m1".into(),
                 ablations: vec![],
+                role: crate::simulation::experiment_plan::ExperimentRole::Incremental,
+                parent_experiment_id: None,
+                execution_overlay: "maker_only".into(),
+                evidence_policy: "oos_required".into(),
             }],
         };
         assert!(profile.validate().is_err());

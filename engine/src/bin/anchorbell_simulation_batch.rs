@@ -177,10 +177,15 @@ fn main() {
             .runtime_specs_with_ablations()
             .unwrap_or_else(|error| fail(format!("invalid experiment plan: {error}")))
             .into_iter()
-            .map(|(label, variant, ablations)| SimulationBatchSpec {
-                label,
-                variant,
-                ablations,
+            .map(|spec| SimulationBatchSpec {
+                label: spec.label,
+                strategy_key: spec.strategy,
+                variant: spec.variant,
+                ablations: spec.ablations,
+                role: spec.role,
+                parent_experiment_id: spec.parent_experiment_id,
+                execution_overlay: spec.execution_overlay,
+                evidence_policy: spec.evidence_policy,
             })
             .collect();
         registry
@@ -194,6 +199,7 @@ fn main() {
         let config = SimulationBatchConfig {
             policy_id,
             experiment_plan_id: experiment_plan.plan_id.clone(),
+            experiment_plan_digest: experiment_plan.digest(),
             universe_id: profile.universe_id.clone(),
             environment,
             symbols,

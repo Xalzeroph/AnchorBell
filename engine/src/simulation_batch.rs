@@ -8,6 +8,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use crate::simulation::experiment_plan::ExperimentRole;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{process::Command, sync::mpsc};
@@ -45,6 +46,7 @@ use crate::{
 const MIN_SIMULATION_FREE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const STORAGE_SAFETY_SCHEMA_VERSION: u16 = 1;
 const RUN_STATUS_SCHEMA_VERSION: u16 = 1;
+const EXPERIMENT_INDEX_SCHEMA_VERSION: u16 = 1;
 const DISPLAY_HISTORY_CAPACITY: usize = 900;
 const RISK_HISTORY_CAPACITY: usize = 7_201;
 const MARKET_EVENT_CHANNEL_CAPACITY: usize = 65_536;
@@ -52,8 +54,13 @@ const MARKET_EVENT_CHANNEL_CAPACITY: usize = 65_536;
 #[derive(Debug, Clone)]
 pub struct SimulationBatchSpec {
     pub label: String,
+    pub strategy_key: String,
     pub variant: SimulationPolicyVariant,
     pub ablations: Vec<String>,
+    pub role: ExperimentRole,
+    pub parent_experiment_id: Option<String>,
+    pub execution_overlay: String,
+    pub evidence_policy: String,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +68,7 @@ pub struct SimulationBatchConfig {
     /// Human-readable run generation. Each run writes it into its manifest.
     pub policy_id: String,
     pub experiment_plan_id: String,
+    pub experiment_plan_digest: String,
     pub universe_id: String,
     pub environment: BinanceEnvironment,
     pub symbols: Vec<String>,
@@ -105,7 +113,12 @@ pub struct SimulationBatchConfig {
 #[derive(Debug, Serialize)]
 pub struct SimulationLedgerResult {
     pub label: String,
+    pub strategy_key: String,
     pub strategy_variant: String,
+    pub role: ExperimentRole,
+    pub parent_experiment_id: Option<String>,
+    pub execution_overlay: String,
+    pub evidence_policy: String,
     pub ablations: Vec<String>,
     pub evidence_record_id: String,
     pub summary: SimulationSummary,
@@ -117,6 +130,9 @@ pub struct SimulationLedgerResult {
 
 #[derive(Debug, Serialize)]
 pub struct SimulationBatchResult {
+    pub run_id: String,
+    pub experiment_plan_id: String,
+    pub experiment_plan_digest: String,
     pub shared_market_records_written: u64,
     pub shared_market_records_dropped: u64,
     pub shared_fx_records_written: u64,
@@ -420,6 +436,7 @@ fn validate(config: &SimulationBatchConfig) -> Result<(), SimulationError> {
     if config.symbols.is_empty()
         || config.specs.is_empty()
         || config.experiment_plan_id.trim().is_empty()
+        || config.experiment_plan_digest.trim().is_empty()
         || config.universe_id.trim().is_empty()
         || config.max_subscriptions_per_shard == 0
     {
@@ -443,6 +460,56 @@ fn validate(config: &SimulationBatchConfig) -> Result<(), SimulationError> {
     }
     Ok(())
 }
+
+fn experiment_definitions(specs: &[SimulationBatchSpec]) -> Vec<serde_json::Value> {
+    specs
+        .iter()
+        .map(|spec| {
+            serde_json::json!({
+                "experiment_id": spec.label.as_str(),
+                "method_key": spec.strategy_key.as_str(),
+                "method": spec.variant.label(),
+                "role": &spec.role,
+                "parent_experiment_id": spec.parent_experiment_id.as_deref(),
+                "ablations": &spec.ablations,
+                "execution_overlay": spec.execution_overlay.as_str(),
+                "evidence_policy": spec.evidence_policy.as_str(),
+            })
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_experiment_index(
+    path: &Path,
+    config: &SimulationBatchConfig,
+    run_id: &str,
+    status: &str,
+    created_at_ms: u64,
+    finished_at_ms: Option<u64>,
+    reason: Option<&str>,
+    promotion_gate: Option<&SimulationPromotionGate>,
+) -> Result<(), SimulationError> {
+    let value = serde_json::json!({
+        "schema_version": EXPERIMENT_INDEX_SCHEMA_VERSION,
+        "status": status,
+        "run_id": run_id,
+        "policy_id": config.policy_id,
+        "experiment_plan_id": config.experiment_plan_id,
+        "experiment_plan_digest": config.experiment_plan_digest,
+        "build_identity": crate::simulation::SimulationRunManifest::compiled_build_identity(),
+        "created_at_ms": created_at_ms,
+        "finished_at_ms": finished_at_ms,
+        "reason": reason,
+        "promotion_verdict": promotion_gate.map(|gate| format!("{:?}", gate.verdict)),
+        "evidence_class": promotion_gate.map(|gate| gate.evidence_class.as_str()),
+        "experiments": experiment_definitions(&config.specs),
+    });
+    write_json_atomic(path, &value)
+        .await
+        .map_err(|error| SimulationError::Io(error.to_string()))
+}
+
 pub async fn run(
     mut config: SimulationBatchConfig,
 ) -> Result<SimulationBatchResult, SimulationError> {
@@ -465,6 +532,7 @@ pub async fn run(
     let parameter_material = serde_json::json!({
         "policy_id": config.policy_id,
         "experiment_plan_id": config.experiment_plan_id,
+        "experiment_plan_digest": config.experiment_plan_digest,
         "universe_id": config.universe_id,
         "entry_threshold_bps": config.entry_threshold_bps,
         "threshold_scale_ppm": config.threshold_scale_ppm,
@@ -522,6 +590,7 @@ pub async fn run(
         "strategy_variants": config.specs.iter().map(|spec| spec.variant.label()).collect::<Vec<_>>(),
         "spec_labels": config.specs.iter().map(|spec| spec.label.as_str()).collect::<Vec<_>>(),
         "spec_ablations": config.specs.iter().map(|spec| &spec.ablations).collect::<Vec<_>>(),
+        "experiment_definitions": experiment_definitions(&config.specs),
         "symbols": config.symbols,
         "output_root": config.output_root,
         "entry_threshold_bps": config.entry_threshold_bps,
@@ -539,6 +608,18 @@ pub async fn run(
         "evidence": config.evidence.clone(),
     });
     write_json_atomic(&config.output_root.join("run-manifest.json"), &manifest).await?;
+    let experiment_index_path = config.output_root.join("experiment-index.json");
+    write_experiment_index(
+        &experiment_index_path,
+        &config,
+        &manifest_run_id,
+        "running",
+        manifest_created_at_ms,
+        None,
+        None,
+        None,
+    )
+    .await?;
     let run_status_path = config.output_root.join("run-status.json");
     write_json_atomic(
         &run_status_path,
@@ -1121,7 +1202,12 @@ pub async fn run(
             .map_err(|e| SimulationError::Io(e.to_string()))??;
         ledger_results.push(SimulationLedgerResult {
             label: ledger.spec.label,
+            strategy_key: ledger.spec.strategy_key,
             strategy_variant: ledger.spec.variant.label().to_owned(),
+            role: ledger.spec.role,
+            parent_experiment_id: ledger.spec.parent_experiment_id,
+            execution_overlay: ledger.spec.execution_overlay,
+            evidence_policy: ledger.spec.evidence_policy,
             ablations: ledger.spec.ablations,
             evidence_record_id: evidence.evidence_id(),
             summary: ledger.engine.summary(),
@@ -1132,14 +1218,27 @@ pub async fn run(
         });
     }
     if let Some(error) = run_error {
+        let finished_at_ms = now_ms();
+        let reason = error.to_string();
         write_json_atomic(
             &run_status_path,
             &serde_json::json!({
                 "schema_version": RUN_STATUS_SCHEMA_VERSION,
                 "status": "failed",
-                "finished_at_ms": now_ms(),
-                "reason": error.to_string(),
+                "finished_at_ms": finished_at_ms,
+                "reason": reason,
             }),
+        )
+        .await?;
+        write_experiment_index(
+            &experiment_index_path,
+            &config,
+            &manifest_run_id,
+            "failed",
+            manifest_created_at_ms,
+            Some(finished_at_ms),
+            Some(&reason),
+            None,
         )
         .await?;
         return Err(error);
@@ -1151,14 +1250,27 @@ pub async fn run(
     {
         let error =
             SimulationError::Market("batch execution dropped shared feed records".to_owned());
+        let finished_at_ms = now_ms();
+        let reason = error.to_string();
         write_json_atomic(
             &run_status_path,
             &serde_json::json!({
                 "schema_version": RUN_STATUS_SCHEMA_VERSION,
                 "status": "failed",
-                "finished_at_ms": now_ms(),
-                "reason": error.to_string(),
+                "finished_at_ms": finished_at_ms,
+                "reason": reason,
             }),
+        )
+        .await?;
+        write_experiment_index(
+            &experiment_index_path,
+            &config,
+            &manifest_run_id,
+            "failed",
+            manifest_created_at_ms,
+            Some(finished_at_ms),
+            Some(&reason),
+            None,
         )
         .await?;
         return Err(error);
@@ -1196,18 +1308,33 @@ pub async fn run(
         &promotion_gate,
     )
     .await?;
+    let finished_at_ms = now_ms();
     write_json_atomic(
         &run_status_path,
         &serde_json::json!({
             "schema_version": RUN_STATUS_SCHEMA_VERSION,
             "status": "completed",
-            "finished_at_ms": now_ms(),
+            "finished_at_ms": finished_at_ms,
             "evidence_class": promotion_gate.evidence_class.clone(),
             "verdict": format!("{:?}", promotion_gate.verdict),
         }),
     )
     .await?;
+    write_experiment_index(
+        &experiment_index_path,
+        &config,
+        &manifest_run_id,
+        "completed",
+        manifest_created_at_ms,
+        Some(finished_at_ms),
+        None,
+        Some(&promotion_gate),
+    )
+    .await?;
     Ok(SimulationBatchResult {
+        run_id: manifest_run_id,
+        experiment_plan_id: config.experiment_plan_id,
+        experiment_plan_digest: config.experiment_plan_digest,
         shared_market_records_written: market_count.max(market_written.load(Ordering::Relaxed)),
         shared_market_records_dropped: market_dropped.load(Ordering::Relaxed),
         shared_fx_records_written: fx_count.max(fx_written.load(Ordering::Relaxed)),
