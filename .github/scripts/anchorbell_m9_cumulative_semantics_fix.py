@@ -84,7 +84,7 @@ replace_once(
     "replay cumulative funding capability",
 )
 
-old_m9 = '''            } else if strategy_variant == SimulationPolicyVariant::M9DeadlineCausalDroMpc {
+baseline = '''            } else if strategy_variant == SimulationPolicyVariant::M9DeadlineCausalDroMpc {
                 let (intent, reduce_only, reason) = m9_intent_for_state(
                     state,
                     timestamp_ms,
@@ -96,7 +96,7 @@ old_m9 = '''            } else if strategy_variant == SimulationPolicyVariant::M
                 (intent, reduce_only, state.working.is_some(), reason)
             } else {
 '''
-new_m9 = '''            } else if strategy_variant == SimulationPolicyVariant::M9DeadlineCausalDroMpc {
+weak = '''            } else if strategy_variant == SimulationPolicyVariant::M9DeadlineCausalDroMpc {
                 let inherited_required_pico_bps = dynamic_threshold_for(
                     state,
                     strategy_variant,
@@ -125,9 +125,45 @@ new_m9 = '''            } else if strategy_variant == SimulationPolicyVariant::M
                 }
             } else {
 '''
-if old_m9 in text:
-    text = text.replace(old_m9, new_m9, 1)
-elif new_m9 not in text:
+strong = '''            } else if strategy_variant == SimulationPolicyVariant::M9DeadlineCausalDroMpc {
+                let (intent, reduce_only, reason) = m9_intent_for_state(
+                    state,
+                    timestamp_ms,
+                    max_position,
+                    requested_quantity,
+                    self.max_mark_index_gap_bps,
+                    self.fee_ppm,
+                );
+                let evidence_ok = reduce_only
+                    || dynamic_threshold_for(
+                        state,
+                        strategy_variant,
+                        self.strategy.entry_threshold_bps,
+                        self.fee_ppm,
+                        requested_quantity,
+                        max_position,
+                        timestamp_ms,
+                    )
+                    .map(|value| scale_threshold_non_fee(value, self.threshold_scale_ppm))
+                    .and_then(|value| value.required_pico_bps())
+                    .is_some_and(|value| {
+                        m7_entry_admissible(
+                            state,
+                            value.saturating_sub(state.adaptive_relief_pico_bps),
+                        )
+                    });
+                if intent.is_some() && !evidence_ok {
+                    (None, false, state.working.is_some(), "m7_evidence_gate")
+                } else {
+                    (intent, reduce_only, state.working.is_some(), reason)
+                }
+            } else {
+'''
+if weak in text:
+    text = text.replace(weak, strong, 1)
+elif baseline in text:
+    text = text.replace(baseline, strong, 1)
+elif strong not in text:
     raise SystemExit("missing anchor: M9 inherited evidence gate")
 
 if "m9_inherits_m7_and_m8_capabilities" not in text:
