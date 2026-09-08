@@ -42,11 +42,9 @@ fn main() {
         fail("candidate list cannot be empty");
     }
     let mut ids = BTreeSet::new();
-    if request
-        .candidates
-        .iter()
-        .any(|candidate| candidate.candidate_id.trim().is_empty() || !ids.insert(&candidate.candidate_id))
-    {
+    if request.candidates.iter().any(|candidate| {
+        candidate.candidate_id.trim().is_empty() || !ids.insert(&candidate.candidate_id)
+    }) {
         fail("candidate ids must be non-empty and unique");
     }
 

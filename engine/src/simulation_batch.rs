@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -15,8 +15,8 @@ use tokio::{process::Command, sync::mpsc};
 use crate::{
     analytics_evidence::{EvidenceAccumulator, EvidenceConfig},
     analytics_validation::{
-        evaluate_simulation_promotion, SimulationPromotionGate, SimulationPromotionInput,
-        ValidationSummary,
+        evaluate_candidate_readiness, evaluate_simulation_promotion, CandidateReadinessGate,
+        SimulationPromotionGate, SimulationPromotionInput, ValidationSummary,
     },
     backtest::realism::{LatencyModel, QueueModel, RealisticFillModel},
     execution::{BinanceEnvironment, SessionCheckpoint},
@@ -124,6 +124,7 @@ pub struct SimulationBatchResult {
     pub evidence_summary: crate::analytics_evidence::EvidenceSummary,
     pub analytics_validation_summary: ValidationSummary,
     pub promotion_gate: SimulationPromotionGate,
+    pub candidate_readiness: BTreeMap<String, CandidateReadinessGate>,
     pub evidence_records_written: u64,
     pub evidence_records_dropped: u64,
     pub ledgers: Vec<SimulationLedgerResult>,
@@ -391,6 +392,13 @@ fn build_engine(
     Ok(engine)
 }
 
+fn candidate_identity(spec: &SimulationBatchSpec) -> String {
+    let mut ablations = spec.ablations.clone();
+    ablations.sort();
+    ablations.dedup();
+    format!("{}|{}", spec.variant.label(), ablations.join(","))
+}
+
 fn validate(config: &SimulationBatchConfig) -> Result<(), SimulationError> {
     if config.symbols.is_empty()
         || config.specs.is_empty()
@@ -400,18 +408,25 @@ fn validate(config: &SimulationBatchConfig) -> Result<(), SimulationError> {
             "batch execution requires symbols, specs, and shard capacity",
         ));
     }
-    if config.specs.iter().any(|spec| spec.label.trim().is_empty()) {
-        return Err(SimulationError::InvalidConfig(
-            "batch execution labels must be non-empty",
-        ));
-    }
+    let mut labels = BTreeSet::new();
     if config
         .specs
-        .windows(2)
-        .any(|pair| pair[0].label == pair[1].label)
+        .iter()
+        .any(|spec| spec.label.trim().is_empty() || !labels.insert(spec.label.as_str()))
     {
         return Err(SimulationError::InvalidConfig(
-            "batch execution labels must be unique",
+            "batch execution labels must be non-empty and unique",
+        ));
+    }
+    let mut candidate_identities = BTreeSet::new();
+    if config
+        .specs
+        .iter()
+        .map(candidate_identity)
+        .any(|identity| !candidate_identities.insert(identity))
+    {
+        return Err(SimulationError::InvalidConfig(
+            "batch execution contains duplicate candidate semantics",
         ));
     }
     Ok(())
@@ -1070,6 +1085,30 @@ pub async fn run(
             "batch execution dropped shared feed records".to_owned(),
         ));
     }
+    let candidate_readiness = ledger_results
+        .iter()
+        .map(|ledger| {
+            let input = SimulationPromotionInput {
+                ledger_count: 1,
+                orders: ledger.summary.order_count,
+                fills: ledger.summary.fill_count,
+                records_dropped: ledger.records_dropped,
+                valuation_incomplete_ledgers: if ledger.summary.unrealized_valuation_complete {
+                    0
+                } else {
+                    1
+                },
+                non_flat_ledgers: if ledger.summary.flat_at_end { 0 } else { 1 },
+                total_net_pnl_ticks: ledger.summary.net_pnl_ticks,
+            };
+            (ledger.label.clone(), evaluate_candidate_readiness(input))
+        })
+        .collect::<BTreeMap<_, _>>();
+    write_json_atomic(
+        &config.output_root.join("candidate-readiness.json"),
+        &candidate_readiness,
+    )
+    .await?;
     let promotion_input = SimulationPromotionInput {
         ledger_count: ledger_results.len() as u64,
         orders: ledger_results
@@ -1111,6 +1150,7 @@ pub async fn run(
         evidence_summary,
         analytics_validation_summary,
         promotion_gate,
+        candidate_readiness,
         evidence_records_written: evidence_count.max(evidence_written.load(Ordering::Relaxed)),
         evidence_records_dropped: evidence_dropped.load(Ordering::Relaxed),
         ledgers: ledger_results,
@@ -1119,7 +1159,8 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::calibration_key;
+    use super::{calibration_key, candidate_identity, SimulationBatchSpec};
+    use crate::simulation::engine::SimulationPolicyVariant;
 
     #[test]
     fn calibration_store_keys_are_strategy_scoped() {
@@ -1128,5 +1169,24 @@ mod tests {
             calibration_key("F3_m3", "CXMTUSDT"),
             calibration_key("F4_m4", "CXMTUSDT")
         );
+    }
+
+    #[test]
+    fn candidate_identity_normalizes_ablation_order_and_ignores_label() {
+        let left = SimulationBatchSpec {
+            label: "candidate-a".to_owned(),
+            variant: SimulationPolicyVariant::M8FundingAware,
+            ablations: vec!["funding".to_owned(), "tail".to_owned()],
+        };
+        let right = SimulationBatchSpec {
+            label: "candidate-b".to_owned(),
+            variant: SimulationPolicyVariant::M8FundingAware,
+            ablations: vec![
+                "tail".to_owned(),
+                "funding".to_owned(),
+                "funding".to_owned(),
+            ],
+        };
+        assert_eq!(candidate_identity(&left), candidate_identity(&right));
     }
 }
