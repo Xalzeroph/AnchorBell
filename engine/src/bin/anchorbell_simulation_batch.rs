@@ -51,7 +51,7 @@ struct Args {
     capital_usdt: i64,
     duration_secs: u64,
     fold_id: Option<String>,
-    stress_fold: bool,
+    stress_profile: Option<String>,
     include_m9: bool,
 }
 
@@ -215,7 +215,7 @@ fn main() {
             checkpoint_interval_ms: 5_000,
             duration_secs: args.duration_secs,
             validation_fold_id: args.fold_id,
-            validation_stress: args.stress_fold,
+            validation_stress_profile: args.stress_profile,
             evidence: EvidenceConfig::default(),
         };
         let result = match run(config).await {
@@ -254,7 +254,7 @@ fn parse_args() -> Result<Args, String> {
     let mut capital_usdt = 1_500_i64.checked_mul(100_000_000).unwrap();
     let mut duration_secs = 0;
     let mut fold_id = None;
-    let mut stress_fold = false;
+    let mut stress_profile = None;
     let mut include_m9 = false;
     let mut args = env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -277,7 +277,10 @@ fn parse_args() -> Result<Args, String> {
             "--capital-usdt" => capital_usdt = parse_decimal(&next(&mut args, &flag)?, 8)?,
             "--duration-secs" => duration_secs = parse(&mut args, &flag)?,
             "--fold-id" => fold_id = Some(next(&mut args, &flag)?),
-            "--stress-fold" => stress_fold = true,
+            "--stress-profile" => stress_profile = Some(next(&mut args, &flag)?),
+            "--stress-fold" => {
+                return Err("--stress-fold was removed; use --stress-profile synthetic_fee2x_latency_50_100_150_v1".to_owned())
+            }
             "--include-m9" => include_m9 = true,
             "--help" | "-h" => {
                 print_usage();
@@ -289,8 +292,8 @@ fn parse_args() -> Result<Args, String> {
     if symbols.is_empty() {
         return Err("--symbols cannot be empty".to_owned());
     }
-    if stress_fold && fold_id.is_none() {
-        return Err("--stress-fold requires --fold-id".to_owned());
+    if stress_profile.is_some() && fold_id.is_none() {
+        return Err("--stress-profile requires --fold-id".to_owned());
     }
     if fold_id
         .as_ref()
@@ -310,7 +313,7 @@ fn parse_args() -> Result<Args, String> {
         capital_usdt,
         duration_secs,
         fold_id,
-        stress_fold,
+        stress_profile,
         include_m9,
     })
 }
@@ -453,7 +456,7 @@ fn terminate_simulation_batch_process(pid: u32) {
 }
 
 fn print_usage() {
-    eprintln!("usage: anchorbell_simulation_batch [--policy-id M6] --index-anchors [--environment production] [--symbols S1,S2] [--output-root PATH] [--capital-usdt N] [--duration-secs N] [--include-m9]");
+    eprintln!("usage: anchorbell_simulation_batch [--policy-id M6] --index-anchors [--environment production] [--symbols S1,S2] [--output-root PATH] [--capital-usdt N] [--duration-secs N] [--fold-id ID] [--stress-profile synthetic_fee2x_latency_50_100_150_v1] [--include-m9]");
     eprintln!(
         "defaults: shared feed + M1..M8; pass --include-m9 to opt into the separate M1..M9 plan"
     );

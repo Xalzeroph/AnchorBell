@@ -4,18 +4,32 @@ use std::{
     collections::{BTreeMap, BTreeSet},
 };
 
+/// Synthetic execution stress, not a claim about measured production latency.
+/// The simulation batch applies this profile before any candidate engine is built.
+pub const EXECUTION_ADVERSE_STRESS_PROFILE_V1: &str = "synthetic_fee2x_latency_50_100_150_v1";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OosFoldMetrics {
     pub fold_id: String,
     /// SHA-256 of the exact shared market-event ledger used by this fold.
     pub data_digest: String,
     pub stress: bool,
+    /// None for ordinary OOS folds; recognized explicit scenario id for stress folds.
+    pub stress_profile: Option<String>,
     pub net_return_bps: f64,
     pub sharpe_ratio: Option<f64>,
     pub sortino_ratio: Option<f64>,
     pub max_drawdown_pct: f64,
     pub fee_drag_bps: f64,
     pub trades: u64,
+}
+
+fn valid_stress_profile(stress: bool, profile: Option<&str>) -> bool {
+    match (stress, profile) {
+        (false, None) => true,
+        (true, Some(EXECUTION_ADVERSE_STRESS_PROFILE_V1)) => true,
+        _ => false,
+    }
 }
 
 fn valid_sha256_digest(value: &str) -> bool {
@@ -29,6 +43,7 @@ impl OosFoldMetrics {
     fn valid(&self) -> bool {
         !self.fold_id.trim().is_empty()
             && valid_sha256_digest(&self.data_digest)
+            && valid_stress_profile(self.stress, self.stress_profile.as_deref())
             && self.net_return_bps.is_finite()
             && self.max_drawdown_pct.is_finite()
             && self.max_drawdown_pct >= 0.0
@@ -44,14 +59,16 @@ pub struct OosFoldBundle {
     pub methodology_id: String,
     pub fold_id: String,
     pub stress: bool,
+    pub stress_profile: Option<String>,
     pub candidates: BTreeMap<String, OosFoldMetrics>,
 }
 
 impl OosFoldBundle {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.methodology_id != "anchorbell-oos-fold-bundle-v1"
+        if self.methodology_id != "anchorbell-oos-fold-bundle-v2"
             || self.fold_id.trim().is_empty()
             || self.candidates.is_empty()
+            || !valid_stress_profile(self.stress, self.stress_profile.as_deref())
         {
             return Err("invalid_fold_bundle_identity");
         }
@@ -60,6 +77,7 @@ impl OosFoldBundle {
                 || !metrics.valid()
                 || metrics.fold_id != self.fold_id
                 || metrics.stress != self.stress
+                || metrics.stress_profile != self.stress_profile
         }) {
             return Err("invalid_fold_bundle_metrics");
         }
@@ -73,7 +91,7 @@ pub fn validate_candidate_fold_coverage(
     if candidates.is_empty() {
         return Err("candidate_folds_required");
     }
-    let mut expected_coverage: Option<BTreeSet<(String, bool, String)>> = None;
+    let mut expected_coverage: Option<BTreeSet<(String, bool, Option<String>, String)>> = None;
     for (candidate_id, folds) in candidates {
         if candidate_id.trim().is_empty()
             || folds.is_empty()
@@ -97,7 +115,12 @@ pub fn validate_candidate_fold_coverage(
             if !data_set.insert(fold.data_digest.clone()) {
                 return Err("duplicate_data_window_within_fold_class");
             }
-            coverage.insert((fold.fold_id.clone(), fold.stress, fold.data_digest.clone()));
+            coverage.insert((
+                fold.fold_id.clone(),
+                fold.stress,
+                fold.stress_profile.clone(),
+                fold.data_digest.clone(),
+            ));
         }
         match &expected_coverage {
             Some(expected) if expected != &coverage => {
@@ -385,6 +408,7 @@ mod tests {
             fold_id: id.to_owned(),
             data_digest: format!("sha256:{digest_seed:064x}"),
             stress,
+            stress_profile: stress.then(|| EXECUTION_ADVERSE_STRESS_PROFILE_V1.to_owned()),
             net_return_bps: ret,
             sharpe_ratio: Some(sharpe),
             sortino_ratio: Some(sharpe * 1.2),
@@ -399,17 +423,19 @@ mod tests {
         let mut first_candidates = BTreeMap::new();
         first_candidates.insert("m7|".to_owned(), fold("o1", false, 5.0, 1.0, 1.0));
         let first = OosFoldBundle {
-            methodology_id: "anchorbell-oos-fold-bundle-v1".to_owned(),
+            methodology_id: "anchorbell-oos-fold-bundle-v2".to_owned(),
             fold_id: "o1".to_owned(),
             stress: false,
+            stress_profile: None,
             candidates: first_candidates,
         };
         let mut second_candidates = BTreeMap::new();
         second_candidates.insert("m7|".to_owned(), fold("s1", true, -2.0, 0.2, 2.0));
         let second = OosFoldBundle {
-            methodology_id: "anchorbell-oos-fold-bundle-v1".to_owned(),
+            methodology_id: "anchorbell-oos-fold-bundle-v2".to_owned(),
             fold_id: "s1".to_owned(),
             stress: true,
+            stress_profile: Some(EXECUTION_ADVERSE_STRESS_PROFILE_V1.to_owned()),
             candidates: second_candidates,
         };
         let merged = merge_fold_bundles(&[first.clone(), second]).unwrap();
@@ -457,6 +483,25 @@ mod tests {
         assert_eq!(result.reason, "duplicate_data_window");
         first.data_digest = format!("sha256:{:064x}", 999_u64);
         assert!(first.valid());
+    }
+
+    #[test]
+    fn stress_label_without_profile_is_rejected() {
+        let mut invalid = fold("s-missing-profile", true, 0.0, 0.2, 2.0);
+        invalid.stress_profile = None;
+        let result = evaluate_robust_candidate(
+            &[
+                fold("o1", false, 3.0, 1.0, 1.0),
+                fold("o2", false, 3.0, 1.0, 1.0),
+                fold("o3", false, 3.0, 1.0, 1.0),
+                invalid,
+                fold("s2", true, 0.0, 0.2, 2.0),
+                fold("s3", true, 0.0, 0.2, 2.0),
+            ],
+            RobustSelectionConstraints::default(),
+        );
+        assert!(!result.eligible);
+        assert_eq!(result.reason, "invalid_fold_metrics");
     }
 
     #[test]

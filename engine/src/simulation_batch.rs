@@ -28,7 +28,7 @@ use crate::{
         BinanceC2cFxClient, BinanceC2cFxPoller, BinanceMarketConfig, BinanceMarketFeed,
         BinanceMarketStream, FxPollerConfig, FxUpdate, PublicMarketMetadataClient, ReconnectPolicy,
     },
-    oos_validation::{OosFoldBundle, OosFoldMetrics},
+    oos_validation::{OosFoldBundle, OosFoldMetrics, EXECUTION_ADVERSE_STRESS_PROFILE_V1},
     orderbook::{LocalOrderBook, OrderBookError},
     runtime::{
         io::{spawn_line_writer, write_json_atomic, AsyncLineWriter},
@@ -102,7 +102,8 @@ pub struct SimulationBatchConfig {
     pub duration_secs: u64,
     /// Optional reproducible OOS/stress fold identity. Formal folds must be finite runs.
     pub validation_fold_id: Option<String>,
-    pub validation_stress: bool,
+    /// Explicit synthetic execution scenario; None means ordinary OOS fold.
+    pub validation_stress_profile: Option<String>,
     /// Shared, deterministic evidence test fed exactly once per public event.
     pub evidence: EvidenceConfig,
 }
@@ -414,6 +415,39 @@ fn build_engine(
     Ok(engine)
 }
 
+const STRESS_MIN_FEE_PPM: i64 = 400;
+const STRESS_MARKET_TO_DECISION_MS: u64 = 50;
+const STRESS_DECISION_TO_EXCHANGE_MS: u64 = 100;
+const STRESS_CANCEL_TO_EXCHANGE_MS: u64 = 150;
+
+fn apply_validation_stress_profile(
+    config: &mut SimulationBatchConfig,
+) -> Result<(), SimulationError> {
+    let Some(profile) = config.validation_stress_profile.as_deref() else {
+        return Ok(());
+    };
+    match profile {
+        EXECUTION_ADVERSE_STRESS_PROFILE_V1 => {
+            // Synthetic adverse execution scenario. These are explicit stress
+            // assumptions, not estimates of observed production performance.
+            config.fee_ppm = config.fee_ppm.saturating_mul(2).max(STRESS_MIN_FEE_PPM);
+            config.market_to_decision_ms = config
+                .market_to_decision_ms
+                .max(STRESS_MARKET_TO_DECISION_MS);
+            config.decision_to_exchange_ms = config
+                .decision_to_exchange_ms
+                .max(STRESS_DECISION_TO_EXCHANGE_MS);
+            config.cancel_to_exchange_ms = config
+                .cancel_to_exchange_ms
+                .max(STRESS_CANCEL_TO_EXCHANGE_MS);
+            Ok(())
+        }
+        _ => Err(SimulationError::InvalidConfig(
+            "unknown validation stress profile",
+        )),
+    }
+}
+
 fn candidate_identity(spec: &SimulationBatchSpec) -> String {
     let mut ablations = spec.ablations.clone();
     ablations.sort();
@@ -467,7 +501,16 @@ fn validate(config: &SimulationBatchConfig) -> Result<(), SimulationError> {
                 "validation folds require explicit capital allocations",
             ));
         }
-    } else if config.validation_stress {
+        if config
+            .validation_stress_profile
+            .as_deref()
+            .is_some_and(|profile| profile != EXECUTION_ADVERSE_STRESS_PROFILE_V1)
+        {
+            return Err(SimulationError::InvalidConfig(
+                "unknown validation stress profile",
+            ));
+        }
+    } else if config.validation_stress_profile.is_some() {
         return Err(SimulationError::InvalidConfig(
             "stress validation requires a fold id",
         ));
@@ -478,6 +521,7 @@ pub async fn run(
     mut config: SimulationBatchConfig,
 ) -> Result<SimulationBatchResult, SimulationError> {
     validate(&config)?;
+    apply_validation_stress_profile(&mut config)?;
     if config.policy_id.trim().is_empty() {
         return Err(SimulationError::InvalidConfig(
             "simulation policy identity must be non-empty",
@@ -558,7 +602,7 @@ pub async fn run(
         "depth_snapshot_limit": config.depth_snapshot_limit,
         "duration_secs": config.duration_secs,
         "validation_fold_id": config.validation_fold_id,
-        "validation_stress": config.validation_stress,
+        "validation_stress_profile": config.validation_stress_profile,
         "evidence": config.evidence.clone(),
     });
     write_json_atomic(&config.output_root.join("run-manifest.json"), &manifest).await?;
@@ -1165,6 +1209,8 @@ pub async fn run(
     )
     .await?;
     let oos_fold_bundle = if let Some(fold_id) = config.validation_fold_id.as_deref() {
+        let stress_profile = config.validation_stress_profile.clone();
+        let is_stress = stress_profile.is_some();
         let capital_ticks = config
             .position_allocations
             .as_ref()
@@ -1202,7 +1248,8 @@ pub async fn run(
                         .as_ref()
                         .expect("validation digest exists when fold id is configured")
                         .clone(),
-                    stress: config.validation_stress,
+                    stress: is_stress,
+                    stress_profile: stress_profile.clone(),
                     net_return_bps: risk.total_return_pct * 100.0,
                     sharpe_ratio: risk.sharpe_ratio,
                     sortino_ratio: risk.sortino_ratio,
@@ -1213,9 +1260,10 @@ pub async fn run(
             );
         }
         let bundle = OosFoldBundle {
-            methodology_id: "anchorbell-oos-fold-bundle-v1".to_owned(),
+            methodology_id: "anchorbell-oos-fold-bundle-v2".to_owned(),
             fold_id: fold_id.to_owned(),
-            stress: config.validation_stress,
+            stress: is_stress,
+            stress_profile,
             candidates,
         };
         bundle
@@ -1277,8 +1325,16 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::{calibration_key, candidate_identity, SimulationBatchSpec};
-    use crate::simulation::engine::SimulationPolicyVariant;
+    use super::{
+        apply_validation_stress_profile, calibration_key, candidate_identity,
+        SimulationBatchConfig, SimulationBatchSpec,
+    };
+    use crate::{
+        analytics_evidence::EvidenceConfig, execution::BinanceEnvironment,
+        oos_validation::EXECUTION_ADVERSE_STRESS_PROFILE_V1,
+        simulation::engine::SimulationPolicyVariant,
+    };
+    use std::{collections::BTreeMap, path::PathBuf};
 
     #[test]
     fn calibration_store_keys_are_strategy_scoped() {
@@ -1287,6 +1343,55 @@ mod tests {
             calibration_key("F3_m3", "CXMTUSDT"),
             calibration_key("F4_m4", "CXMTUSDT")
         );
+    }
+
+    #[test]
+    fn execution_adverse_stress_profile_changes_economics_and_latency() {
+        let mut config = SimulationBatchConfig {
+            policy_id: "test".to_owned(),
+            environment: BinanceEnvironment::Testnet,
+            symbols: vec!["CXMTUSDT".to_owned()],
+            anchors: BTreeMap::new(),
+            entry_threshold_bps: 5,
+            threshold_scale_ppm: 1_000_000,
+            max_position: 1,
+            requested_quantity: 1,
+            max_mark_index_gap_bps: 50,
+            max_anchor_age_ms: 0,
+            fee_ppm: 200,
+            quantity_scale: 8,
+            price_scale: 8,
+            position_allocations: Some(BTreeMap::new()),
+            output_root: PathBuf::from("target/test-stress"),
+            specs: vec![],
+            max_subscriptions_per_shard: 1,
+            connect_timeout_ms: 1,
+            read_timeout_ms: 1,
+            metrics_refresh_ms: 1_000,
+            index_anchor_refresh_ms: 0,
+            fx_refresh_ms: 1_000,
+            fx_max_age_ms: 1_000,
+            queue_ahead: 0,
+            trade_through: 0,
+            market_to_decision_ms: 0,
+            decision_to_exchange_ms: 0,
+            cancel_to_exchange_ms: 0,
+            quote_reprice_min_interval_ms: 750,
+            dynamic_capital_refresh_ms: 60_000,
+            depth_snapshot_limit: 100,
+            checkpoint_path: None,
+            checkpoint_session_id: None,
+            checkpoint_interval_ms: 5_000,
+            duration_secs: 60,
+            validation_fold_id: Some("stress-1".to_owned()),
+            validation_stress_profile: Some(EXECUTION_ADVERSE_STRESS_PROFILE_V1.to_owned()),
+            evidence: EvidenceConfig::default(),
+        };
+        apply_validation_stress_profile(&mut config).unwrap();
+        assert_eq!(config.fee_ppm, 400);
+        assert_eq!(config.market_to_decision_ms, 50);
+        assert_eq!(config.decision_to_exchange_ms, 100);
+        assert_eq!(config.cancel_to_exchange_ms, 150);
     }
 
     #[test]
