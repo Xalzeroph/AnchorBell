@@ -34,3 +34,4 @@ pub use contract::{SimulationRunManifest, SIMULATION_MANIFEST_SCHEMA_VERSION};
 pub use engine::*;
 pub use experiment_plan::{ExperimentPlan, ExperimentSpec};
 pub use orchestration::*;
+pub use replay_config::ReplayConfig;

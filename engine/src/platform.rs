@@ -241,6 +241,10 @@ pub enum RegistryError {
         system_layer: PlatformLayer,
         dependency_layer: PlatformLayer,
     },
+    CapabilityProviderOutOfScope {
+        system: String,
+        capability: String,
+    },
     DuplicateDependency {
         system: String,
         dependency: String,
@@ -276,6 +280,12 @@ impl std::fmt::Display for RegistryError {
                 f,
                 "layer violation: {system} ({system_layer:?}) depends on {dependency} ({dependency_layer:?})"
             ),
+            Self::CapabilityProviderOutOfScope { system, capability } => {
+                write!(
+                    f,
+                    "system {system} consumes capability {capability} outside its dependency closure"
+                )
+            }
             Self::DuplicateDependency { system, dependency } => {
                 write!(
                     f,
@@ -437,6 +447,16 @@ impl SystemRegistry {
                         "{id} consumes unprovided capability {required}"
                     )));
                 }
+                let reachable = self.dependency_closure(id)?;
+
+                if !self.contracts.iter().any(|(provider_id, provider)| {
+                    reachable.contains(provider_id) && provider.provides.contains(required)
+                }) {
+                    return Err(RegistryError::CapabilityProviderOutOfScope {
+                        system: (*id).to_owned(),
+                        capability: (*required).to_owned(),
+                    });
+                }
             }
         }
         for id in self.descriptors.keys() {
@@ -462,33 +482,36 @@ impl SystemRegistry {
         &self,
         profile: RuntimeProfile,
     ) -> Result<Vec<&'static str>, RegistryError> {
+        profile
+            .roots()
+            .iter()
+            .try_fold(BTreeSet::new(), |mut ids, root| {
+                ids.extend(self.dependency_closure(root)?);
+                Ok::<_, RegistryError>(ids)
+            })
+            .map(|ids| ids.into_iter().collect())
+    }
+
+    /// Return the complete transitive dependency closure for a registered node.
+    /// This is the single reusable topology primitive for profiles, readiness,
+    /// capability scope checks and generated diagnostics.
+    pub fn dependency_closure(&self, id: &str) -> Result<BTreeSet<&'static str>, RegistryError> {
         let mut ids = BTreeSet::new();
-        for root in profile.roots() {
-            self.collect_profile_dependencies(root, &mut ids)?;
+        let mut pending = vec![id];
+        while let Some(candidate) = pending.pop() {
+            let Some(descriptor) = self.descriptors.get(candidate) else {
+                return Err(RegistryError::MissingDependency {
+                    system: id.to_owned(),
+                    dependency: candidate.to_owned(),
+                });
+            };
+            if !ids.insert(descriptor.id) {
+                continue;
+            }
+            pending.extend(descriptor.dependencies.iter().copied());
         }
-        Ok(ids.into_iter().collect())
+        Ok(ids)
     }
-
-    fn collect_profile_dependencies(
-        &self,
-        id: &str,
-        ids: &mut BTreeSet<&'static str>,
-    ) -> Result<(), RegistryError> {
-        let Some(descriptor) = self.descriptors.get(id) else {
-            return Err(RegistryError::MissingDependency {
-                system: id.to_owned(),
-                dependency: "profile root".to_owned(),
-            });
-        };
-        if !ids.insert(descriptor.id) {
-            return Ok(());
-        }
-        for dependency in descriptor.dependencies {
-            self.collect_profile_dependencies(dependency, ids)?;
-        }
-        Ok(())
-    }
-
     pub fn from_catalog(descriptors: Vec<SystemDescriptor>) -> Result<Self, RegistryError> {
         let mut registry = Self {
             descriptors: BTreeMap::new(),
@@ -1039,7 +1062,7 @@ register_system!(
     &["decision.intent"],
     &["anchor.snapshot"],
     &[RuntimeProfile::Live],
-    &[],
+    &["market_events"],
     "engine::strategy",
     "strategy/mod.rs"
 );
@@ -1097,7 +1120,7 @@ register_system!(
     SystemRole::ExecutionGateway,
     Authority::Binance,
     Mutability::ImmutableCore,
-    &["market.binance", "decision.risk"],
+    &["market.binance", "decision.strategy", "decision.risk"],
     1_000,
     true,
     &["execution.submit", "execution.cancel"],
@@ -1350,14 +1373,7 @@ mod tests {
             .iter()
             .any(|reason| reason.contains("health_report_missing")));
 
-        for id in [
-            "control.kernel",
-            "market.binance",
-            "market.reference",
-            "market.anchor",
-            "decision.risk",
-            "execution.gateway",
-        ] {
+        for id in registry.dependency_closure("execution.gateway").unwrap() {
             registry
                 .report_health(HealthSnapshot::ready(id, 1_000))
                 .unwrap();
@@ -1381,7 +1397,10 @@ mod tests {
     fn contracts_expose_capabilities_and_recovery() {
         let registry = SystemRegistry::default();
         let contract = registry.contract("execution.gateway").unwrap();
-        assert_eq!(contract.requires, &["market.binance", "decision.risk"]);
+        assert_eq!(
+            contract.requires,
+            &["market.binance", "decision.strategy", "decision.risk"]
+        );
         assert!(contract.provides.contains(&"execution.submit"));
         assert_eq!(contract.recovery, RecoveryPolicy::RestartThenReconcile);
         assert_eq!(registry.contracts().count(), registry.descriptors().count());
@@ -1393,14 +1412,7 @@ mod tests {
         registry.bootstrap_health(1_000);
         let blocked = registry.readiness_for_capability("execution.submit", 1_000);
         assert!(!blocked.ready);
-        for id in [
-            "control.kernel",
-            "market.binance",
-            "market.reference",
-            "market.anchor",
-            "decision.risk",
-            "execution.gateway",
-        ] {
+        for id in registry.dependency_closure("execution.gateway").unwrap() {
             registry
                 .report_health(HealthSnapshot::ready(id, 1_000))
                 .unwrap();

@@ -21,8 +21,14 @@ use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+use super::portfolio_guard::{
+    PortfolioDrawdownAction, PortfolioDrawdownGuard, PortfolioDrawdownSnapshot,
+};
+pub use super::risk_metrics::RiskMetrics;
+use super::risk_metrics::{calculate_risk_metrics, RISK_SAMPLE_INTERVAL_MS};
+
 use crate::{
-    backtest::{MakerQuote, TopOfBook},
+    backtest::TopOfBook,
     execution::BinanceEnvironment,
     execution::{OrderIntent, Side},
     market::{
@@ -122,6 +128,14 @@ impl SimulationPolicyVariant {
 
     fn uses_dynamic_capital(self) -> bool {
         self >= Self::M6DynamicCapital
+    }
+
+    fn uses_evidence_gate(self) -> bool {
+        self >= Self::M7EvidenceGated
+    }
+
+    fn uses_funding_controller(self) -> bool {
+        self >= Self::M8FundingAware
     }
 }
 
@@ -291,6 +305,8 @@ pub enum SimulationError {
     ReplayOutOfOrder { previous_ms: u64, current_ms: u64 },
     #[error("replay event symbol is not configured: {0}")]
     ReplaySymbolNotConfigured(String),
+    #[error("calibration seed time {seed_ms} is not strictly before replay start {replay_ms}")]
+    CalibrationSeedNotPrior { seed_ms: u64, replay_ms: u64 },
 }
 
 impl From<std::io::Error> for SimulationError {
@@ -621,8 +637,13 @@ struct WorkingOrder {
     price_ticks: i64,
     remaining_quantity: i64,
     reduce_only: bool,
-    /// Quantity resting ahead of this order when it reached the exchange.
+    /// Initial modeled quantity resting ahead of this order. When local depth is
+    /// seeded this includes the observed quantity at our price plus any explicit
+    /// synthetic queue/trade-through stress.
     queue_ahead_quantity: i64,
+    /// Stateful queue barrier still requiring compatible aggressor volume before
+    /// this maker order may fill. This can only decrease after exchange arrival.
+    queue_ahead_remaining: i64,
     /// Absolute distance from the contemporaneous mid, in basis points.
     quote_distance_bps: i64,
     placed_at_ms: u64,
@@ -987,22 +1008,6 @@ pub struct ModelAssumptions {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct RiskMetrics {
-    pub status: String,
-    pub sample_count: usize,
-    pub observed_seconds: f64,
-    pub total_return_pct: f64,
-    pub max_drawdown_pct: f64,
-    pub win_rate_pct: f64,
-    pub average_return_bps: f64,
-    pub profit_factor: Option<f64>,
-    /// Annualized Sharpe; null until enough independent history exists.
-    pub sharpe_ratio: Option<f64>,
-    /// Annualized Sortino; null until enough independent history exists.
-    pub sortino_ratio: Option<f64>,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct MetricsSnapshot {
     pub observed_at_ms: u64,
     pub strategy_variant: String,
@@ -1012,6 +1017,8 @@ pub struct MetricsSnapshot {
     pub symbols: Vec<SymbolMetrics>,
     pub history: Vec<PerformancePoint>,
     pub risk_metrics: Option<RiskMetrics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub portfolio_drawdown: Option<PortfolioDrawdownSnapshot>,
     pub calendar_snapshot: String,
     pub maker_fee_source: String,
     pub funding_model: String,
@@ -1036,7 +1043,9 @@ pub struct SimulationEngine {
     realism: crate::backtest::realism::RealisticFillModel,
     quote_reprice_min_interval_ms: u64,
     live_risk_gates: bool,
+    funding_controller_enabled: bool,
     threshold_scale_ppm: i64,
+    portfolio_drawdown_guard: Option<PortfolioDrawdownGuard>,
     position_allocations: BTreeMap<String, PositionAllocation>,
     capital_usdt_ticks: Option<i64>,
     states: BTreeMap<String, SimulationSymbolState>,
@@ -1159,7 +1168,9 @@ impl SimulationEngine {
             realism: crate::backtest::realism::RealisticFillModel::default(),
             quote_reprice_min_interval_ms: 0,
             live_risk_gates: false,
+            funding_controller_enabled: true,
             threshold_scale_ppm: 1_000_000,
+            portfolio_drawdown_guard: None,
             position_allocations,
             capital_usdt_ticks: None,
             states,
@@ -1190,6 +1201,27 @@ impl SimulationEngine {
         self
     }
 
+    pub fn with_funding_controller_enabled(mut self, enabled: bool) -> Self {
+        self.funding_controller_enabled = enabled;
+        self
+    }
+
+    fn funding_controller_active(&self) -> bool {
+        self.strategy_variant.uses_funding_controller() && self.funding_controller_enabled
+    }
+
+    fn funding_entry_allowed_for_strategy(
+        &self,
+        state: &SimulationSymbolState,
+        now_ms: u64,
+    ) -> bool {
+        if self.strategy_variant.uses_funding_controller() && !self.funding_controller_enabled {
+            funding_entry_allowed(state, now_ms)
+        } else {
+            funding_entry_allowed_variant(state, now_ms, self.strategy_variant, self.fee_ppm)
+        }
+    }
+
     /// Hold a same-side quote briefly before replacing it. This models the
     /// operational cost of cancel/replace churn and leaves urgent reduce-only
     /// actions unrestricted.
@@ -1201,6 +1233,29 @@ impl SimulationEngine {
     pub fn with_threshold_scale_ppm(mut self, scale_ppm: i64) -> Self {
         self.threshold_scale_ppm = scale_ppm.clamp(0, 1_000_000);
         self
+    }
+
+    pub fn with_portfolio_drawdown_limits_bps(
+        mut self,
+        capital: i64,
+        soft: i64,
+        hard: i64,
+    ) -> Result<Self, SimulationError> {
+        if self.capital_usdt_ticks.is_some_and(|v| v != capital) {
+            return Err(SimulationError::InvalidConfig("drawdown capital mismatch"));
+        }
+        self.portfolio_drawdown_guard = PortfolioDrawdownGuard::new(capital, soft, hard)
+            .map_err(SimulationError::InvalidConfig)?;
+        self.capital_usdt_ticks = Some(capital);
+        Ok(self)
+    }
+
+    fn observe_portfolio_drawdown(&mut self) -> PortfolioDrawdownAction {
+        let s = self.summary();
+        PortfolioDrawdownGuard::observe_optional(
+            self.portfolio_drawdown_guard.as_mut(),
+            s.unrealized_valuation_complete.then_some(s.net_pnl_ticks),
+        )
     }
 
     pub fn with_strategy_variant(mut self, variant: SimulationPolicyVariant) -> Self {
@@ -1290,6 +1345,18 @@ impl SimulationEngine {
             BinanceMarketEvent::AggTrade(trade) => self.on_agg_trade(trade),
             BinanceMarketEvent::DepthUpdate(depth) => self.on_depth_update(depth),
         });
+        if self.observe_portfolio_drawdown().blocks_new_risk() {
+            let source = event_symbol(event);
+            for symbol in self.states.keys().cloned().collect::<Vec<_>>() {
+                if !matches!(
+                    event,
+                    BinanceMarketEvent::BookTicker(_) | BinanceMarketEvent::MarkPrice(_)
+                ) || !symbol.eq_ignore_ascii_case(source)
+                {
+                    records.extend(self.rebalance_symbol(&symbol, self.last_event_at_ms));
+                }
+            }
+        }
         records
     }
 
@@ -1341,15 +1408,57 @@ impl SimulationEngine {
         records
     }
 
+    const DYNAMIC_ALLOCATION_MIN_REFRESH_MS: u64 = 5 * 60 * 1_000;
+    const DYNAMIC_ALLOCATION_REBALANCE_DEADBAND_BPS: i64 = 100;
+    const DYNAMIC_PERFORMANCE_MIN_FILLS: u64 = 10;
+
+    fn allocation_budget_change_bps(old_budget: i64, new_budget: i64, total_capital: i64) -> i64 {
+        if total_capital <= 0 {
+            return i64::MAX;
+        }
+        let delta = i128::from(new_budget)
+            .saturating_sub(i128::from(old_budget))
+            .abs();
+        (delta.saturating_mul(10_000) / i128::from(total_capital)).clamp(0, i128::from(i64::MAX))
+            as i64
+    }
+
+    fn stable_post_fee_loss_bps(net_pnl_ticks: i64, fills: u64, baseline_budget: i64) -> i64 {
+        if fills < Self::DYNAMIC_PERFORMANCE_MIN_FILLS || net_pnl_ticks >= 0 || baseline_budget <= 0
+        {
+            return 0;
+        }
+        (i128::from(net_pnl_ticks).abs().saturating_mul(10_000) / i128::from(baseline_budget))
+            .clamp(0, 250) as i64
+    }
+
+    /// Penalize fee inefficiency without making the penalty grow merely because
+    /// a simulation has been running longer. Fees are already included in net
+    /// PnL; this bounded term measures how much positive gross edge they consume.
+    fn fee_efficiency_penalty_bps(gross_pnl_ticks: i64, fees_ticks: i64, fills: u64) -> i64 {
+        if fills < Self::DYNAMIC_PERFORMANCE_MIN_FILLS || gross_pnl_ticks <= 0 || fees_ticks <= 0 {
+            return 0;
+        }
+        (i128::from(fees_ticks).saturating_mul(100) / i128::from(gross_pnl_ticks)).clamp(0, 100)
+            as i64
+    }
+
     fn refresh_dynamic_allocations(&mut self, timestamp_ms: u64) -> Vec<SimulationRecord> {
         if !self.strategy_variant.uses_dynamic_capital()
             || self.capital_usdt_ticks.is_none()
             || (self.last_dynamic_capital_update_ms > 0
                 && timestamp_ms.saturating_sub(self.last_dynamic_capital_update_ms)
-                    < self.dynamic_capital_refresh_ms)
+                    < self
+                        .dynamic_capital_refresh_ms
+                        .max(Self::DYNAMIC_ALLOCATION_MIN_REFRESH_MS))
         {
             return Vec::new();
         }
+        let total_capital = self.capital_usdt_ticks.unwrap_or(0);
+        if total_capital <= 0 {
+            return Vec::new();
+        }
+        let fallback_budget = total_capital / i64::try_from(self.states.len()).unwrap_or(1).max(1);
         let risk_inputs = self
             .states
             .iter()
@@ -1363,22 +1472,38 @@ impl SimulationEngine {
                 } else {
                     0
                 };
+                // Performance penalties must use a stable denominator. Using the
+                // current dynamic allocation creates a positive-feedback loop: reducing a
+                // budget makes the same historical loss look larger and forces another cut.
+                let performance_budget = fallback_budget.max(1);
+                let gross_pnl_ticks = state
+                    .market_pnl_ticks
+                    .saturating_add(state.strategy_pnl_ticks)
+                    .saturating_add(state.funding_pnl_ticks);
+                let net_pnl_ticks = gross_pnl_ticks.saturating_sub(state.fees_ticks);
+                let post_fee_loss_bps =
+                    Self::stable_post_fee_loss_bps(net_pnl_ticks, state.fills, performance_budget);
+                let fee_drag_bps = Self::fee_efficiency_penalty_bps(
+                    gross_pnl_ticks,
+                    state.fees_ticks,
+                    state.fills,
+                );
+                let adverse_markout_bps =
+                    pico_bps_to_bps(state.ewma_adverse_markout_pico_bps).clamp(0, 100);
                 let risk_bps = 1_i64
                     .saturating_add(state.ewma_abs_return_bps.saturating_mul(3))
                     .saturating_add(state.ewma_spread_bps)
                     .saturating_add(gap_bps / 2)
                     .saturating_add(tail_bps / 2)
+                    .saturating_add(adverse_markout_bps.saturating_mul(2))
+                    .saturating_add(fee_drag_bps)
+                    .saturating_add(post_fee_loss_bps)
                     .max(1);
                 let eligible = data_quality_for(state, timestamp_ms, self.max_mark_index_gap_bps)
                     == DataQualityStatus::Fresh
                     && state.anchor.valid_at(timestamp_ms, self.max_anchor_age_ms)
                     && (!self.live_risk_gates
-                        || funding_entry_allowed_variant(
-                            state,
-                            timestamp_ms,
-                            self.strategy_variant,
-                            self.fee_ppm,
-                        ));
+                        || self.funding_entry_allowed_for_strategy(state, timestamp_ms));
                 (symbol.clone(), CapitalRiskInput { risk_bps, eligible })
             })
             .collect::<BTreeMap<_, _>>();
@@ -1386,10 +1511,6 @@ impl SimulationEngine {
             Ok(weights) => weights,
             Err(_) => return Vec::new(),
         };
-        let total_capital = self.capital_usdt_ticks.unwrap_or(0);
-        if total_capital <= 0 {
-            return Vec::new();
-        }
         let symbols = self.states.keys().cloned().collect::<Vec<_>>();
         let mut budget_left = i128::from(total_capital);
         let mut weight_left = 10_000_i64;
@@ -1424,13 +1545,22 @@ impl SimulationEngine {
             .filter(|symbol| {
                 let old = self.position_allocations.get(*symbol);
                 let candidate = allocations.get(*symbol);
-                old.map(|allocation| {
-                    candidate.is_some_and(|candidate| {
-                        allocation.budget_usdt_ticks != candidate.budget_usdt_ticks
-                            || allocation.max_position != candidate.max_position
-                    })
-                })
-                .unwrap_or(true)
+                match (old, candidate) {
+                    (Some(old), Some(candidate)) => {
+                        let budget_change_bps = Self::allocation_budget_change_bps(
+                            old.budget_usdt_ticks,
+                            candidate.budget_usdt_ticks,
+                            total_capital,
+                        );
+                        let absolute_position = self.states[*symbol]
+                            .position
+                            .checked_abs()
+                            .unwrap_or(i64::MAX);
+                        budget_change_bps >= Self::DYNAMIC_ALLOCATION_REBALANCE_DEADBAND_BPS
+                            || candidate.max_position < absolute_position
+                    }
+                    _ => true,
+                }
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -1680,6 +1810,12 @@ impl SimulationEngine {
         }
     }
 
+    pub fn set_calibration_updates_enabled(&mut self, enabled: bool) {
+        for state in self.states.values_mut() {
+            state.calibration.set_updates_enabled(enabled);
+        }
+    }
+
     pub fn restore_calibration_states_if_unavailable(
         &mut self,
         seeds: &BTreeMap<String, CalibrationState>,
@@ -1777,16 +1913,12 @@ impl SimulationEngine {
                     funding_decision.funding_carry_bps,
                     state.position,
                 );
+                let funding_controller_active = self.funding_controller_active();
                 let funding_allowed = !self.live_risk_gates
-                    || if self.strategy_variant == SimulationPolicyVariant::M8FundingAware {
+                    || if funding_controller_active {
                         funding_overlay.allow_base_strategy
                     } else {
-                        funding_entry_allowed_variant(
-                            state,
-                            self.last_event_at_ms,
-                            self.strategy_variant,
-                            self.fee_ppm,
-                        )
+                        self.funding_entry_allowed_for_strategy(state, self.last_event_at_ms)
                     };
                 let risk_state = if !equity_entry_allowed {
                     SimulationRiskState::ReduceOnlyEquitySession
@@ -1798,7 +1930,7 @@ impl SimulationEngine {
                     SimulationRiskState::ReduceOnlyTailRisk
                 } else if !funding_known {
                     SimulationRiskState::HaltFundingMetadata
-                } else if self.strategy_variant == SimulationPolicyVariant::M8FundingAware {
+                } else if funding_controller_active {
                     match funding_overlay.state {
                         crate::risk::FundingRiskState::ReduceOnly => {
                             SimulationRiskState::ReduceOnlyFundingRisk
@@ -1846,6 +1978,12 @@ impl SimulationEngine {
                     state.adaptive_relief_pico_bps,
                     buy_edge_pico_bps,
                     sell_edge_pico_bps,
+                );
+
+                let labels = PortfolioDrawdownGuard::metric_labels(
+                    self.portfolio_drawdown_guard.as_ref(),
+                    risk_state.label(),
+                    entry_block_reason,
                 );
 
                 SymbolMetrics {
@@ -1919,15 +2057,28 @@ impl SimulationEngine {
                     calendar_state: calendar_state.to_owned(),
                     next_funding_time_ms: state.next_funding_time_ms,
                     latest_funding_rate_e8: state.latest_funding_rate_e8,
-                    funding_flatten_deadline_ms: (self.strategy_variant
-                        != SimulationPolicyVariant::M8FundingAware)
+                    funding_flatten_deadline_ms: (!funding_controller_active)
                         .then(|| funding_flatten_deadline(state.next_funding_time_ms))
                         .flatten(),
-                    funding_action: format!("{:?}", funding_decision.action),
-                    funding_carry_bps: funding_decision.funding_carry_bps,
-                    funding_net_edge_bps: funding_decision.net_edge_bps,
-                    risk_state: risk_state.label().to_owned(),
-                    entry_block_reason: entry_block_reason.to_owned(),
+                    funding_action: if self.strategy_variant.uses_funding_controller()
+                        && !self.funding_controller_enabled
+                    {
+                        "Ablated".to_owned()
+                    } else {
+                        format!("{:?}", funding_decision.action)
+                    },
+                    funding_carry_bps: if funding_controller_active {
+                        funding_decision.funding_carry_bps
+                    } else {
+                        0
+                    },
+                    funding_net_edge_bps: if funding_controller_active {
+                        funding_decision.net_edge_bps
+                    } else {
+                        0
+                    },
+                    risk_state: labels.0.to_owned(),
+                    entry_block_reason: labels.1.to_owned(),
                     data_quality,
                     mark_age_ms,
                     bid_price_ticks,
@@ -1990,6 +2141,10 @@ impl SimulationEngine {
             symbols,
             history: Vec::new(),
             risk_metrics: None,
+            portfolio_drawdown: self
+                .portfolio_drawdown_guard
+                .as_ref()
+                .map(PortfolioDrawdownGuard::snapshot),
             calendar_snapshot: "sse-hkex-2026".to_owned(),
             maker_fee_source: "binance_usdm_base_maker_schedule".to_owned(),
             funding_model: "m8_exact_mark_settlement_plus_strategy_funding_controller".to_owned(),
@@ -1998,8 +2153,9 @@ impl SimulationEngine {
                 crate::execution::binance_wire::format_ticks(capital, self.price_scale)
             }),
             model_assumptions: ModelAssumptions {
-                fill_model: "local_depth_when_seeded_else_top_of_book_plus_aggregate_trade_queue"
-                    .to_owned(),
+                fill_model:
+                    "stateful_fifo_observed_depth_plus_synthetic_queue_then_aggregate_trade"
+                        .to_owned(),
                 queue_ahead: self.realism.queue.visible_ahead,
                 trade_through: self.realism.queue.trade_through,
                 market_to_decision_ms: self.realism.latency.market_to_decision_ms,
@@ -2265,7 +2421,6 @@ impl SimulationEngine {
         let symbol = trade.symbol.to_ascii_uppercase();
         let fee_ppm = self.fee_ppm;
         let quantity_scale = self.quantity_scale;
-        let realism = self.realism;
         let (quantity, order) = {
             let Some(state) = self.states.get_mut(&symbol) else {
                 return Vec::new();
@@ -2335,24 +2490,37 @@ impl SimulationEngine {
                     ask_quantity: book.ask_quantity,
                 }
             };
-            let fill_quantity = realism.evaluate_after_latency(
-                MakerQuote {
-                    side: order.side,
-                    price_ticks: order.price_ticks,
-                    quantity: order.remaining_quantity,
-                },
-                book,
-                trade.quantity.0,
-            );
-            let quantity = match fill_quantity {
-                crate::backtest::FillDecision::Fill { quantity } => quantity,
-                crate::backtest::FillDecision::NoFill => 0,
-            };
-            if quantity <= 0 {
+            // Consume FIFO queue state cumulatively across compatible trades. The
+            // previous model compared each aggregate trade independently against a
+            // fixed global queue threshold and ignored the observed per-order queue.
+            let mut updated_order = order;
+            let aggressed_quantity = trade.quantity.0.max(0);
+            let consumed_ahead = aggressed_quantity.min(updated_order.queue_ahead_remaining.max(0));
+            updated_order.queue_ahead_remaining = updated_order
+                .queue_ahead_remaining
+                .saturating_sub(consumed_ahead);
+            let executable_quantity = aggressed_quantity.saturating_sub(consumed_ahead);
+            if executable_quantity <= 0 {
+                state.working = Some(updated_order);
                 return Vec::new();
             }
-            let mut updated_order = order;
-            updated_order.remaining_quantity -= quantity;
+            // Queue and trade-through assumptions were incorporated once at order
+            // placement. After they are exhausted, cap the fill by currently
+            // displayed depth and remaining maker quantity without double-counting.
+            let displayed_depth = match order.side {
+                Side::Buy => book.bid_quantity,
+                Side::Sell => book.ask_quantity,
+            };
+            let quantity = executable_quantity
+                .min(displayed_depth.max(0))
+                .min(updated_order.remaining_quantity)
+                .max(0);
+            if quantity <= 0 {
+                state.working = Some(updated_order);
+                return Vec::new();
+            }
+            updated_order.remaining_quantity =
+                updated_order.remaining_quantity.saturating_sub(quantity);
             state.working = (updated_order.remaining_quantity > 0).then_some(updated_order);
             apply_position_fill(
                 state,
@@ -2514,6 +2682,7 @@ impl SimulationEngine {
             .map(|allocation| allocation.requested_quantity)
             .unwrap_or(self.requested_quantity);
         let strategy_variant = self.strategy_variant;
+        let portfolio_drawdown_action = self.observe_portfolio_drawdown();
         self.update_adaptive_threshold_controller(
             symbol,
             timestamp_ms,
@@ -2527,8 +2696,8 @@ impl SimulationEngine {
             };
             let session_allowed =
                 !self.live_risk_gates || simulation_session_allows_entry(symbol, timestamp_ms);
-            let funding_decision = (self.strategy_variant
-                == SimulationPolicyVariant::M8FundingAware)
+            let funding_controller_active = self.funding_controller_active();
+            let funding_decision = funding_controller_active
                 .then(|| m8_funding_decision(state, timestamp_ms, max_position, self.fee_ppm));
             // Funding is an incremental overlay. Neutral/zero funding delegates
             // admission back to the inherited M7 signal and risk layers.
@@ -2546,14 +2715,7 @@ impl SimulationEngine {
             });
             let funding_allowed = !self.live_risk_gates
                 || funding_decision.as_ref().map_or_else(
-                    || {
-                        funding_entry_allowed_variant(
-                            state,
-                            timestamp_ms,
-                            self.strategy_variant,
-                            self.fee_ppm,
-                        )
-                    },
+                    || self.funding_entry_allowed_for_strategy(state, timestamp_ms),
                     |decision| {
                         funding_overlay
                             .as_ref()
@@ -2566,22 +2728,32 @@ impl SimulationEngine {
             let funding_reduce_only = funding_overlay
                 .as_ref()
                 .is_some_and(|overlay| overlay.reduce_only);
-            let entries_allowed = session_allowed && funding_allowed;
+            let portfolio_reduce_only = portfolio_drawdown_action.blocks_new_risk();
+            let entries_allowed = session_allowed && funding_allowed && !portfolio_reduce_only;
             let tail_reduce_only = strategy_variant.uses_tail_guard() && m5_tail_reduce_only(state);
             if !entries_allowed || tail_reduce_only {
-                let should_reduce = position_requires_reduction(
-                    state.position,
-                    session_allowed,
-                    funding_allowed,
-                    funding_reduce_only,
-                    tail_reduce_only,
-                );
+                let should_reduce = (portfolio_reduce_only && state.position != 0)
+                    || position_requires_reduction(
+                        state.position,
+                        session_allowed,
+                        funding_allowed,
+                        funding_reduce_only,
+                        tail_reduce_only,
+                    );
                 if !should_reduce {
                     (
                         None,
                         true,
                         state.working.is_some(),
-                        entry_restriction_reason(state.position, session_allowed, funding_allowed),
+                        if portfolio_reduce_only {
+                            portfolio_drawdown_action.label()
+                        } else {
+                            entry_restriction_reason(
+                                state.position,
+                                session_allowed,
+                                funding_allowed,
+                            )
+                        },
                     )
                 } else {
                     let (desired, exit_reason) = maker_exit_intent_for_state(
@@ -2601,7 +2773,29 @@ impl SimulationEngine {
                     self.max_mark_index_gap_bps,
                     self.fee_ppm,
                 );
-                (intent, reduce_only, state.working.is_some(), reason)
+                let evidence_ok = reduce_only
+                    || dynamic_threshold_for(
+                        state,
+                        strategy_variant,
+                        self.strategy.entry_threshold_bps,
+                        self.fee_ppm,
+                        requested_quantity,
+                        max_position,
+                        timestamp_ms,
+                    )
+                    .map(|value| scale_threshold_non_fee(value, self.threshold_scale_ppm))
+                    .and_then(|value| value.required_pico_bps())
+                    .is_some_and(|value| {
+                        m7_entry_admissible(
+                            state,
+                            value.saturating_sub(state.adaptive_relief_pico_bps),
+                        )
+                    });
+                if intent.is_some() && !evidence_ok {
+                    (None, false, state.working.is_some(), "m7_evidence_gate")
+                } else {
+                    (intent, reduce_only, state.working.is_some(), reason)
+                }
             } else {
                 let mark_index_ok = match (state.mark_price_ticks, state.index_price_ticks) {
                     (Some(mark), Some(index)) => {
@@ -2660,7 +2854,7 @@ impl SimulationEngine {
                         .and_then(|value| value.required_pico_bps())
                         .map(|required| required.saturating_sub(state.adaptive_relief_pico_bps))
                         .unwrap_or(0);
-                    let m7_blocked = strategy_variant == SimulationPolicyVariant::M7EvidenceGated
+                    let m7_blocked = strategy_variant.uses_evidence_gate()
                         && !m7_entry_admissible(state, m7_required_pico_bps);
                     let intent = if strategy_variant == SimulationPolicyVariant::M0Fixed {
                         if m7_blocked {
@@ -2748,7 +2942,7 @@ impl SimulationEngine {
                     };
                     let reason = if intent.is_some() {
                         "admissible"
-                    } else if strategy_variant == SimulationPolicyVariant::M7EvidenceGated {
+                    } else if strategy_variant.uses_evidence_gate() {
                         "m7_evidence_gate"
                     } else {
                         "signal_below_threshold"
@@ -2920,16 +3114,21 @@ impl SimulationEngine {
         }
         let mid_ticks = book.bid_price_ticks.saturating_add(book.ask_price_ticks) / 2;
         let quote_distance_bps = bps_between(intent.price, mid_ticks);
-        let queue_ahead_quantity = if state.local_book.is_valid() {
+        // A new maker order joins behind the observable resting quantity at its
+        // price. With no seeded local depth (legacy/simple replay), only explicit
+        // synthetic queue assumptions are applied; we do not pretend top-of-book
+        // size is a fully reconstructed FIFO queue.
+        let observed_queue_ahead = if state.local_book.is_valid() {
             state
                 .local_book
                 .quantity_at(intent.side == Side::Buy, intent.price)
+                .max(0)
         } else {
-            match intent.side {
-                Side::Buy => book.bid_quantity.max(0),
-                Side::Sell => book.ask_quantity.max(0),
-            }
+            0
         };
+        let queue_ahead_quantity = observed_queue_ahead
+            .saturating_add(self.realism.queue.visible_ahead.max(0))
+            .saturating_add(self.realism.queue.trade_through.max(0));
         state.working = Some(WorkingOrder {
             client_id,
             decision_id,
@@ -2938,6 +3137,7 @@ impl SimulationEngine {
             remaining_quantity: intent.quantity,
             reduce_only,
             queue_ahead_quantity,
+            queue_ahead_remaining: queue_ahead_quantity,
             quote_distance_bps,
             placed_at_ms: timestamp_ms,
             exchange_arrival_at_ms: self
@@ -3614,7 +3814,7 @@ fn funding_entry_allowed_variant(
     variant: SimulationPolicyVariant,
     fee_ppm: i64,
 ) -> bool {
-    if variant != SimulationPolicyVariant::M8FundingAware {
+    if !variant.uses_funding_controller() {
         return funding_entry_allowed(state, now_ms);
     }
     m8_funding_decision(
@@ -4486,6 +4686,10 @@ fn apply_position_fill(
         Side::Buy => quantity,
         Side::Sell => -quantity,
     };
+    let notional = i128::from(price_ticks).abs() * i128::from(quantity).abs();
+    let fill_fee_ticks = clamp_i128(
+        notional * i128::from(fee_ppm) / 1_000_000 / quantity_scale_multiplier(quantity_scale),
+    );
     let execution_alpha = state.mark_price_ticks.map(|mark| match side {
         Side::Buy => i128::from(mark) - i128::from(price_ticks),
         Side::Sell => i128::from(price_ticks) - i128::from(mark),
@@ -4494,9 +4698,10 @@ fn apply_position_fill(
         let alpha_ticks = alpha * i128::from(quantity) / quantity_scale_multiplier(quantity_scale);
         let alpha_ticks = clamp_i128(alpha_ticks);
         state.strategy_pnl_ticks = state.strategy_pnl_ticks.saturating_add(alpha_ticks);
-        if alpha_ticks > 0 {
+        let fee_adjusted_alpha = alpha_ticks.saturating_sub(fill_fee_ticks);
+        if fee_adjusted_alpha > 0 {
             state.winning_fills = state.winning_fills.saturating_add(1);
-        } else if alpha_ticks < 0 {
+        } else if fee_adjusted_alpha < 0 {
             state.losing_fills = state.losing_fills.saturating_add(1);
         }
     }
@@ -4529,10 +4734,7 @@ fn apply_position_fill(
         }
     }
     state.position = clamp_i128(i128::from(old_position) + i128::from(delta));
-    let notional = i128::from(price_ticks).abs() * i128::from(quantity).abs();
-    state.fees_ticks = state.fees_ticks.saturating_add(clamp_i128(
-        notional * i128::from(fee_ppm) / 1_000_000 / quantity_scale_multiplier(quantity_scale),
-    ));
+    state.fees_ticks = state.fees_ticks.saturating_add(fill_fee_ticks);
 }
 
 fn quantity_scale_multiplier(quantity_scale: u32) -> i128 {
@@ -4847,7 +5049,7 @@ pub async fn run_simulation(
                         let observed_at_ms = now_ms();
                         let point = engine.performance_point(observed_at_ms);
                         performance_history.push_back(point.clone());
-                        push_risk_history_point(&mut risk_history, point, false);
+                        append_risk_history_sample(&mut risk_history, point, false);
                         while performance_history.len() > DISPLAY_HISTORY_CAPACITY {
                             performance_history.pop_front();
                         }
@@ -4945,7 +5147,7 @@ pub async fn run_simulation(
         let observed_at_ms = now_ms();
         let point = engine.performance_point(observed_at_ms);
         performance_history.push_back(point.clone());
-        push_risk_history_point(&mut risk_history, point, true);
+        append_risk_history_sample(&mut risk_history, point, true);
         while performance_history.len() > DISPLAY_HISTORY_CAPACITY {
             performance_history.pop_front();
         }
@@ -5011,128 +5213,74 @@ pub async fn run_simulation(
 }
 
 const DISPLAY_HISTORY_CAPACITY: usize = 900;
-const RISK_SAMPLE_INTERVAL_MS: u64 = 30_000;
-const RISK_HISTORY_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+pub(crate) const RISK_HISTORY_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 const RISK_HISTORY_CAPACITY: usize =
-    (RISK_HISTORY_RETENTION_MS / RISK_SAMPLE_INTERVAL_MS) as usize + 2;
-const MIN_RISK_RETURN_SAMPLES: usize = 30;
+    (RISK_HISTORY_WINDOW_MS / RISK_SAMPLE_INTERVAL_MS) as usize + 2;
 
-fn push_risk_history_point(
+/// Store statistically independent risk samples instead of every metrics tick.
+/// `force_final` replaces a sub-interval tail sample so shutdown/fold-end PnL is
+/// reflected without creating a spuriously tiny return interval.
+pub(crate) fn append_risk_history_sample(
     history: &mut VecDeque<PerformancePoint>,
     point: PerformancePoint,
-    force_endpoint: bool,
+    force_final: bool,
 ) {
-    if history
-        .back()
-        .is_some_and(|last| last.observed_at_ms == point.observed_at_ms)
-    {
-        history.pop_back();
-        history.push_back(point);
-    } else if force_endpoint
-        || history.back().is_none_or(|last| {
-            point.observed_at_ms.saturating_sub(last.observed_at_ms) >= RISK_SAMPLE_INTERVAL_MS
-        })
-    {
-        history.push_back(point);
+    match history.back() {
+        None => history.push_back(point),
+        Some(last)
+            if point.observed_at_ms.saturating_sub(last.observed_at_ms)
+                >= RISK_SAMPLE_INTERVAL_MS =>
+        {
+            history.push_back(point);
+        }
+        Some(_) if force_final => {
+            if let Some(last) = history.back_mut() {
+                *last = point;
+            }
+        }
+        Some(_) => {}
     }
     while history.len() > RISK_HISTORY_CAPACITY {
         history.pop_front();
     }
 }
 
-fn calculate_risk_metrics(points: &[(u64, i64)], capital_ticks: i64) -> RiskMetrics {
-    let capital = capital_ticks.max(1) as f64;
-    let baseline_pnl_ticks = points.first().map(|(_, pnl)| *pnl).unwrap_or(0);
-    let total_return_pct = points
-        .last()
-        .map(|(_, pnl)| (pnl.saturating_sub(baseline_pnl_ticks) as f64 / capital) * 100.0)
-        .unwrap_or(0.0);
-    let mut max_drawdown_pct = 0.0_f64;
-    let mut peak_equity = 1.0_f64;
-    for (_, pnl) in points {
-        let window_pnl_ticks = pnl.saturating_sub(baseline_pnl_ticks);
-        let equity = 1.0 + (window_pnl_ticks as f64 / capital);
-        peak_equity = peak_equity.max(equity);
-        if peak_equity > 0.0 {
-            max_drawdown_pct = max_drawdown_pct.max((peak_equity - equity) / peak_equity * 100.0);
+#[cfg(test)]
+mod risk_window_regression_tests {
+    use super::*;
+
+    fn point(timestamp_ms: u64, pnl: i64) -> PerformancePoint {
+        PerformancePoint {
+            observed_at_ms: timestamp_ms,
+            market_pnl_ticks: pnl,
+            strategy_pnl_ticks: 0,
+            funding_pnl_ticks: 0,
+            fees_ticks: 0,
+            gross_pnl_ticks: pnl,
+            net_pnl_ticks: pnl,
+            current_absolute_position: 0,
+            symbols: Vec::new(),
         }
     }
 
-    let mut sampled_points = Vec::with_capacity(points.len());
-    for point in points.iter().copied() {
-        if sampled_points.last().is_none_or(|last: &(u64, i64)| {
-            point.0.saturating_sub(last.0) >= RISK_SAMPLE_INTERVAL_MS
-        }) {
-            sampled_points.push(point);
-        }
+    #[test]
+    fn risk_history_is_downsampled_and_keeps_the_fold_end() {
+        let mut history = VecDeque::new();
+        append_risk_history_sample(&mut history, point(0, 100), false);
+        append_risk_history_sample(&mut history, point(1_000, 101), false);
+        append_risk_history_sample(&mut history, point(30_000, 102), false);
+        append_risk_history_sample(&mut history, point(31_000, 103), true);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history.front().unwrap().observed_at_ms, 0);
+        assert_eq!(history.back().unwrap().observed_at_ms, 31_000);
+        assert_eq!(history.back().unwrap().net_pnl_ticks, 103);
     }
-    let mut returns = Vec::with_capacity(sampled_points.len().saturating_sub(1));
-    let mut observed_seconds = 0.0_f64;
-    for pair in sampled_points.windows(2) {
-        let dt = (pair[1].0.saturating_sub(pair[0].0) as f64 / 1_000.0).max(0.001);
-        observed_seconds += dt;
-        returns.push((pair[1].1.saturating_sub(pair[0].1)) as f64 / capital);
-    }
-    let sample_count = returns.len();
-    let mean = if sample_count == 0 {
-        0.0
-    } else {
-        returns.iter().sum::<f64>() / sample_count as f64
-    };
-    let variance = if sample_count > 1 {
-        returns
-            .iter()
-            .map(|value| (value - mean).powi(2))
-            .sum::<f64>()
-            / (sample_count - 1) as f64
-    } else {
-        0.0
-    };
-    let standard_deviation = variance.sqrt();
-    let downside_deviation = if sample_count == 0 {
-        0.0
-    } else {
-        (returns
-            .iter()
-            .map(|value| if *value < 0.0 { value.powi(2) } else { 0.0 })
-            .sum::<f64>()
-            / sample_count as f64)
-            .sqrt()
-    };
-    let annualization = if sample_count > 0 && observed_seconds > 0.0 {
-        (365.0 * 24.0 * 60.0 * 60.0 / (observed_seconds / sample_count as f64)).sqrt()
-    } else {
-        0.0
-    };
-    let positive = returns.iter().filter(|value| **value > 0.0).count();
-    let gross_profit = returns.iter().filter(|value| **value > 0.0).sum::<f64>();
-    let gross_loss = returns
-        .iter()
-        .filter(|value| **value < 0.0)
-        .map(|value| value.abs())
-        .sum::<f64>();
 
-    RiskMetrics {
-        status: if sample_count >= MIN_RISK_RETURN_SAMPLES {
-            "ok".to_owned()
-        } else {
-            "insufficient_history".to_owned()
-        },
-        sample_count,
-        observed_seconds,
-        total_return_pct,
-        max_drawdown_pct,
-        win_rate_pct: if sample_count == 0 {
-            0.0
-        } else {
-            positive as f64 / sample_count as f64 * 100.0
-        },
-        average_return_bps: mean * 10_000.0,
-        profit_factor: (gross_loss > 0.0).then_some(gross_profit / gross_loss),
-        sharpe_ratio: (sample_count >= MIN_RISK_RETURN_SAMPLES && standard_deviation > 0.0)
-            .then_some(mean / standard_deviation * annualization),
-        sortino_ratio: (sample_count >= MIN_RISK_RETURN_SAMPLES && downside_deviation > 0.0)
-            .then_some(mean / downside_deviation * annualization),
+    #[test]
+    fn risk_metrics_are_relative_to_the_retained_window() {
+        let metrics = calculate_risk_metrics(&[(0, 1_000), (30_000, 1_100)], 10_000);
+        assert!((metrics.total_return_pct - 1.0).abs() < 1e-9);
+        assert!((metrics.max_drawdown_pct - 0.0).abs() < 1e-9);
     }
 }
 
@@ -5145,7 +5293,37 @@ fn event_symbol(event: &BinanceMarketEvent) -> &str {
     }
 }
 
-// The explicit arguments keep replay assumptions visible and deterministic.
+// Legacy wrappers preserve the stable replay API. New research and OOS
+// validation should use ReplayConfig so strategy and execution assumptions are
+// carried by one auditable object.
+pub use super::replay_config::ReplayConfig;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplayEvaluation {
+    pub summary: SimulationSummary,
+    pub risk_metrics: Option<RiskMetrics>,
+    pub risk_samples: usize,
+    pub calibration_snapshots: BTreeMap<String, CalibrationSnapshot>,
+}
+
+fn validate_calibration_seed_horizon(
+    seeds: &BTreeMap<String, CalibrationState>,
+    replay_start_ms: u64,
+) -> Result<(), SimulationError> {
+    let seed_ms = seeds
+        .values()
+        .map(|seed| seed.last_event_time_ms)
+        .max()
+        .unwrap_or(0);
+    if seed_ms != 0 && seed_ms >= replay_start_ms {
+        return Err(SimulationError::CalibrationSeedNotPrior {
+            seed_ms,
+            replay_ms: replay_start_ms,
+        });
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn replay_jsonl(
     input_path: &Path,
@@ -5191,19 +5369,94 @@ pub fn replay_jsonl_with_realism(
     fee_ppm: i64,
     realism: crate::backtest::realism::RealisticFillModel,
 ) -> Result<SimulationSummary, SimulationError> {
+    replay_jsonl_with_config(
+        input_path,
+        output_path,
+        anchors,
+        ReplayConfig {
+            price_scale,
+            quantity_scale,
+            entry_threshold_bps,
+            max_position,
+            requested_quantity,
+            max_mark_index_gap_bps,
+            max_anchor_age_ms,
+            fee_ppm,
+            realism,
+            strategy_variant: SimulationPolicyVariant::M0Fixed,
+            threshold_scale_ppm: 1_000_000,
+            quote_reprice_min_interval_ms: 0,
+            dynamic_capital_refresh_ms: 60_000,
+            live_risk_gates: false,
+            funding_controller_enabled: true,
+            capital_usdt_ticks: None,
+            portfolio_drawdown_limits_bps: None,
+            calibration_updates_enabled: true,
+            calibration_seeds: BTreeMap::new(),
+        },
+    )
+    .map(|evaluation| evaluation.summary)
+}
+
+pub fn replay_jsonl_with_config(
+    input_path: &Path,
+    output_path: Option<&Path>,
+    anchors: BTreeMap<String, AnchorSnapshot>,
+    config: ReplayConfig,
+) -> Result<ReplayEvaluation, SimulationError> {
+    if config.threshold_scale_ppm <= 0
+        || config.threshold_scale_ppm > 1_000_000
+        || config.dynamic_capital_refresh_ms == 0
+        || config
+            .capital_usdt_ticks
+            .is_some_and(|capital| capital <= 0)
+        || (!config.funding_controller_enabled
+            && !config.strategy_variant.uses_funding_controller())
+    {
+        return Err(SimulationError::InvalidConfig(
+            "invalid replay policy configuration",
+        ));
+    }
+    let allocations = config
+        .capital_usdt_ticks
+        .map(|capital| {
+            allocate_positions(&anchors, capital, &BTreeMap::new(), config.quantity_scale)
+        })
+        .transpose()?;
     let mut engine = SimulationEngine::new(
         anchors,
-        entry_threshold_bps,
-        max_position,
-        requested_quantity,
-        max_mark_index_gap_bps,
-        max_anchor_age_ms,
-        fee_ppm,
-        quantity_scale,
+        config.entry_threshold_bps,
+        config.max_position,
+        config.requested_quantity,
+        config.max_mark_index_gap_bps,
+        config.max_anchor_age_ms,
+        config.fee_ppm,
+        config.quantity_scale,
     )?
-    .with_price_scale(price_scale)
-    .with_strategy_variant(SimulationPolicyVariant::M0Fixed)
-    .with_realism(realism);
+    .with_price_scale(config.price_scale)
+    .with_strategy_variant(config.strategy_variant)
+    .with_funding_controller_enabled(config.funding_controller_enabled)
+    .with_realism(config.realism)
+    .with_threshold_scale_ppm(config.threshold_scale_ppm)
+    .with_quote_reprice_min_interval_ms(config.quote_reprice_min_interval_ms)
+    .with_dynamic_capital_refresh_ms(config.dynamic_capital_refresh_ms);
+    if config.live_risk_gates {
+        engine = engine.with_live_risk_gates();
+    }
+    engine.restore_calibration_states(&config.calibration_seeds);
+    engine.set_calibration_updates_enabled(config.calibration_updates_enabled);
+    if let Some(allocations) = allocations {
+        engine = engine.with_position_allocations(allocations)?;
+    }
+    if let Some((soft, hard)) = config.portfolio_drawdown_limits_bps {
+        let capital = config
+            .capital_usdt_ticks
+            .ok_or(SimulationError::InvalidConfig(
+                "drawdown limits require capital",
+            ))?;
+        engine = engine.with_portfolio_drawdown_limits_bps(capital, soft, hard)?;
+    }
+
     let reader = BufReader::new(File::open(input_path)?);
     if let Some(parent) = output_path
         .and_then(Path::parent)
@@ -5216,6 +5469,9 @@ pub fn replay_jsonl_with_realism(
         .transpose()?;
     let mut previous_ms = None;
     let mut event_sequence = 0_u64;
+    let mut last_risk_sample_ms = None;
+    let mut risk_points = Vec::<(u64, i64)>::new();
+
     for (index, line) in reader.lines().enumerate() {
         let line_number = index + 1;
         let line = line?;
@@ -5244,8 +5500,8 @@ pub fn replay_jsonl_with_realism(
             });
         let event = crate::market::binance::parse_market_message(
             payload.as_bytes(),
-            price_scale,
-            quantity_scale,
+            config.price_scale,
+            config.quantity_scale,
         )
         .map_err(|error| SimulationError::ReplayParse {
             line: line_number,
@@ -5255,13 +5511,11 @@ pub fn replay_jsonl_with_realism(
         if !engine.states.contains_key(&symbol) {
             return Err(SimulationError::ReplaySymbolNotConfigured(symbol));
         }
-        let event_timestamp_ms = match &event {
-            BinanceMarketEvent::BookTicker(value) => value.event_time_ms,
-            BinanceMarketEvent::MarkPrice(value) => value.event_time_ms,
-            BinanceMarketEvent::AggTrade(value) => value.event_time_ms,
-            BinanceMarketEvent::DepthUpdate(value) => value.event_time_ms,
-        };
+        let event_timestamp_ms = event_time_ms(&event);
         let timestamp_ms = received_at_ms.unwrap_or(event_timestamp_ms);
+        if previous_ms.is_none() {
+            validate_calibration_seed_horizon(&config.calibration_seeds, timestamp_ms)?;
+        }
         if previous_ms.is_some_and(|previous| timestamp_ms < previous) {
             return Err(SimulationError::ReplayOutOfOrder {
                 previous_ms: previous_ms.unwrap(),
@@ -5288,9 +5542,16 @@ pub fn replay_jsonl_with_realism(
                 output.write_all(b"\n")?;
             }
         }
+        if config.capital_usdt_ticks.is_some()
+            && last_risk_sample_ms
+                .is_none_or(|last| timestamp_ms.saturating_sub(last) >= RISK_SAMPLE_INTERVAL_MS)
+        {
+            let point = engine.performance_point(timestamp_ms);
+            risk_points.push((timestamp_ms, point.net_pnl_ticks));
+            last_risk_sample_ms = Some(timestamp_ms);
+        }
     }
-    // A replay window cannot assume an order remains live after its last event.
-    // Cancel working quotes at EOF, but never synthesize a position flatten fill.
+
     let final_timestamp_ms = previous_ms.unwrap_or(0);
     for record in engine.cancel_all(final_timestamp_ms, "replay window ended") {
         if let Some(output) = output.as_mut() {
@@ -5301,7 +5562,24 @@ pub fn replay_jsonl_with_realism(
     if let Some(output) = output.as_mut() {
         output.flush()?;
     }
-    Ok(engine.summary())
+    let summary = engine.summary();
+    if config.capital_usdt_ticks.is_some() {
+        match risk_points.last_mut() {
+            Some(last) if last.0 == final_timestamp_ms => last.1 = summary.net_pnl_ticks,
+            _ => risk_points.push((final_timestamp_ms, summary.net_pnl_ticks)),
+        }
+    }
+    let risk_metrics = config
+        .capital_usdt_ticks
+        .map(|capital| calculate_risk_metrics(&risk_points, capital));
+    let calibration_snapshots =
+        engine.calibration_snapshots(ppm_to_pico_bps(config.fee_ppm.saturating_mul(2)));
+    Ok(ReplayEvaluation {
+        summary,
+        risk_metrics,
+        risk_samples: risk_points.len(),
+        calibration_snapshots,
+    })
 }
 
 fn now_ms() -> u64 {
@@ -5391,6 +5669,44 @@ mod tests {
     }
 
     #[test]
+    fn latency_rejected_trade_does_not_consume_queue() {
+        let mut engine = engine().with_realism(crate::backtest::realism::RealisticFillModel {
+            queue: crate::backtest::realism::QueueModel {
+                visible_ahead: 2,
+                trade_through: 0,
+            },
+            latency: crate::backtest::realism::LatencyModel {
+                market_to_decision_ms: 5,
+                decision_to_exchange_ms: 5,
+                cancel_to_exchange_ms: 0,
+            },
+        });
+        feed(
+            &mut engine,
+            br#"{"e":"markPriceUpdate","E":1,"s":"CXMTUSDT","p":"100","i":"100","T":600000,"r":"0"}"#,
+        );
+        feed(
+            &mut engine,
+            br#"{"e":"bookTicker","u":1,"E":2,"T":2,"s":"CXMTUSDT","b":"98","B":"10","a":"99","A":"10"}"#,
+        );
+        let early = feed(
+            &mut engine,
+            br#"{"e":"aggTrade","E":4,"s":"CXMTUSDT","a":1,"p":"98","q":"2","T":4,"m":true}"#,
+        );
+        assert!(early.is_empty());
+        let at_exchange = feed(
+            &mut engine,
+            br#"{"e":"aggTrade","E":12,"s":"CXMTUSDT","a":2,"p":"98","q":"2","T":12,"m":true}"#,
+        );
+        assert!(at_exchange.is_empty());
+        let through = feed(
+            &mut engine,
+            br#"{"e":"aggTrade","E":13,"s":"CXMTUSDT","a":3,"p":"98","q":"1","T":13,"m":true}"#,
+        );
+        assert_eq!(through[0].quantity, Some(1));
+    }
+
+    #[test]
     fn exchange_arrival_uses_local_receipt_time_not_exchange_event_time() {
         let mut engine = engine().with_realism(crate::backtest::realism::RealisticFillModel {
             queue: crate::backtest::realism::QueueModel::default(),
@@ -5430,6 +5746,42 @@ mod tests {
         .unwrap();
         assert_eq!(engine.on_event_at_ref(&available, 3_020).len(), 1);
         assert_eq!(engine.summary().current_absolute_position, 3);
+    }
+
+    #[test]
+    fn observed_queue_is_consumed_across_multiple_compatible_trades() {
+        let mut engine = engine();
+        engine
+            .load_depth_snapshot("CXMTUSDT", 10, &[(98, 5)], &[(99, 10)])
+            .unwrap();
+        feed(
+            &mut engine,
+            br#"{"e":"markPriceUpdate","E":1,"s":"CXMTUSDT","p":"100","i":"100","T":600000,"r":"0"}"#,
+        );
+        let placed = feed(
+            &mut engine,
+            br#"{"e":"bookTicker","u":1,"E":2,"T":2,"s":"CXMTUSDT","b":"98","B":"5","a":"99","A":"10"}"#,
+        );
+        let order = placed
+            .iter()
+            .find(|record| record.kind == "order_placed")
+            .unwrap();
+        assert_eq!(order.queue_ahead_quantity, Some(5));
+
+        let first = feed(
+            &mut engine,
+            br#"{"e":"aggTrade","E":3,"s":"CXMTUSDT","a":1,"p":"98","q":"3","T":3,"m":true}"#,
+        );
+        assert!(first.is_empty());
+        assert_eq!(engine.summary().current_absolute_position, 0);
+
+        let second = feed(
+            &mut engine,
+            br#"{"e":"aggTrade","E":4,"s":"CXMTUSDT","a":2,"p":"98","q":"3","T":4,"m":true}"#,
+        );
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].quantity, Some(1));
+        assert_eq!(engine.summary().current_absolute_position, 1);
     }
 
     #[test]
@@ -5512,38 +5864,6 @@ mod tests {
     }
 
     #[test]
-    fn risk_history_uses_independent_sampling_and_forced_endpoint() {
-        let point = |observed_at_ms, net_pnl_ticks| PerformancePoint {
-            observed_at_ms,
-            market_pnl_ticks: net_pnl_ticks,
-            strategy_pnl_ticks: 0,
-            funding_pnl_ticks: 0,
-            fees_ticks: 0,
-            gross_pnl_ticks: net_pnl_ticks,
-            net_pnl_ticks,
-            current_absolute_position: 0,
-            symbols: Vec::new(),
-        };
-        let mut history = VecDeque::new();
-        push_risk_history_point(&mut history, point(0, 100), false);
-        push_risk_history_point(&mut history, point(1_000, 101), false);
-        assert_eq!(history.len(), 1);
-        push_risk_history_point(&mut history, point(30_000, 102), false);
-        assert_eq!(history.len(), 2);
-        push_risk_history_point(&mut history, point(31_000, 103), true);
-        assert_eq!(history.len(), 3);
-        assert_eq!(history.back().unwrap().net_pnl_ticks, 103);
-    }
-
-    #[test]
-    fn rolling_risk_metrics_normalize_to_window_start() {
-        let points = vec![(0, 1_000), (30_000, 1_100), (60_000, 1_200)];
-        let metrics = calculate_risk_metrics(&points, 10_000);
-        assert!((metrics.total_return_pct - 2.0).abs() < 1e-9);
-        assert!(metrics.max_drawdown_pct.abs() < 1e-9);
-    }
-
-    #[test]
     fn summary_includes_mark_to_market_for_open_position() {
         let mut engine = engine();
         feed(
@@ -5622,6 +5942,60 @@ mod tests {
             Err(SimulationError::ReplaySymbolNotConfigured(symbol)) if symbol == "XYZUSDT"
         ));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn allocator_performance_penalty_uses_stable_scale() {
+        assert_eq!(
+            SimulationEngine::stable_post_fee_loss_bps(-50, 10, 10_000),
+            50
+        );
+        assert_eq!(
+            SimulationEngine::stable_post_fee_loss_bps(-50, 10, 20_000),
+            25
+        );
+        assert_eq!(
+            SimulationEngine::stable_post_fee_loss_bps(-50, 9, 10_000),
+            0
+        );
+    }
+
+    #[test]
+    fn fee_efficiency_penalty_is_ratio_based_not_runtime_accumulation() {
+        let short = SimulationEngine::fee_efficiency_penalty_bps(1_000, 200, 10);
+        let long = SimulationEngine::fee_efficiency_penalty_bps(10_000, 2_000, 100);
+        assert_eq!(short, 20);
+        assert_eq!(short, long);
+        assert_eq!(
+            SimulationEngine::fee_efficiency_penalty_bps(-1, 200, 100),
+            0
+        );
+    }
+
+    #[test]
+    fn m9_inherits_m7_and_m8_capabilities() {
+        let variant = SimulationPolicyVariant::M9DeadlineCausalDroMpc;
+        assert!(variant.uses_evidence_gate());
+        assert!(variant.uses_funding_controller());
+        assert!(engine()
+            .with_strategy_variant(variant)
+            .funding_controller_active());
+    }
+
+    #[test]
+    fn dynamic_allocation_deadband_ignores_sub_percent_noise() {
+        assert_eq!(
+            SimulationEngine::allocation_budget_change_bps(2_000, 2_050, 10_000),
+            50
+        );
+        assert_eq!(
+            SimulationEngine::allocation_budget_change_bps(2_000, 2_200, 10_000),
+            200
+        );
+        assert!(
+            SimulationEngine::allocation_budget_change_bps(2_000, 2_050, 10_000)
+                < SimulationEngine::DYNAMIC_ALLOCATION_REBALANCE_DEADBAND_BPS
+        );
     }
 
     #[test]
@@ -5895,5 +6269,26 @@ mod tests {
             .records
             .iter()
             .any(|record| record.kind == "order_placed"));
+    }
+}
+
+#[cfg(test)]
+mod walkforward_regression_tests {
+    use super::*;
+
+    #[test]
+    fn calibration_seed_must_strictly_precede_oos_replay() {
+        let mut seed = CalibrationState::new("TEST");
+        seed.last_event_time_ms = 100;
+        let seeds = BTreeMap::from([("TEST".to_owned(), seed)]);
+        assert!(matches!(
+            validate_calibration_seed_horizon(&seeds, 100),
+            Err(SimulationError::CalibrationSeedNotPrior { .. })
+        ));
+        assert!(matches!(
+            validate_calibration_seed_horizon(&seeds, 99),
+            Err(SimulationError::CalibrationSeedNotPrior { .. })
+        ));
+        assert!(validate_calibration_seed_horizon(&seeds, 101).is_ok());
     }
 }

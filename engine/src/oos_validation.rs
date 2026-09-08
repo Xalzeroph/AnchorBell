@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OosFoldMetrics {
@@ -237,6 +238,61 @@ pub fn compare_robust_candidates(
                 .median_fee_drag_bps
                 .total_cmp(&left.median_fee_drag_bps)
         })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OosFoldBundle {
+    pub candidate_id: String,
+    pub folds: Vec<OosFoldMetrics>,
+}
+
+pub fn validate_candidate_fold_coverage(
+    candidates: &BTreeMap<String, Vec<OosFoldMetrics>>,
+) -> Result<(), String> {
+    if candidates.is_empty() {
+        return Err("candidate list cannot be empty".to_owned());
+    }
+    for (candidate_id, folds) in candidates {
+        if candidate_id.trim().is_empty() {
+            return Err("candidate id cannot be empty".to_owned());
+        }
+        if folds.is_empty() {
+            return Err(format!("candidate {candidate_id} has no folds"));
+        }
+        let mut ids = BTreeSet::new();
+        for fold in folds {
+            if !fold.valid() {
+                return Err(format!("candidate {candidate_id} contains invalid fold"));
+            }
+            if !ids.insert(fold.fold_id.as_str()) {
+                return Err(format!(
+                    "candidate {candidate_id} contains duplicate fold {}",
+                    fold.fold_id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn merge_fold_bundles(
+    bundles: &[OosFoldBundle],
+) -> Result<BTreeMap<String, Vec<OosFoldMetrics>>, String> {
+    if bundles.is_empty() {
+        return Err("fold bundle list cannot be empty".to_owned());
+    }
+    let mut merged = BTreeMap::<String, Vec<OosFoldMetrics>>::new();
+    for bundle in bundles {
+        if bundle.candidate_id.trim().is_empty() {
+            return Err("fold bundle candidate id cannot be empty".to_owned());
+        }
+        merged
+            .entry(bundle.candidate_id.clone())
+            .or_default()
+            .extend(bundle.folds.clone());
+    }
+    validate_candidate_fold_coverage(&merged)?;
+    Ok(merged)
 }
 
 #[cfg(test)]
