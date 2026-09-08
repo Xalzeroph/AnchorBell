@@ -16,6 +16,20 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
 simulation = SIMULATION.read_text(encoding="utf-8")
 runtime = RUNTIME.read_text(encoding="utf-8")
 
+# The validated integration may already be committed in its source-budget compacted
+# form. Treat that state as complete instead of trying to recreate the pre-compact
+# method body byte-for-byte.
+if (
+    'pub mod portfolio_guard;' in simulation
+    and 'portfolio_drawdown_guard: Option<PortfolioDrawdownGuard>' in runtime
+    and 'pub fn with_portfolio_drawdown_limits_bps(' in runtime
+    and 'let portfolio_drawdown_action = if strategy_variant.uses_tail_guard()' in runtime
+    and 'portfolio_drawdown_action.blocks_new_risk()' in runtime
+    and 'pub portfolio_drawdown: Option<PortfolioDrawdownSnapshot>' in runtime
+):
+    print("portfolio drawdown runtime integration already present")
+    raise SystemExit(0)
+
 simulation = replace_once(
     simulation,
     '#[path = "simulation/orchestration.rs"]\npub mod orchestration;\n',
