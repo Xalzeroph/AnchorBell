@@ -35,7 +35,18 @@ jobs:
         run: python3 .github/scripts/anchorbell_calibration_store_roundtrip_fix.py
 
       - name: Expose portfolio drawdown controls
-        run: python3 .github/scripts/anchorbell_drawdown_config_surface_fix.py
+        shell: bash
+        run: |
+          if grep -q 'pub portfolio_drawdown_limits_bps: Option<(i64, i64)>' engine/src/simulation/replay_config.rs \
+            && grep -q 'portfolio_drawdown_soft_limit_bps' engine/src/bin/anchorbell_backtest.rs \
+            && grep -q 'pub portfolio_drawdown_soft_limit_bps: i64' engine/src/simulation_batch.rs \
+            && grep -q 'pub portfolio_drawdown_hard_limit_bps: i64' engine/src/simulation_batch.rs \
+            && grep -q 'pub portfolio_drawdown_soft_limit_bps: i64' engine/src/strategy/config.rs \
+            && grep -q 'profile.portfolio_drawdown_soft_limit_bps' engine/src/bin/anchorbell_simulation_batch.rs; then
+            echo "portfolio drawdown config surface already present"
+          else
+            python3 .github/scripts/anchorbell_drawdown_config_surface_fix.py
+          fi
 
       - name: Extract replay configuration module
         run: python3 .github/scripts/anchorbell_replay_config_module_fix.py
