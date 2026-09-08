@@ -250,6 +250,17 @@ batch = replace_once(
         "validation_fold_id": config.validation_fold_id,''',
     "batch drawdown manifest",
 )
+# Existing test fixtures must preserve the disabled 0/0 default when the config gains fields.
+batch = replace_once(
+    batch,
+    '''            position_allocations: Some(BTreeMap::new()),
+            output_root: PathBuf::from("target/test-stress"),''',
+    '''            position_allocations: Some(BTreeMap::new()),
+            portfolio_drawdown_soft_limit_bps: 0,
+            portfolio_drawdown_hard_limit_bps: 0,
+            output_root: PathBuf::from("target/test-stress"),''',
+    "stress fixture drawdown defaults",
+)
 
 # Backward-compatible profile surface: schema remains v2; missing fields default to disabled.
 profile = replace_once(
