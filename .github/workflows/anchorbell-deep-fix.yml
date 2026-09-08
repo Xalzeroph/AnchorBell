@@ -25,11 +25,8 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Apply authoritative strategy-profile migration
-        run: python3 .github/scripts/anchorbell_strategy_profile_fix.py
-
-      - name: Repair Rust 1.98 profile CLI inference
-        run: python3 .github/scripts/anchorbell_strategy_profile_compile_fix.py
+      - name: Apply profile lineage and M9 source repair
+        run: python3 .github/scripts/anchorbell_profile_lineage_fix.py
 
       - name: Format
         run: cargo fmt --all
@@ -59,10 +56,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add engine/src/strategy/config.rs \
-                  engine/src/strategy/mod.rs \
-                  engine/src/simulation_batch.rs \
-                  engine/src/bin/anchorbell_simulation_batch.rs \
-                  config/anchorbell-simulation.json \
-                  deploy/systemd/anchorbell-simulation.service
-          git commit -m "feat: make simulation runtime strategy-profile authoritative"
+                  engine/src/simulation_batch.rs
+          git commit -m "fix: bind experiment matrix into simulation lineage"
           git push origin HEAD:diag-risk-20260908
