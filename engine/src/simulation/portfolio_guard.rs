@@ -110,6 +110,23 @@ impl PortfolioDrawdownGuard {
         self.action
     }
 
+    pub fn observe_optional(guard: Option<&mut Self>, pnl: Option<i64>) -> PortfolioDrawdownAction {
+        guard.map_or(PortfolioDrawdownAction::Trading, |guard| guard.observe(pnl))
+    }
+
+    pub fn metric_labels<'a>(
+        guard: Option<&Self>,
+        risk: &'a str,
+        reason: &'a str,
+    ) -> (&'a str, &'a str) {
+        guard
+            .filter(|guard| guard.action.blocks_new_risk())
+            .map_or((risk, reason), |guard| {
+                let label = guard.action.label();
+                (label, label)
+            })
+    }
+
     pub fn snapshot(&self) -> PortfolioDrawdownSnapshot {
         PortfolioDrawdownSnapshot {
             capital_ticks: self.capital_ticks,

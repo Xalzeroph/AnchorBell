@@ -1251,16 +1251,11 @@ impl SimulationEngine {
     }
 
     fn observe_portfolio_drawdown(&mut self) -> PortfolioDrawdownAction {
-        let summary = self.summary();
-        self.portfolio_drawdown_guard
-            .as_mut()
-            .map_or(PortfolioDrawdownAction::Trading, |guard| {
-                guard.observe(summary.unrealized_valuation_complete.then(|| {
-                    summary
-                        .net_pnl_ticks
-                        .saturating_add(summary.unrealized_pnl_ticks)
-                }))
-            })
+        let s = self.summary();
+        PortfolioDrawdownGuard::observe_optional(
+            self.portfolio_drawdown_guard.as_mut(),
+            s.unrealized_valuation_complete.then_some(s.net_pnl_ticks),
+        )
     }
 
     pub fn with_strategy_variant(mut self, variant: SimulationPolicyVariant) -> Self {
@@ -1352,12 +1347,12 @@ impl SimulationEngine {
         });
         if self.observe_portfolio_drawdown().blocks_new_risk() {
             let source = event_symbol(event);
-            let source_rebalanced = matches!(
-                event,
-                BinanceMarketEvent::BookTicker(_) | BinanceMarketEvent::MarkPrice(_)
-            );
             for symbol in self.states.keys().cloned().collect::<Vec<_>>() {
-                if !source_rebalanced || !symbol.eq_ignore_ascii_case(source) {
+                if !matches!(
+                    event,
+                    BinanceMarketEvent::BookTicker(_) | BinanceMarketEvent::MarkPrice(_)
+                ) || !symbol.eq_ignore_ascii_case(source)
+                {
                     records.extend(self.rebalance_symbol(&symbol, self.last_event_at_ms));
                 }
             }
@@ -1985,6 +1980,12 @@ impl SimulationEngine {
                     sell_edge_pico_bps,
                 );
 
+                let labels = PortfolioDrawdownGuard::metric_labels(
+                    self.portfolio_drawdown_guard.as_ref(),
+                    risk_state.label(),
+                    entry_block_reason,
+                );
+
                 SymbolMetrics {
                     symbol: symbol.clone(),
                     position_mode: self
@@ -2076,8 +2077,8 @@ impl SimulationEngine {
                     } else {
                         0
                     },
-                    risk_state: risk_state.label().to_owned(),
-                    entry_block_reason: entry_block_reason.to_owned(),
+                    risk_state: labels.0.to_owned(),
+                    entry_block_reason: labels.1.to_owned(),
                     data_quality,
                     mark_age_ms,
                     bid_price_ticks,
