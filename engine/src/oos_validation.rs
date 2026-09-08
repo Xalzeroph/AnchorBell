@@ -86,7 +86,10 @@ fn mad(values: &[f64]) -> f64 {
         return 0.0;
     }
     let center = median(values);
-    let deviations = values.iter().map(|value| (value - center).abs()).collect::<Vec<_>>();
+    let deviations = values
+        .iter()
+        .map(|value| (value - center).abs())
+        .collect::<Vec<_>>();
     median(&deviations)
 }
 
@@ -128,16 +131,31 @@ pub fn evaluate_robust_candidate(
     if stress.len() < constraints.min_stress_folds {
         return base("insufficient_stress_folds");
     }
-    if oos.iter().any(|fold| fold.trades < constraints.min_trades_per_oos_fold) {
+    if oos
+        .iter()
+        .any(|fold| fold.trades < constraints.min_trades_per_oos_fold)
+    {
         return base("insufficient_oos_trades");
     }
-    if oos.iter().any(|fold| fold.sharpe_ratio.is_none() || fold.sortino_ratio.is_none()) {
+    if oos
+        .iter()
+        .any(|fold| fold.sharpe_ratio.is_none() || fold.sortino_ratio.is_none())
+    {
         return base("risk_metrics_incomplete");
     }
 
-    let returns = oos.iter().map(|fold| fold.net_return_bps).collect::<Vec<_>>();
-    let sharpes = oos.iter().filter_map(|fold| fold.sharpe_ratio).collect::<Vec<_>>();
-    let sortinos = oos.iter().filter_map(|fold| fold.sortino_ratio).collect::<Vec<_>>();
+    let returns = oos
+        .iter()
+        .map(|fold| fold.net_return_bps)
+        .collect::<Vec<_>>();
+    let sharpes = oos
+        .iter()
+        .filter_map(|fold| fold.sharpe_ratio)
+        .collect::<Vec<_>>();
+    let sortinos = oos
+        .iter()
+        .filter_map(|fold| fold.sortino_ratio)
+        .collect::<Vec<_>>();
     let fees = oos.iter().map(|fold| fold.fee_drag_bps).collect::<Vec<_>>();
     let worst_drawdown = oos
         .iter()
@@ -150,8 +168,7 @@ pub fn evaluate_robust_candidate(
                 && fold.max_drawdown_pct <= constraints.max_stress_drawdown_pct
         })
         .count();
-    let stress_survival_ppm =
-        (survivors as u128 * 1_000_000 / stress.len().max(1) as u128) as u32;
+    let stress_survival_ppm = (survivors as u128 * 1_000_000 / stress.len().max(1) as u128) as u32;
 
     let lower_quartile = percentile(&returns, 250_000);
     let median_return = median(&returns);
@@ -201,11 +218,25 @@ pub fn compare_robust_candidates(
             left.lower_quartile_net_return_bps
                 .total_cmp(&right.lower_quartile_net_return_bps)
         })
-        .then_with(|| left.median_sharpe_ratio.total_cmp(&right.median_sharpe_ratio))
-        .then_with(|| left.median_sortino_ratio.total_cmp(&right.median_sortino_ratio))
-        .then_with(|| right.worst_max_drawdown_pct.total_cmp(&left.worst_max_drawdown_pct))
+        .then_with(|| {
+            left.median_sharpe_ratio
+                .total_cmp(&right.median_sharpe_ratio)
+        })
+        .then_with(|| {
+            left.median_sortino_ratio
+                .total_cmp(&right.median_sortino_ratio)
+        })
+        .then_with(|| {
+            right
+                .worst_max_drawdown_pct
+                .total_cmp(&left.worst_max_drawdown_pct)
+        })
         .then_with(|| right.return_mad_bps.total_cmp(&left.return_mad_bps))
-        .then_with(|| right.median_fee_drag_bps.total_cmp(&left.median_fee_drag_bps))
+        .then_with(|| {
+            right
+                .median_fee_drag_bps
+                .total_cmp(&left.median_fee_drag_bps)
+        })
 }
 
 #[cfg(test)]
@@ -275,6 +306,9 @@ mod tests {
         let mut fragile = safe.clone();
         fragile.median_net_return_bps = 50.0;
         fragile.stress_survival_ppm = 666_667;
-        assert_eq!(compare_robust_candidates(&safe, &fragile), Ordering::Greater);
+        assert_eq!(
+            compare_robust_candidates(&safe, &fragile),
+            Ordering::Greater
+        );
     }
 }
