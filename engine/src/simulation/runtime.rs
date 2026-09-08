@@ -1,9 +1,4 @@
 //! Shared simulation-trading and replay execution engine.
-//!
-//! The simulation path consumes the same Binance bookTicker, markPrice, and
-//! aggregate-trade events as the live adapter.  A passive order is filled only
-//! when a public aggregate trade is at the order price and its aggressor side
-//! is compatible with the order.  No bar-only shortcut is used here.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -21,11 +16,14 @@ use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+mod decision_audit;
+
 use super::portfolio_guard::{
     PortfolioDrawdownAction, PortfolioDrawdownGuard, PortfolioDrawdownSnapshot,
 };
 pub use super::risk_metrics::RiskMetrics;
 use super::risk_metrics::{calculate_risk_metrics, RISK_SAMPLE_INTERVAL_MS};
+use decision_audit::DecisionAuditContext;
 
 use crate::{
     backtest::TopOfBook,
@@ -2976,17 +2974,17 @@ impl SimulationEngine {
                         detail: Some(decision_reason),
                     },
                 );
-                record.decision_audit = Some(decision_audit(
-                    self,
+                record.decision_audit = Some(decision_audit(DecisionAuditContext {
+                    engine: self,
                     symbol,
                     state,
                     timestamp_ms,
                     decision_id,
                     outcome,
-                    decision_reason,
+                    final_gate: decision_reason,
                     max_position,
                     requested_quantity,
-                ));
+                }));
                 record
             };
             self.reject_entry(decision_reason);
@@ -3026,17 +3024,17 @@ impl SimulationEngine {
                     detail: Some(decision_reason),
                 },
             );
-            record.decision_audit = Some(decision_audit(
-                self,
+            record.decision_audit = Some(decision_audit(DecisionAuditContext {
+                engine: self,
                 symbol,
                 state,
                 timestamp_ms,
                 decision_id,
                 outcome,
-                decision_reason,
+                final_gate: decision_reason,
                 max_position,
                 requested_quantity,
-            ));
+            }));
             record
         };
         let same_order = self.states[symbol].working.is_some_and(|order| {
@@ -3264,68 +3262,75 @@ impl SimulationEngine {
     }
 }
 
-fn decision_audit(
-    engine: &SimulationEngine,
-    symbol: &str,
-    state: &SimulationSymbolState,
-    timestamp_ms: u64,
-    decision_id: u64,
-    outcome: &str,
-    final_gate: &str,
-    max_position: i64,
-    requested_quantity: i64,
-) -> DecisionAudit {
-    let book = state.book;
+fn decision_audit(context: DecisionAuditContext<'_>) -> DecisionAudit {
+    let book = context.state.book;
     let book_valid = book.is_some_and(|book| {
         book.bid_price_ticks > 0
             && book.ask_price_ticks >= book.bid_price_ticks
             && book.bid_quantity > 0
             && book.ask_quantity > 0
     });
-    let mark_index_ok = match (state.mark_price_ticks, state.index_price_ticks) {
+    let mark_index_ok = match (
+        context.state.mark_price_ticks,
+        context.state.index_price_ticks,
+    ) {
         (Some(mark), Some(index)) if mark > 0 && index > 0 => {
             (i128::from(mark) - i128::from(index)).abs() * 10_000
-                <= i128::from(engine.max_mark_index_gap_bps.max(0)) * i128::from(index)
+                <= i128::from(context.engine.max_mark_index_gap_bps.max(0)) * i128::from(index)
         }
         _ => false,
     };
-    let mark_age_ms =
-        (state.last_mark_time_ms > 0).then(|| timestamp_ms.saturating_sub(state.last_mark_time_ms));
-    let signal_fresh = state.last_mark_time_ms > 0
-        && timestamp_ms >= state.last_mark_time_ms
-        && timestamp_ms.saturating_sub(state.last_mark_time_ms) <= 5_000;
-    let anchor_valid = state
+    let mark_age_ms = (context.state.last_mark_time_ms > 0).then(|| {
+        context
+            .timestamp_ms
+            .saturating_sub(context.state.last_mark_time_ms)
+    });
+    let signal_fresh = context.state.last_mark_time_ms > 0
+        && context.timestamp_ms >= context.state.last_mark_time_ms
+        && context
+            .timestamp_ms
+            .saturating_sub(context.state.last_mark_time_ms)
+            <= 5_000;
+    let anchor_valid = context
+        .state
         .anchor
-        .valid_at(timestamp_ms, engine.max_anchor_age_ms);
-    let anchor_age_ms = (state.anchor.observed_at_ms > 0)
-        .then(|| timestamp_ms.saturating_sub(state.anchor.observed_at_ms));
-    let session_allowed =
-        !engine.live_risk_gates || simulation_session_allows_entry(symbol, timestamp_ms);
-    let funding_allowed = !engine.live_risk_gates
+        .valid_at(context.timestamp_ms, context.engine.max_anchor_age_ms);
+    let anchor_age_ms = (context.state.anchor.observed_at_ms > 0).then(|| {
+        context
+            .timestamp_ms
+            .saturating_sub(context.state.anchor.observed_at_ms)
+    });
+    let session_allowed = !context.engine.live_risk_gates
+        || simulation_session_allows_entry(context.symbol, context.timestamp_ms);
+    let funding_allowed = !context.engine.live_risk_gates
         || funding_entry_allowed_variant(
-            state,
-            timestamp_ms,
-            engine.strategy_variant,
-            engine.fee_ppm,
+            context.state,
+            context.timestamp_ms,
+            context.engine.strategy_variant,
+            context.engine.fee_ppm,
         );
     let effective_quantity = book
         .map(|book| {
-            liquidity_adjusted_quantity(requested_quantity, book.bid_quantity, book.ask_quantity)
+            liquidity_adjusted_quantity(
+                context.requested_quantity,
+                book.bid_quantity,
+                book.ask_quantity,
+            )
         })
-        .unwrap_or(requested_quantity);
+        .unwrap_or(context.requested_quantity);
     let threshold_diagnostic = dynamic_threshold_diagnostic_for(
-        state,
-        engine.strategy_variant,
-        engine.strategy.entry_threshold_bps,
-        engine.fee_ppm,
+        context.state,
+        context.engine.strategy_variant,
+        context.engine.strategy.entry_threshold_bps,
+        context.engine.fee_ppm,
         effective_quantity,
-        max_position,
-        timestamp_ms,
+        context.max_position,
+        context.timestamp_ms,
     );
     let threshold = threshold_diagnostic
         .threshold
-        .map(|value| scale_threshold_non_fee(value, engine.threshold_scale_ppm));
-    let fair_value = fair_value_for_state(state);
+        .map(|value| scale_threshold_non_fee(value, context.engine.threshold_scale_ppm));
+    let fair_value = fair_value_for_state(context.state);
     let liquidity_ratio_bps = book
         .map(|book| liquidity_ratio_bps(effective_quantity, book.bid_quantity, book.ask_quantity));
     let signal_abs_pico_bps = match (book, fair_value) {
@@ -3335,7 +3340,8 @@ fn decision_audit(
         }
         _ => None,
     };
-    let position_capacity = state.position.checked_abs().unwrap_or(i64::MAX) < max_position;
+    let position_capacity =
+        context.state.position.checked_abs().unwrap_or(i64::MAX) < context.max_position;
     let gates = vec![
         DecisionGateAudit {
             name: "session_calendar".to_owned(),
@@ -3414,26 +3420,26 @@ fn decision_audit(
         },
         DecisionGateAudit {
             name: "policy_terminal".to_owned(),
-            passed: outcome == "admissible" || outcome == "reduce_only",
-            reason: final_gate.to_owned(),
+            passed: context.outcome == "admissible" || context.outcome == "reduce_only",
+            reason: context.final_gate.to_owned(),
         },
     ];
     DecisionAudit {
         schema_version: DECISION_AUDIT_SCHEMA_VERSION,
-        decision_id,
-        exchange_event_time_ms: timestamp_ms,
-        received_at_ms: engine.last_received_at_ms,
-        outcome: outcome.to_owned(),
-        final_gate: final_gate.to_owned(),
+        decision_id: context.decision_id,
+        exchange_event_time_ms: context.timestamp_ms,
+        received_at_ms: context.engine.last_received_at_ms,
+        outcome: context.outcome.to_owned(),
+        final_gate: context.final_gate.to_owned(),
         gates,
         book_bid_ticks: book.map(|book| book.bid_price_ticks),
         book_ask_ticks: book.map(|book| book.ask_price_ticks),
         book_bid_quantity: book.map(|book| book.bid_quantity),
         book_ask_quantity: book.map(|book| book.ask_quantity),
-        mark_ticks: state.mark_price_ticks,
-        index_ticks: state.index_price_ticks,
-        anchor_ticks: state.anchor.close_price_ticks,
-        position: state.position,
+        mark_ticks: context.state.mark_price_ticks,
+        index_ticks: context.state.index_price_ticks,
+        anchor_ticks: context.state.anchor.close_price_ticks,
+        position: context.state.position,
         mark_age_ms,
         anchor_age_ms,
         threshold_status: threshold_diagnostic.status.label().to_owned(),
@@ -3441,7 +3447,7 @@ fn decision_audit(
         fair_value_ticks: fair_value.map(|estimate| estimate.price.0),
         liquidity_ratio_bps,
         signal_abs_pico_bps,
-        adaptive_relief_pico_bps: state.adaptive_relief_pico_bps,
+        adaptive_relief_pico_bps: context.state.adaptive_relief_pico_bps,
         threshold_components_pico_bps: threshold.map(|value| value.components_pico_bps()),
     }
 }
@@ -3640,7 +3646,6 @@ fn maker_exit_intent_for_state(
     ) else {
         return (None, "maker_exit_plan_invalid");
     };
-    let position_quantity = position_quantity.min(i64::MAX);
     let working = match state.working {
         None => ExitWorkingOrder::None,
         Some(order) if order.cancel_requested_at_ms.is_some() => ExitWorkingOrder::Pending,
@@ -3927,14 +3932,6 @@ fn edge_pico_bps(numerator_price: i64, denominator_price: i64) -> Option<i64> {
 }
 
 /// Compatibility diagnostic; admission uses edge_pico_bps directly.
-fn edge_micro_bps(numerator_price: i64, denominator_price: i64) -> Option<i64> {
-    edge_pico_bps(numerator_price, denominator_price).map(pico_bps_to_micro)
-}
-
-fn edge_bps(numerator_price: i64, denominator_price: i64) -> Option<i64> {
-    edge_pico_bps(numerator_price, denominator_price).map(pico_bps_to_bps)
-}
-
 fn fair_value_for_state(state: &SimulationSymbolState) -> Option<FairValueEstimate> {
     let book = state.book?;
     let index = state.index_price_ticks?;
@@ -4179,7 +4176,7 @@ fn scale_threshold_non_fee(threshold: AdaptiveThreshold, scale_ppm: i64) -> Adap
         scale(values[0]),
         scale(values[1]),
         values[2],
-        values[3].min(i64::MAX),
+        values[3],
         values[4],
         scale(values[5]),
         scale(values[6]),
@@ -4255,12 +4252,13 @@ fn pico_bps_to_micro(value: i64) -> i64 {
     }
 }
 
-fn pico_bps_to_bps(value: i64) -> i64 {
+#[cfg(test)]
+fn micro_bps_to_bps(value: i64) -> i64 {
     if value == 0 {
         return 0;
     }
     let magnitude = i128::from(value.unsigned_abs());
-    let rounded = ((magnitude + i128::from(PICO_BPS_SCALE / 2)) / i128::from(PICO_BPS_SCALE))
+    let rounded = ((magnitude + i128::from(MICRO_BPS_SCALE / 2)) / i128::from(MICRO_BPS_SCALE))
         .clamp(0, i128::from(i64::MAX)) as i64;
     if value >= 0 {
         rounded
@@ -4269,12 +4267,17 @@ fn pico_bps_to_bps(value: i64) -> i64 {
     }
 }
 
-fn micro_bps_to_bps(value: i64) -> i64 {
+#[cfg(test)]
+fn edge_micro_bps(numerator_price: i64, denominator_price: i64) -> Option<i64> {
+    edge_pico_bps(numerator_price, denominator_price).map(pico_bps_to_micro)
+}
+
+fn pico_bps_to_bps(value: i64) -> i64 {
     if value == 0 {
         return 0;
     }
     let magnitude = i128::from(value.unsigned_abs());
-    let rounded = ((magnitude + i128::from(MICRO_BPS_SCALE / 2)) / i128::from(MICRO_BPS_SCALE))
+    let rounded = ((magnitude + i128::from(PICO_BPS_SCALE / 2)) / i128::from(PICO_BPS_SCALE))
         .clamp(0, i128::from(i64::MAX)) as i64;
     if value >= 0 {
         rounded
@@ -4328,10 +4331,6 @@ fn m5_tail_risk_pico(state: &SimulationSymbolState) -> i64 {
         .max(0)
         .saturating_mul(2)
         .min(10_000 * PICO_BPS_SCALE)
-}
-
-fn m5_tail_risk_bps(state: &SimulationSymbolState) -> i64 {
-    pico_bps_to_bps(m5_tail_risk_pico(state))
 }
 
 fn m5_quote_quantity(state: &SimulationSymbolState, requested_quantity: i64) -> i64 {

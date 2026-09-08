@@ -12,6 +12,8 @@ pub struct ExperimentSpec {
     pub ablations: Vec<String>,
 }
 
+pub type ExperimentRuntimeSpec = (String, SimulationPolicyVariant, Vec<String>);
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExperimentPlan {
     pub schema_version: u16,
@@ -119,9 +121,7 @@ impl ExperimentPlan {
         Ok(())
     }
 
-    pub fn runtime_specs_with_ablations(
-        &self,
-    ) -> Result<Vec<(String, SimulationPolicyVariant, Vec<String>)>, &'static str> {
+    pub fn runtime_specs_with_ablations(&self) -> Result<Vec<ExperimentRuntimeSpec>, &'static str> {
         self.validate()?;
         self.experiments
             .iter()

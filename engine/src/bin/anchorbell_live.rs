@@ -798,11 +798,17 @@ async fn run(args: Args) -> Result<i32, String> {
                             GateDecision::Allow => {
                                 if args.send_orders && !working.contains_key(symbol) {
                                     order_sequence = order_sequence.saturating_add(1);
-                                    let order = place_order(
-                                        &client, &credentials, symbol, intent,
-                                        args.price_scale, args.quantity_scale,
-                                        now, order_sequence, false,
-                                    ).await?;
+                                    let order = place_order(PlaceOrderRequest {
+                                        client: &client,
+                                        credentials: &credentials,
+                                        symbol,
+                                        intent,
+                                        price_scale: args.price_scale,
+                                        quantity_scale: args.quantity_scale,
+                                        now,
+                                        sequence: order_sequence,
+                                        reduce_only: false,
+                                    }).await?;
                                     shadow.live_order_submitted(&order.client_order_id, now);
                                     println!("{}", serde_json::json!({
                                         "event":"order_accepted",
@@ -852,11 +858,17 @@ async fn run(args: Args) -> Result<i32, String> {
                                                 post_only: true,
                                             };
                                             order_sequence = order_sequence.saturating_add(1);
-                                            let order = place_order(
-                                                &client, &credentials, symbol, intent,
-                                                args.price_scale, args.quantity_scale,
-                                                now, order_sequence, true,
-                                            ).await?;
+                                            let order = place_order(PlaceOrderRequest {
+                                        client: &client,
+                                        credentials: &credentials,
+                                        symbol,
+                                        intent,
+                                        price_scale: args.price_scale,
+                                        quantity_scale: args.quantity_scale,
+                                        now,
+                                        sequence: order_sequence,
+                                        reduce_only: true,
+                                    }).await?;
                                             working.insert(symbol.clone(), order);
                                         }
                                     }
@@ -1329,17 +1341,30 @@ fn persist_live_checkpoint(
         .map_err(|error| format!("live checkpoint write failed: {error}"))
 }
 
-async fn place_order(
-    client: &BinanceRestClient,
-    credentials: &BinanceCredentials,
-    symbol: &str,
+struct PlaceOrderRequest<'a> {
+    client: &'a BinanceRestClient,
+    credentials: &'a BinanceCredentials,
+    symbol: &'a str,
     intent: anchorbell_engine::execution::OrderIntent,
     price_scale: u32,
     quantity_scale: u32,
     now: u64,
     sequence: u64,
     reduce_only: bool,
-) -> Result<WorkingOrder, String> {
+}
+
+async fn place_order(request: PlaceOrderRequest<'_>) -> Result<WorkingOrder, String> {
+    let PlaceOrderRequest {
+        client,
+        credentials,
+        symbol,
+        intent,
+        price_scale,
+        quantity_scale,
+        now,
+        sequence,
+        reduce_only,
+    } = request;
     let client_order_id = format!("anchorbell-{}-{}", now, sequence);
     let _response = client
         .place_maker_order(

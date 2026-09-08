@@ -402,20 +402,6 @@ impl RequestCoordinator {
                 .max(now + retry_after.unwrap_or_else(|| class.cooldown()));
         }
     }
-
-    pub async fn snapshot(&self) -> BTreeMap<RequestClass, (u64, u64, Option<u16>)> {
-        self.buckets
-            .lock()
-            .await
-            .iter()
-            .map(|(class, bucket)| {
-                (
-                    *class,
-                    (bucket.requests, bucket.throttled, bucket.last_status),
-                )
-            })
-            .collect()
-    }
 }
 
 #[cfg(test)]

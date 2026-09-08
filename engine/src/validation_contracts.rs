@@ -120,6 +120,10 @@ impl EpisodeRegistry {
         self.episodes.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.episodes.is_empty()
+    }
+
     pub fn episodes(&self) -> &[ClosureEpisode] {
         &self.episodes
     }
