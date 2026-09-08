@@ -25,8 +25,8 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Apply candidate-level promotion repair
-        run: python3 .github/scripts/anchorbell_candidate_promotion_fix.py
+      - name: Apply reproducible OOS fold pipeline repair
+        run: python3 .github/scripts/anchorbell_oos_pipeline_fix.py
 
       - name: Format
         run: cargo fmt --all
@@ -55,8 +55,9 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add engine/src/analytics_validation.rs \
+          git add engine/src/oos_validation.rs \
                   engine/src/simulation_batch.rs \
+                  engine/src/bin/anchorbell_simulation_batch.rs \
                   engine/src/bin/anchorbell_oos_select.rs
-          git commit -m "fix: enforce candidate-level promotion semantics"
+          git commit -m "feat: make OOS fold selection reproducible"
           git push origin HEAD:diag-risk-20260908
