@@ -57,6 +57,9 @@ jobs:
       - name: Propagate portfolio drawdown across symbols
         run: python3 .github/scripts/anchorbell_drawdown_portfolio_propagation_fix.py
 
+      - name: Align drawdown metrics semantics
+        run: python3 .github/scripts/anchorbell_drawdown_metrics_semantics_fix.py
+
       - name: Format
         run: cargo fmt --all
 
@@ -85,7 +88,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "fix: propagate portfolio drawdown guard"
+          git commit -m "fix: align portfolio drawdown observability"
           git fetch origin diag-risk-20260908
           git rebase origin/diag-risk-20260908
           git push origin HEAD:diag-risk-20260908
