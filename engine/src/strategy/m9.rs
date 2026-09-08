@@ -40,6 +40,7 @@ impl M9Calibration {
     #[cfg(test)]
     /// Explicit conservative bootstrap prior. It is a versioned prior, not
     /// evidence of alpha; production calibration must replace this bundle.
+    #[cfg(test)]
     pub const fn bootstrap() -> Self {
         Self {
             half_life_ms: 4 * 60 * 60 * 1_000,

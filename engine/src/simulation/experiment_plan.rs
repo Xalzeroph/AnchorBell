@@ -19,6 +19,16 @@ pub struct ExperimentPlan {
 impl ExperimentPlan {
     pub const SCHEMA_VERSION: u16 = 1;
 
+    pub fn from_specs(experiments: Vec<ExperimentSpec>) -> Result<Self, &'static str> {
+        let plan = Self {
+            schema_version: Self::SCHEMA_VERSION,
+            plan_id: "profile-defined-experiment-matrix".into(),
+            experiments,
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
+
     pub fn m1_to_m8() -> Self {
         let names = [
             ("F1_m1", "m1"),

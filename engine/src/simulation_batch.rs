@@ -43,12 +43,8 @@ use crate::{
     },
 };
 
-/// M9 uses a declared calibration population instead of whichever ledger has
-/// the largest sample count. This keeps the warm-start source auditable and
 const MIN_SIMULATION_FREE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const STORAGE_SAFETY_SCHEMA_VERSION: u16 = 1;
-/// avoids mixing policy-specific order selection into a single unlabeled model.
-const M9_CALIBRATION_SOURCE_LABEL: &str = "F3_m3";
 const DISPLAY_HISTORY_CAPACITY: usize = 900;
 const RISK_HISTORY_CAPACITY: usize = 7_201;
 
@@ -100,6 +96,7 @@ pub struct SimulationBatchConfig {
     pub duration_secs: u64,
     /// Shared, deterministic evidence test fed exactly once per public event.
     pub evidence: EvidenceConfig,
+    pub m9_calibration_source_label: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -247,10 +244,10 @@ fn calibration_rank(snapshot: &CalibrationSnapshot) -> (u64, u64, u64, u64) {
     )
 }
 
-fn warm_start_m9_from_source(ledgers: &mut [Ledger]) {
+fn warm_start_m9_from_source(ledgers: &mut [Ledger], source_label: &str) {
     let seeds = ledgers
         .iter()
-        .find(|ledger| ledger.spec.label == M9_CALIBRATION_SOURCE_LABEL)
+        .find(|ledger| ledger.spec.label == source_label)
         .map(|ledger| {
             ledger
                 .engine
@@ -532,7 +529,7 @@ pub async fn run(
     for spec in &config.specs {
         let calibration_source = if spec.variant == SimulationPolicyVariant::M9DeadlineCausalDroMpc
         {
-            M9_CALIBRATION_SOURCE_LABEL
+            config.m9_calibration_source_label.as_str()
         } else {
             spec.label.as_str()
         };
@@ -779,7 +776,7 @@ pub async fn run(
                         }
                     }
                     write_json_atomic(&evidence_summary_path, &evidence.summary()).await?;
-                    warm_start_m9_from_source(&mut ledgers);
+                    warm_start_m9_from_source(&mut ledgers, &config.m9_calibration_source_label);
                     for ledger in &mut ledgers {
                         let point = ledger.engine.performance_point(observed_at);
                         ledger.history.push_back(point.clone());

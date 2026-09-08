@@ -22,40 +22,53 @@ use anchorbell_engine::{
         orchestration::{run, SimulationBatchConfig, SimulationBatchSpec},
         PositionMode,
     },
+    strategy::StrategyProfile,
 };
 
-const DEFAULT_SYMBOLS: &str =
-    "CXMTUSDT,UNITREEUSDT,GIGADEVUSDT,HK0625USDT,MINIMAXUSDT,ZHIPUUSDT,ZHONGJIUSDT";
-
-// Execution economics and transport behavior are one internal profile. They are
-// derived from venue rules and runtime safety, not exposed as strategy knobs.
-const ENTRY_THRESHOLD_BPS: i64 = 5;
-const THRESHOLD_SCALE_PPM: i64 = 700_000;
-const MAX_MARK_INDEX_GAP_BPS: i64 = 50;
-const FEE_PPM: i64 = 200;
-const QUEUE_AHEAD: i64 = 0;
-const TRADE_THROUGH: i64 = 0;
-const MARKET_TO_DECISION_MS: u64 = 0;
-const DECISION_TO_EXCHANGE_MS: u64 = 0;
-const CANCEL_TO_EXCHANGE_MS: u64 = 0;
-const QUOTE_REPRICE_MIN_INTERVAL_MS: u64 = 750;
-const DYNAMIC_CAPITAL_REFRESH_MS: u64 = 60_000;
+const DEFAULT_PROFILE_PATH: &str = "config/anchorbell-simulation.json";
 
 #[derive(Debug)]
 struct Args {
-    policy_id: String,
-    environment: BinanceEnvironment,
-    index_anchors: bool,
-    symbols: Vec<String>,
-    output_root: PathBuf,
-    capital_usdt: i64,
-    duration_secs: u64,
-    include_m9: bool,
+    profile_path: PathBuf,
+    policy_id: Option<String>,
+    environment: Option<BinanceEnvironment>,
+    index_anchors: Option<bool>,
+    symbols: Option<Vec<String>>,
+    output_root: Option<PathBuf>,
+    capital_usdt: Option<String>,
+    duration_secs: Option<u64>,
 }
 
 fn main() {
     let args = parse_args().unwrap_or_else(|error| fail(error));
-    if !args.index_anchors {
+    let profile = StrategyProfile::load(&args.profile_path).unwrap_or_else(|error| fail(error));
+    let policy_id = args
+        .policy_id
+        .clone()
+        .unwrap_or_else(|| profile.policy_id.clone());
+    let environment = args.environment.unwrap_or(profile.environment);
+    let index_anchors = args.index_anchors.unwrap_or(profile.index_anchors);
+    let symbols = args
+        .symbols
+        .clone()
+        .unwrap_or_else(|| profile.symbols.clone());
+    let output_root: PathBuf = args
+        .output_root
+        .clone()
+        .unwrap_or_else(|| profile.output_root.clone().into());
+    let capital_usdt = args
+        .capital_usdt
+        .as_deref()
+        .map(|value| parse_decimal(value, 8))
+        .transpose()
+        .unwrap_or_else(|error| fail(error))
+        .unwrap_or_else(|| {
+            profile
+                .capital_usdt_ticks()
+                .unwrap_or_else(|error| fail(error))
+        });
+    let duration_secs = args.duration_secs.unwrap_or(profile.duration_secs);
+    if !index_anchors {
         fail("batch execution requires live --index-anchors");
     }
     let _instance_guard =
@@ -70,28 +83,25 @@ fn main() {
             .start(RuntimeProfile::Batch, timestamp_ms())
             .await
             .unwrap_or_else(|error| fail(format!("batch health bootstrap failed: {error}")));
-        let run_id = format!("batch-{}-{}", args.policy_id, timestamp_ms());
-        let include_m9 = args.include_m9;
-        let strategies = if include_m9 {
-            (1..=9).map(|n| format!("m{n}")).collect()
-        } else {
-            (1..=8).map(|n| format!("m{n}")).collect()
-        };
-        let experiment_plan = if include_m9 {
-            anchorbell_engine::simulation::experiment_plan::ExperimentPlan::m1_to_m9()
-        } else {
-            anchorbell_engine::simulation::experiment_plan::ExperimentPlan::m1_to_m8()
-        };
-        let registry = RunRegistry::new(args.output_root.join("runs"));
+        let run_id = format!("batch-{}-{}", policy_id, timestamp_ms());
+        let experiment_plan = profile
+            .experiment_plan()
+            .unwrap_or_else(|error| fail(error));
+        let strategies = experiment_plan
+            .experiments
+            .iter()
+            .map(|experiment| experiment.strategy.clone())
+            .collect::<Vec<_>>();
+        let registry = RunRegistry::new(output_root.join("runs"));
         registry
             .create(
                 RunSpec {
                     schema_version: RUN_REGISTRY_SCHEMA_VERSION,
                     run_id: run_id.clone(),
                     mode: RunMode::Simulation,
-                    policy_id: args.policy_id.clone(),
+                    policy_id: policy_id.clone(),
                     capital_currency: "USDT".into(),
-                    capital_minor_units: args.capital_usdt,
+                    capital_minor_units: capital_usdt,
                     universe: "frozen-close-ah".into(),
                     strategies,
                     ablations: vec!["funding".into()],
@@ -106,12 +116,11 @@ fn main() {
         registry
             .claim(
                 &run_id,
-                format!("batch-{}-{}", std::process::id(), args.policy_id),
+                format!("batch-{}-{}", std::process::id(), policy_id),
                 timestamp_ms(),
             )
             .unwrap_or_else(|error| fail(format!("run registry claim failed: {error}")));
-        let checkpoint_path = args
-            .output_root
+        let checkpoint_path = output_root
             .join("runs")
             .join(&run_id)
             .join("checkpoint.json");
@@ -131,7 +140,7 @@ fn main() {
         let anchors = loop {
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(15),
-                load_index_anchor_set(args.environment, &args.symbols, 8, None),
+                load_index_anchor_set(environment, &symbols, profile.price_scale, None),
             )
             .await;
             match result {
@@ -148,16 +157,17 @@ fn main() {
         let anchors = anchors
             .into_iter()
             .filter(|(symbol, _)| {
-                args.symbols
+                symbols
                     .iter()
                     .any(|candidate| candidate.eq_ignore_ascii_case(symbol))
             })
             .collect::<BTreeMap<_, _>>();
         let modes = BTreeMap::<String, PositionMode>::new();
-        let allocations = allocate_positions(&anchors, args.capital_usdt, &modes, 8)
-            .unwrap_or_else(|error| {
-                fail(format!("cannot allocate simulation-batch capital: {error}"))
-            });
+        let allocations =
+            allocate_positions(&anchors, capital_usdt, &modes, profile.quantity_scale)
+                .unwrap_or_else(|error| {
+                    fail(format!("cannot allocate simulation-batch capital: {error}"))
+                });
         let specs = experiment_plan
             .runtime_specs_with_ablations()
             .unwrap_or_else(|error| fail(format!("invalid experiment plan: {error}")))
@@ -176,43 +186,47 @@ fn main() {
             .unwrap_or_else(|error| fail(format!("run registry heartbeat failed: {error}")));
         let heartbeat_task = registry.spawn_heartbeat(run_id.clone(), 5_000);
         let config = SimulationBatchConfig {
-            policy_id: args.policy_id,
-            environment: args.environment,
-            symbols: args.symbols,
+            policy_id,
+            environment,
+            symbols,
             anchors,
-            entry_threshold_bps: ENTRY_THRESHOLD_BPS,
-            threshold_scale_ppm: THRESHOLD_SCALE_PPM,
-            max_position: 10_000_000,
-            requested_quantity: 1_000_000,
-            max_mark_index_gap_bps: MAX_MARK_INDEX_GAP_BPS,
-            max_anchor_age_ms: 120_000,
-            fee_ppm: FEE_PPM,
-            quantity_scale: 8,
-            price_scale: 8,
+            entry_threshold_bps: profile.entry_threshold_bps,
+            threshold_scale_ppm: profile.threshold_scale_ppm,
+            max_position: profile.max_position,
+            requested_quantity: profile.requested_quantity,
+            max_mark_index_gap_bps: profile.max_mark_index_gap_bps,
+            max_anchor_age_ms: profile.max_anchor_age_ms,
+            fee_ppm: profile.fee_ppm,
+            quantity_scale: profile.quantity_scale,
+            price_scale: profile.price_scale,
             position_allocations: Some(allocations),
-            output_root: args.output_root,
+            output_root,
             specs,
-            max_subscriptions_per_shard: 64,
-            connect_timeout_ms: 5_000,
-            read_timeout_ms: 15_000,
-            metrics_refresh_ms: 1_000,
-            index_anchor_refresh_ms: if args.index_anchors { 60_000 } else { 0 },
-            fx_refresh_ms: 30_000,
-            fx_max_age_ms: 120_000,
-            queue_ahead: QUEUE_AHEAD,
-            trade_through: TRADE_THROUGH,
-            market_to_decision_ms: MARKET_TO_DECISION_MS,
-            decision_to_exchange_ms: DECISION_TO_EXCHANGE_MS,
-            cancel_to_exchange_ms: CANCEL_TO_EXCHANGE_MS,
-            quote_reprice_min_interval_ms: QUOTE_REPRICE_MIN_INTERVAL_MS,
-            dynamic_capital_refresh_ms: DYNAMIC_CAPITAL_REFRESH_MS,
-            // Keep REST weight bounded; resync is throttled on 418/429.
-            depth_snapshot_limit: 100,
+            max_subscriptions_per_shard: profile.max_subscriptions_per_shard,
+            connect_timeout_ms: profile.connect_timeout_ms,
+            read_timeout_ms: profile.read_timeout_ms,
+            metrics_refresh_ms: profile.metrics_refresh_ms,
+            index_anchor_refresh_ms: if index_anchors {
+                profile.index_anchor_refresh_ms
+            } else {
+                0
+            },
+            fx_refresh_ms: profile.fx_refresh_ms,
+            fx_max_age_ms: profile.fx_max_age_ms,
+            queue_ahead: profile.queue_ahead,
+            trade_through: profile.trade_through,
+            market_to_decision_ms: profile.market_to_decision_ms,
+            decision_to_exchange_ms: profile.decision_to_exchange_ms,
+            cancel_to_exchange_ms: profile.cancel_to_exchange_ms,
+            quote_reprice_min_interval_ms: profile.quote_reprice_min_interval_ms,
+            dynamic_capital_refresh_ms: profile.dynamic_capital_refresh_ms,
+            depth_snapshot_limit: profile.depth_snapshot_limit,
             checkpoint_path: Some(checkpoint_path),
             checkpoint_session_id: Some(run_id.clone()),
-            checkpoint_interval_ms: 5_000,
-            duration_secs: args.duration_secs,
+            checkpoint_interval_ms: profile.checkpoint_interval_ms,
+            duration_secs,
             evidence: EvidenceConfig::default(),
+            m9_calibration_source_label: profile.m9_calibration_source_label.clone(),
         };
         let result = match run(config).await {
             Ok(result) => result,
@@ -239,38 +253,39 @@ fn main() {
     });
 }
 fn parse_args() -> Result<Args, String> {
-    let mut policy_id = "M7-policy_matrix-r13".to_owned();
-    let mut environment = BinanceEnvironment::Production;
-    let mut index_anchors = true;
-    let mut symbols = DEFAULT_SYMBOLS
-        .split(',')
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let mut output_root = PathBuf::from("target\\simulation-batch-20260904-M7");
-    let mut capital_usdt = 1_500_i64.checked_mul(100_000_000).unwrap();
-    let mut duration_secs = 0;
-    let mut include_m9 = false;
+    let mut profile_path = PathBuf::from(DEFAULT_PROFILE_PATH);
+    let mut policy_id = None;
+    let mut environment = None;
+    let mut index_anchors = None;
+    let mut symbols = None;
+    let mut output_root = None;
+    let mut capital_usdt = None;
+    let mut duration_secs = None;
     let mut args = env::args().skip(1);
     while let Some(flag) = args.next() {
         match flag.as_str() {
-            "--policy-id" => policy_id = next(&mut args, &flag)?,
-            "--index-anchors" => index_anchors = true,
+            "--strategy-profile" => profile_path = PathBuf::from(next(&mut args, &flag)?),
+            "--policy-id" => policy_id = Some(next(&mut args, &flag)?),
+            "--index-anchors" => index_anchors = Some(true),
             "--environment" => {
-                environment = next(&mut args, &flag)?
-                    .parse()
-                    .map_err(|_| "invalid --environment".to_owned())?;
+                environment = Some(
+                    next(&mut args, &flag)?
+                        .parse()
+                        .map_err(|_| "invalid --environment".to_owned())?,
+                );
             }
             "--symbols" => {
-                symbols = next(&mut args, &flag)?
-                    .split(',')
-                    .map(|s| s.trim().to_ascii_uppercase())
-                    .filter(|s| !s.is_empty())
-                    .collect()
+                symbols = Some(
+                    next(&mut args, &flag)?
+                        .split(',')
+                        .map(|s| s.trim().to_ascii_uppercase())
+                        .filter(|s| !s.is_empty())
+                        .collect(),
+                )
             }
-            "--output-root" => output_root = PathBuf::from(next(&mut args, &flag)?),
-            "--capital-usdt" => capital_usdt = parse_decimal(&next(&mut args, &flag)?, 8)?,
-            "--duration-secs" => duration_secs = parse(&mut args, &flag)?,
-            "--include-m9" => include_m9 = true,
+            "--output-root" => output_root = Some(PathBuf::from(next(&mut args, &flag)?)),
+            "--capital-usdt" => capital_usdt = Some(next(&mut args, &flag)?),
+            "--duration-secs" => duration_secs = Some(parse(&mut args, &flag)?),
             "--help" | "-h" => {
                 print_usage();
                 process::exit(0);
@@ -278,10 +293,8 @@ fn parse_args() -> Result<Args, String> {
             other => return Err(format!("unknown option {other}")),
         }
     }
-    if symbols.is_empty() {
-        return Err("--symbols cannot be empty".to_owned());
-    }
     Ok(Args {
+        profile_path,
         policy_id,
         environment,
         index_anchors,
@@ -289,7 +302,6 @@ fn parse_args() -> Result<Args, String> {
         output_root,
         capital_usdt,
         duration_secs,
-        include_m9,
     })
 }
 
