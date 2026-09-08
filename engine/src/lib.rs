@@ -11,6 +11,7 @@ pub mod m8;
 pub mod market;
 mod network;
 pub mod observability;
+pub mod oos_validation;
 pub mod orderbook;
 pub mod platform;
 pub mod replay;
