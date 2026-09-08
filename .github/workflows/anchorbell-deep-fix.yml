@@ -12,7 +12,7 @@ jobs:
   deep-fix:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Checkout diagnostic branch
         uses: actions/checkout@v4
@@ -22,18 +22,29 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
-      - name: Apply cumulative strategy semantics repair
-        run: python3 .github/scripts/anchorbell_semantics_fix.py
+      - name: Apply post-fee risk and churn repair
+        run: python3 .github/scripts/anchorbell_profit_risk_fix.py
 
       - name: Format
         run: cargo fmt --all
+
+      - name: Architecture gate
+        run: python3 scripts/architecture_gate.py
+
+      - name: Resource gate
+        run: python3 scripts/resource_gate.py
 
       - name: Check workspace
         run: cargo check --workspace --locked
 
       - name: Test workspace
         run: cargo test --workspace --locked
+
+      - name: Clippy regression scan
+        run: cargo clippy --workspace --all-targets --all-features
 
       - name: Commit validated repairs
         shell: bash
@@ -44,10 +55,7 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add engine/src/simulation/experiment_plan.rs \
-                  engine/src/bin/anchorbell_simulation_batch.rs \
-                  engine/src/simulation_batch.rs \
-                  engine/src/simulation/runtime.rs \
-                  engine/src/strategy/calibration.rs
-          git commit -m "fix: enforce cumulative strategy semantics"
+          git add engine/src/simulation/runtime.rs \
+                  engine/src/analytics_validation.rs
+          git commit -m "fix: optimize post-fee risk and allocation churn"
           git push origin HEAD:diag-risk-20260908
