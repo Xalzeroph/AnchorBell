@@ -25,8 +25,8 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Apply policy-aware replay repair
-        run: python3 .github/scripts/anchorbell_policy_replay_fix.py
+      - name: Apply candidate-level promotion repair
+        run: python3 .github/scripts/anchorbell_candidate_promotion_fix.py
 
       - name: Format
         run: cargo fmt --all
@@ -55,7 +55,8 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add engine/src/simulation/runtime.rs \
-                  engine/src/bin/anchorbell_backtest.rs
-          git commit -m "feat: add policy-aware replay risk evaluation"
+          git add engine/src/analytics_validation.rs \
+                  engine/src/simulation_batch.rs \
+                  engine/src/bin/anchorbell_oos_select.rs
+          git commit -m "fix: enforce candidate-level promotion semantics"
           git push origin HEAD:diag-risk-20260908
