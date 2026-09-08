@@ -2707,30 +2707,35 @@ impl SimulationEngine {
                     (desired, true, state.working.is_some(), exit_reason)
                 }
             } else if strategy_variant == SimulationPolicyVariant::M9DeadlineCausalDroMpc {
-                let inherited_required_pico_bps = dynamic_threshold_for(
+                let (intent, reduce_only, reason) = m9_intent_for_state(
                     state,
-                    strategy_variant,
-                    self.strategy.entry_threshold_bps,
-                    self.fee_ppm,
-                    requested_quantity,
-                    max_position,
                     timestamp_ms,
-                )
-                .map(|value| scale_threshold_non_fee(value, self.threshold_scale_ppm))
-                .and_then(|value| value.required_pico_bps())
-                .map(|value| value.saturating_sub(state.adaptive_relief_pico_bps))
-                .unwrap_or(0);
-                if state.position == 0 && !m7_entry_admissible(state, inherited_required_pico_bps) {
+                    max_position,
+                    requested_quantity,
+                    self.max_mark_index_gap_bps,
+                    self.fee_ppm,
+                );
+                let evidence_ok = reduce_only
+                    || dynamic_threshold_for(
+                        state,
+                        strategy_variant,
+                        self.strategy.entry_threshold_bps,
+                        self.fee_ppm,
+                        requested_quantity,
+                        max_position,
+                        timestamp_ms,
+                    )
+                    .map(|value| scale_threshold_non_fee(value, self.threshold_scale_ppm))
+                    .and_then(|value| value.required_pico_bps())
+                    .is_some_and(|value| {
+                        m7_entry_admissible(
+                            state,
+                            value.saturating_sub(state.adaptive_relief_pico_bps),
+                        )
+                    });
+                if intent.is_some() && !evidence_ok {
                     (None, false, state.working.is_some(), "m7_evidence_gate")
                 } else {
-                    let (intent, reduce_only, reason) = m9_intent_for_state(
-                        state,
-                        timestamp_ms,
-                        max_position,
-                        requested_quantity,
-                        self.max_mark_index_gap_bps,
-                        self.fee_ppm,
-                    );
                     (intent, reduce_only, state.working.is_some(), reason)
                 }
             } else {
