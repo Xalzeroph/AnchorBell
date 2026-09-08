@@ -22,7 +22,7 @@ if start < 0 or end < 0:
 block = runtime[start:end].rstrip() + "\n"
 runtime = runtime[:start] + "pub use super::replay_config::ReplayConfig;\n\n" + runtime[end:]
 
-module = '''//! Auditable replay configuration kept outside the simulation runtime state machine.\n\nuse std::collections::BTreeMap;\n\nuse crate::{\n    backtest::realism::RealisticFillModel,\n    strategy::CalibrationState,\n};\n\nuse super::runtime::SimulationPolicyVariant;\n\n''' + block
+module = '''//! Auditable replay configuration kept outside the simulation runtime state machine.\n\nuse std::collections::BTreeMap;\n\nuse crate::strategy::CalibrationState;\n\nuse super::runtime::SimulationPolicyVariant;\n\n''' + block
 
 module_anchor = '#[path = "simulation/replay.rs"]\npub mod replay;\n'
 module_line = module_anchor + '#[path = "simulation/replay_config.rs"]\npub mod replay_config;\n'
