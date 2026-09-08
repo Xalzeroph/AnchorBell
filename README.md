@@ -1,8 +1,13 @@
 # AnchorBell: Binance Equity Perpetual Anchor-Maker Engine
 
 <p align="center">
+<<<<<<< HEAD
   <strong>Anchor the close. Quote the deviation. Flatten before reopen.</strong><br>
   A Rust-first, maker-only industrial quantitative service for controlled Testnet/Production execution.
+=======
+  <strong>Research the close. Quote the deviation. Reduce risk before the deadline.</strong><br>
+  A Rust-first, maker-only engine for Binance equity perpetual research and controlled Testnet/Production execution.
+>>>>>>> refs/remotes/github/codex/safety-core
 </p>
 
 <p align="center">
@@ -39,7 +44,9 @@ state its data, latency, fill, fee, and risk assumptions.
 During the underlying equity market's closed session, a perpetual contract may
 deviate from the last reliable equity-market close. AnchorBell models that close
 as a static anchor, evaluates the deviation, places only passive post-only quotes,
-and exits before the underlying market reopens.
+and targets passive reduction before the underlying market reopens or the next
+funding-risk deadline. Unfilled residual exposure is reported, never treated as
+a synthetic fill.
 
 The system is intentionally narrow:
 
@@ -81,7 +88,8 @@ recorded data, or a future Binance network adapter.
 ## Design principles
 
 1. Maker-only is a hard invariant, not a best-effort preference.
-2. Positions are flattened before the underlying market reopens.
+2. The engine targets passive reduction before the earliest risk deadline and
+   explicitly reports any unfilled residual exposure.
 3. Invalid anchors, stale data, and exceeded position limits fail closed.
 4. Testnet and production endpoints are different typed environments.
 5. Credentials are read from the environment or the Windows user credential store and never committed.

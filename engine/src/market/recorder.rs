@@ -56,6 +56,7 @@ impl From<io::Error> for RecorderError {
     }
 }
 
+<<<<<<< HEAD
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,6 +95,8 @@ mod tests {
 }
 
 #[allow(clippy::items_after_test_module)]
+=======
+>>>>>>> refs/remotes/github/codex/safety-core
 /// Serializes parsed Binance events for both live recording and replay.
 ///
 /// The event timestamp remains the exchange timestamp; the optional receipt
@@ -175,6 +178,7 @@ pub fn market_event_to_json(
     value
 }
 
+<<<<<<< HEAD
 /// Adds the deterministic lineage fields used to join raw market evidence to
 /// decisions, fills, and PnL without requiring a second side-channel lookup.
 pub fn add_event_lineage<T>(
@@ -189,4 +193,41 @@ pub fn add_event_lineage<T>(
     value["_anchorbell_sequence"] = serde_json::json!(envelope.sequence);
     value["_anchorbell_state_version"] = serde_json::json!(envelope.state_version);
     value["_anchorbell_quality"] = serde_json::to_value(&envelope.quality).unwrap_or_default();
+=======
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn writes_one_json_record_per_line() {
+        let mut output = Vec::new();
+        let mut recorder = JsonlRecorder::new(&mut output);
+        recorder
+            .append(RecordedMarketMessage {
+                received_at_ms: 10,
+                payload: "{}".to_string(),
+            })
+            .unwrap();
+        recorder.finish().unwrap();
+        assert!(String::from_utf8(output).unwrap().ends_with("\n"));
+    }
+
+    #[test]
+    fn rejects_out_of_order_receipts() {
+        let mut recorder = JsonlRecorder::new(Vec::new());
+        recorder
+            .append(RecordedMarketMessage {
+                received_at_ms: 10,
+                payload: "{}".to_string(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recorder.append(RecordedMarketMessage {
+                received_at_ms: 9,
+                payload: "{}".to_string(),
+            }),
+            Err(RecorderError::OutOfOrder { .. })
+        ));
+    }
+>>>>>>> refs/remotes/github/codex/safety-core
 }

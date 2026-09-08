@@ -95,6 +95,20 @@ cargo run -p anchorbell-engine --bin anchorbell_backtest --locked -- --input run
 `--require-flat-at-end`，若仍有持仓或挂单则命令失败。回测输出是模型结果，
 不能当作 Testnet 或 Production 成交证据。
 
+纸面/回放退出使用与执行适配器相同的被动 maker 决策：多仓只在卖一挂 SELL，
+空仓只在买一挂 BUY；仅收到价格精确匹配且主动方相容的聚合成交后才改变仓位。
+提交、取消请求和取消确认都不是成交。若没有下载的交易所过滤器，模拟器明确采用
+有限的模拟假设：price tick=1、quantity tick=1、minimum quantity=1、minimum
+notional=1 quote tick、maximum quantity=该标的配置的 `max_position`；这些记录为
+simulation，绝不表示已获取 exchangeInfo。显式提供的过滤器保留其观测时间并会过期。
+回放时钟也会驱动退出评估；盘口 receipt/event 时间独立于 mark，过期、未来、零价差
+或倒挂盘口不创建退出单。若配置了取消延迟，撤单在确认前仍可能按原有 maker 规则成交，
+确认后才允许替换。硬截止后不再补单，风险增加的本地挂单会进入撤单路径，安全的
+reduce-only 挂单会继续跟踪并将剩余仓位记录为 residual exposure。
+
+EOF 的 `cancel_all` 是本地模拟器 teardown，不是交换所的取消确认：它只清除纸面
+working order 并写 `order_teardown` 记录，不伪造成交或正常撤单确认时间。
+
 ## 4. Testnet 认证只读运行
 
 先在当前 PowerShell 会话注入 Testnet 凭证；也可以由 Dashboard 保存到当前

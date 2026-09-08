@@ -141,6 +141,7 @@ async fn compress_segment(path: &Path, segment: u64) -> Result<(), io::Error> {
     .map_err(|error| io::Error::other(format!("compression task failed: {error}")))?
 }
 
+<<<<<<< HEAD
 fn compress_segment_blocking(
     raw_path: PathBuf,
     archive_path: PathBuf,
@@ -168,6 +169,20 @@ fn compress_segment_blocking(
             .map_err(|error| io_context("read raw line-writer segment", &raw_path, error))?;
         if read == 0 {
             break;
+=======
+pub async fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), io::Error> {
+    let bytes = serde_json::to_vec(value).map_err(|error| io::Error::other(error.to_string()))?;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let temporary = path.with_extension("json.tmp");
+    tokio::fs::write(&temporary, bytes).await?;
+    match tokio::fs::rename(&temporary, path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let _ = tokio::fs::remove_file(path).await;
+            tokio::fs::rename(&temporary, path).await
+>>>>>>> refs/remotes/github/codex/safety-core
         }
         let bytes = &buffer[..read];
         encoder

@@ -8,8 +8,13 @@
 [![Execution](https://img.shields.io/badge/execution-maker--only-blue)](docs/TESTNET_RUNBOOK.md)
 
 <p align="center">
+<<<<<<< HEAD
   <strong>固定收盘锚点，报价价格偏离，开盘前完成平仓。</strong><br>
   Rust-first、maker-only 的 Binance 股票相关永续合约工业量化服务，支持受控 Testnet/Production 执行。
+=======
+  <strong>研究收盘锚点，报价价格偏离，风险截止前被动减仓。</strong><br>
+  Rust-first、maker-only 的 Binance 股票相关永续合约研究与受控 Testnet/Production 执行引擎。
+>>>>>>> refs/remotes/github/codex/safety-core
 </p>
 
 AnchorBell 是一个 Rust-first、只做 maker 的 Binance 股票相关永续合约工业量化服务，覆盖
@@ -22,7 +27,8 @@ AnchorBell 是一个 Rust-first、只做 maker 的 Binance 股票相关永续合
 
 底层股票市场休市后，永续合约可能偏离最近可靠的股票市场收盘价。AnchorBell 将收盘价
 建模为具有明确有效期的静态锚点，评估偏离，只挂 post-only 被动订单，并在底层市场
-重新开盘前平仓。港股发行人的 ADR/ADS 只有在收盘后仍提供有效价格发现时才排除；
+重新开盘或资金费风险截止前尝试被动减仓。未成交的残余仓位会明确报告，不会被视为
+已经平仓，也不会自动改用 taker/市价单。港股发行人的 ADR/ADS 只有在收盘后仍提供有效价格发现时才排除；
 低流动性、过期或无有效报价的 OTC 无担保 ADR 会被记录，但不会参与锚点计算。
 
 ## 系统边界

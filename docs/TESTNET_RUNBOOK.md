@@ -85,6 +85,11 @@ $env:ANCHORBELL_BINANCE_API_SECRET = "<testnet-secret>"
 
 只有 A-C 全部有证据后，才可分别验证 partial fill、full fill、断线恢复、重启 reconciliation、stale-data halt 和 session flatten。每个场景单独运行，发生未知状态立即停止。
 
+Maker-only 的退出只能作为风险降低目标，不能表述成成交保证。多仓退出挂卖一、
+空仓退出挂买一，并保持 post-only/reduce-only；到达股票开盘或资金费硬截止仍未成交时，
+必须记录 residual exposure，不能伪造成平仓成功，也不能自动改用 taker/市价单。
+只读验证禁止包括撤单在内的全部交易写操作。
+
 ## 证据要求
 
 每个场景保存：commit SHA、配置摘要（脱敏）、symbol、UTC 时间、请求 id、exchange order id、订单状态序列、风险状态、重连次数和最终仓位。不得保存 API secret 或完整认证 payload。
