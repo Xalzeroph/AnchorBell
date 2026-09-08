@@ -37,12 +37,10 @@ new_event_tail = '''        records.extend(match event {
         });
         if self.observe_portfolio_drawdown().blocks_new_risk() {
             let source = event_symbol(event);
-            let source_rebalanced = matches!(
-                event,
-                BinanceMarketEvent::BookTicker(_) | BinanceMarketEvent::MarkPrice(_)
-            );
             for symbol in self.states.keys().cloned().collect::<Vec<_>>() {
-                if !source_rebalanced || !symbol.eq_ignore_ascii_case(source) {
+                if !matches!(event, BinanceMarketEvent::BookTicker(_) | BinanceMarketEvent::MarkPrice(_))
+                    || !symbol.eq_ignore_ascii_case(source)
+                {
                     records.extend(self.rebalance_symbol(&symbol, self.last_event_at_ms));
                 }
             }
