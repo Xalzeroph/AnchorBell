@@ -18,9 +18,8 @@ use anchorbell_engine::{
         run_registry::{RunMode, RunRegistry, RunSpec, RunStatus, RUN_REGISTRY_SCHEMA_VERSION},
     },
     simulation::{
-        allocate_positions, load_index_anchor_set,
-        orchestration::{run, SimulationBatchConfig, SimulationBatchSpec},
-        PositionMode,
+        allocate_positions, compiled_build_identity, load_index_anchor_set, run, PositionMode,
+        SimulationBatchConfig, SimulationBatchSpec,
     },
     strategy::StrategyProfile,
 };
@@ -114,7 +113,7 @@ fn main() {
                     checkpoint_interval_ms: profile.checkpoint_interval_ms,
                     max_stale_ms: profile.max_stale_ms,
                     auto_restart: true,
-                    build_identity: env!("CARGO_PKG_VERSION").into(),
+                    build_identity: compiled_build_identity(),
                 },
                 timestamp_ms(),
             )

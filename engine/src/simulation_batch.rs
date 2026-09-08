@@ -29,7 +29,7 @@ use crate::{
     },
     orderbook::{LocalOrderBook, OrderBookError},
     runtime::{
-        io::{spawn_line_writer, write_json_atomic, AsyncLineWriter},
+        io::{send_line, spawn_line_writer, write_json_atomic, AsyncLineWriter},
         reference_authority::fetch as load_index_anchor_set,
         DataQuality, EventEnvelope, EventSource,
     },
@@ -47,6 +47,7 @@ const MIN_SIMULATION_FREE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const STORAGE_SAFETY_SCHEMA_VERSION: u16 = 1;
 const DISPLAY_HISTORY_CAPACITY: usize = 900;
 const RISK_HISTORY_CAPACITY: usize = 7_201;
+const MARKET_EVENT_CHANNEL_CAPACITY: usize = 65_536;
 
 #[derive(Debug, Clone)]
 pub struct SimulationBatchSpec {
@@ -592,7 +593,8 @@ pub async fn run(
     .map_err(|error| SimulationError::Market(format!("FX poller: {error}")))?;
     let (fx_tx, mut fx_rx) = mpsc::channel::<FxUpdate>(256);
     let mut fx_task = tokio::spawn(fx_poller.run(fx_tx));
-    let (anchor_tx, mut anchor_rx) = mpsc::channel(1);
+    let (anchor_tx, mut anchor_rx) =
+        mpsc::channel::<Result<BTreeMap<String, AnchorSnapshot>, String>>(1);
     let mut anchor_task = if config.index_anchor_refresh_ms > 0 {
         let environment = config.environment;
         let symbols = config.symbols.clone();
@@ -600,10 +602,16 @@ pub async fn run(
         Some(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(refresh_ms.max(1_000))).await;
-                if let Ok(anchor_set) = load_index_anchor_set(environment, &symbols, 8, None).await
-                {
-                    if anchor_tx.send(anchor_set.anchors).await.is_err() {
-                        break;
+                match load_index_anchor_set(environment, &symbols, 8, None).await {
+                    Ok(anchor_set) => {
+                        if anchor_tx.send(Ok(anchor_set.anchors)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        if anchor_tx.send(Err(error.to_string())).await.is_err() {
+                            break;
+                        }
                     }
                 }
             }
@@ -613,7 +621,8 @@ pub async fn run(
     };
 
     let mut shard_tasks = tokio::task::JoinSet::new();
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<BinanceMarketEvent>();
+    let (event_tx, mut event_rx) =
+        mpsc::channel::<BinanceMarketEvent>(MARKET_EVENT_CHANNEL_CAPACITY);
     let event_dropped = Arc::new(AtomicU64::new(0));
     let endpoints = config.environment.endpoints();
 
@@ -638,7 +647,7 @@ pub async fn run(
         let dropped = Arc::clone(&event_dropped);
         shard_tasks.spawn(async move {
             BinanceMarketStream::run_forever(stream_config, |event| {
-                if tx.send(event).is_err() {
+                if tx.try_send(event).is_err() {
                     dropped.fetch_add(1, Ordering::Relaxed);
                 }
             })
@@ -722,7 +731,7 @@ pub async fn run(
         let dropped = Arc::clone(&event_dropped);
         shard_tasks.spawn(async move {
             BinanceMarketStream::run_forever(stream_config, |event| {
-                if tx.send(event).is_err() {
+                if tx.try_send(event).is_err() {
                     dropped.fetch_add(1, Ordering::Relaxed);
                 }
             })
@@ -809,6 +818,11 @@ pub async fn run(
                     persist_calibration_store(&calibration_store_path, &ledgers).await?;
                 }
                 event = event_rx.recv() => {
+                    if event_dropped.load(Ordering::Relaxed) != 0 {
+                        return Err::<(), SimulationError>(SimulationError::Market(
+                            "market event queue overflowed; run invalidated".to_owned(),
+                        ));
+                    }
                     let Some(event) = event else { return Err::<(), SimulationError>(SimulationError::Market("all market shards stopped".to_owned())); };
                     let received_at = now_ms();
                     last_received_at_ms = received_at;
@@ -868,23 +882,19 @@ pub async fn run(
                     );
                     add_event_lineage(&mut market_value, &envelope);
                     let market_line = serde_json::to_string(&market_value)?;
-                    market_tx
-                        .send(market_line)
+                    send_line(&market_tx, &market_dropped, market_line)
                         .await
                         .map_err(|_| SimulationError::Io("market writer stopped".to_owned()))?;
                     for evidence in evidence.observe(&event, received_at, &config.anchors) {
                         let line = serde_json::to_string(&evidence)?;
-                        evidence_tx
-                            .send(line)
+                        send_line(&evidence_tx, &evidence_dropped, line)
                             .await
                             .map_err(|_| SimulationError::Io("evidence writer stopped".to_owned()))?;
                     }
                     for ledger in &mut ledgers {
                         for record in ledger.engine.on_enveloped_event(&envelope)? {
                             let line = serde_json::to_string(&record)?;
-                            ledger
-                                .record_tx
-                                .send(line)
+                            send_line(&ledger.record_tx, &ledger.record_dropped, line)
                                 .await
                                 .map_err(|_| SimulationError::Io("ledger writer stopped".to_owned()))?;
                         }
@@ -936,11 +946,23 @@ pub async fn run(
                     }
                 }
                 anchor_update = anchor_rx.recv(), if config.index_anchor_refresh_ms > 0 => {
-                    if let Some(anchors) = anchor_update {
-                        let timestamp = now_ms();
-                        config.anchors = anchors.clone();
-                        for ledger in &mut ledgers {
-                            ledger.engine.refresh_anchors(anchors.clone(), timestamp);
+                    match anchor_update {
+                        Some(Ok(anchors)) => {
+                            let timestamp = now_ms();
+                            config.anchors = anchors.clone();
+                            for ledger in &mut ledgers {
+                                ledger.engine.refresh_anchors(anchors.clone(), timestamp);
+                            }
+                        }
+                        Some(Err(error)) => {
+                            return Err::<(), SimulationError>(SimulationError::Market(
+                                format!("index anchor authority unavailable: {error}"),
+                            ));
+                        }
+                        None => {
+                            return Err::<(), SimulationError>(SimulationError::Market(
+                                "index anchor refresh supervisor stopped".to_owned(),
+                            ));
                         }
                     }
                 }
@@ -948,8 +970,7 @@ pub async fn run(
                     let Some(update) = update else { return Err::<(), SimulationError>(SimulationError::Market("FX feed stopped".to_owned())); };
                     fx_latest.insert(update.currency.clone(), update.clone());
                     let line = serde_json::to_string(&update)?;
-                    fx_record_tx
-                        .send(line)
+                    send_line(&fx_record_tx, &fx_dropped, line)
                         .await
                         .map_err(|_| SimulationError::Io("FX writer stopped".to_owned()))?;
                 }
@@ -1004,9 +1025,7 @@ pub async fn run(
         ledger.flatten_requested = settlement.flatten_requested;
         for record in settlement.records {
             let line = serde_json::to_string(&record)?;
-            ledger
-                .record_tx
-                .send(line)
+            send_line(&ledger.record_tx, &ledger.record_dropped, line)
                 .await
                 .map_err(|_| SimulationError::Io("ledger writer stopped".to_owned()))?;
         }
@@ -1124,7 +1143,19 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::calibration_key;
+    use super::{calibration_key, MARKET_EVENT_CHANNEL_CAPACITY};
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn market_queue_is_bounded_and_reports_overflow() {
+        let (sender, _receiver) = mpsc::channel::<u8>(1);
+        sender.try_send(1).expect("first event fits");
+        assert!(matches!(
+            sender.try_send(2),
+            Err(mpsc::error::TrySendError::Full(2))
+        ));
+        assert_eq!(MARKET_EVENT_CHANNEL_CAPACITY, 65_536);
+    }
 
     #[test]
     fn calibration_store_keys_are_strategy_scoped() {

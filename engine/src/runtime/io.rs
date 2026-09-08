@@ -22,6 +22,20 @@ pub struct AsyncLineWriter {
     pub dropped: Arc<AtomicU64>,
 }
 
+pub async fn send_line(
+    sender: &mpsc::Sender<String>,
+    dropped: &Arc<AtomicU64>,
+    line: String,
+) -> Result<(), mpsc::error::SendError<String>> {
+    match sender.send(line).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            dropped.fetch_add(1, Ordering::Relaxed);
+            Err(error)
+        }
+    }
+}
+
 pub async fn spawn_line_writer(
     path: Option<PathBuf>,
     channel_capacity: usize,
@@ -300,6 +314,17 @@ fn replace_file(source: &Path, target: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn send_line_counts_closed_writer() {
+        let (sender, receiver) = mpsc::channel::<String>(1);
+        drop(receiver);
+        let dropped = Arc::new(AtomicU64::new(0));
+        assert!(send_line(&sender, &dropped, "lost".to_owned())
+            .await
+            .is_err());
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+    }
 
     #[tokio::test]
     async fn writer_counts_drained_lines_without_a_path() {

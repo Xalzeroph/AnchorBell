@@ -670,6 +670,7 @@ pub struct SimulationPromotionInput {
 pub struct SimulationPromotionGate {
     pub methodology_id: String,
     pub minimum_fills: u64,
+    pub evidence_class: String,
     pub integrity_passed: bool,
     pub evidence_sufficient: bool,
     pub economic_passed: bool,
@@ -685,6 +686,7 @@ pub struct SimulationPromotionGate {
 pub struct CandidateReadinessGate {
     pub methodology_id: String,
     pub minimum_fills: u64,
+    pub evidence_class: String,
     pub integrity_passed: bool,
     pub evidence_sufficient: bool,
     pub economic_passed: bool,
@@ -694,12 +696,27 @@ pub struct CandidateReadinessGate {
     pub reason: String,
 }
 
+fn classify_simulation_evidence(input: SimulationPromotionInput) -> String {
+    if input.records_dropped != 0 {
+        "INVALID_DATA".to_owned()
+    } else if input.fills == 0 {
+        "NO_EVIDENCE".to_owned()
+    } else if input.fills < 100 {
+        "INSUFFICIENT_EVIDENCE".to_owned()
+    } else if input.total_net_pnl_ticks <= 0 {
+        "NEGATIVE".to_owned()
+    } else {
+        "CANDIDATE".to_owned()
+    }
+}
+
 pub fn evaluate_candidate_readiness(input: SimulationPromotionInput) -> CandidateReadinessGate {
     const MINIMUM_FILLS: u64 = 100;
     if input.ledger_count != 1 {
         return CandidateReadinessGate {
             methodology_id: "anchorbell-candidate-readiness-v1".to_owned(),
             minimum_fills: MINIMUM_FILLS,
+            evidence_class: classify_simulation_evidence(input),
             integrity_passed: false,
             evidence_sufficient: false,
             economic_passed: false,
@@ -738,6 +755,7 @@ pub fn evaluate_candidate_readiness(input: SimulationPromotionInput) -> Candidat
     CandidateReadinessGate {
         methodology_id: "anchorbell-candidate-readiness-v1".to_owned(),
         minimum_fills: MINIMUM_FILLS,
+        evidence_class: classify_simulation_evidence(input),
         integrity_passed,
         evidence_sufficient,
         economic_passed,
@@ -754,6 +772,7 @@ pub fn evaluate_simulation_promotion(input: SimulationPromotionInput) -> Simulat
         return SimulationPromotionGate {
             methodology_id: "anchorbell-automatic-promotion-v3".to_owned(),
             minimum_fills: MINIMUM_FILLS,
+            evidence_class: classify_simulation_evidence(input),
             integrity_passed: input.records_dropped == 0,
             evidence_sufficient: false,
             economic_passed: false,
@@ -789,6 +808,7 @@ pub fn evaluate_simulation_promotion(input: SimulationPromotionInput) -> Simulat
     SimulationPromotionGate {
         methodology_id: "anchorbell-automatic-promotion-v3".to_owned(),
         minimum_fills: MINIMUM_FILLS,
+        evidence_class: classify_simulation_evidence(input),
         integrity_passed,
         evidence_sufficient,
         economic_passed,
@@ -883,6 +903,31 @@ mod method_tests {
         assert_eq!(gate.reason, "oos_validation_required");
         assert!(gate.economic_passed);
         assert!(gate.survival_passed);
+    }
+
+    #[test]
+    fn evidence_class_distinguishes_no_evidence_from_invalid_data() {
+        let no_evidence = evaluate_candidate_readiness(SimulationPromotionInput {
+            ledger_count: 1,
+            orders: 0,
+            fills: 0,
+            records_dropped: 0,
+            valuation_incomplete_ledgers: 0,
+            non_flat_ledgers: 0,
+            total_net_pnl_ticks: 0,
+        });
+        assert_eq!(no_evidence.evidence_class, "NO_EVIDENCE");
+
+        let invalid = evaluate_simulation_promotion(SimulationPromotionInput {
+            ledger_count: 1,
+            orders: 20,
+            fills: 10,
+            records_dropped: 1,
+            valuation_incomplete_ledgers: 0,
+            non_flat_ledgers: 0,
+            total_net_pnl_ticks: 1,
+        });
+        assert_eq!(invalid.evidence_class, "INVALID_DATA");
     }
 
     #[test]
