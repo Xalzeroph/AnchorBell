@@ -1350,6 +1350,18 @@ impl SimulationEngine {
             BinanceMarketEvent::AggTrade(trade) => self.on_agg_trade(trade),
             BinanceMarketEvent::DepthUpdate(depth) => self.on_depth_update(depth),
         });
+        if self.observe_portfolio_drawdown().blocks_new_risk() {
+            let source = event_symbol(event);
+            let source_rebalanced = matches!(
+                event,
+                BinanceMarketEvent::BookTicker(_) | BinanceMarketEvent::MarkPrice(_)
+            );
+            for symbol in self.states.keys().cloned().collect::<Vec<_>>() {
+                if !source_rebalanced || !symbol.eq_ignore_ascii_case(source) {
+                    records.extend(self.rebalance_symbol(&symbol, self.last_event_at_ms));
+                }
+            }
+        }
         records
     }
 
@@ -2669,11 +2681,7 @@ impl SimulationEngine {
             .map(|allocation| allocation.requested_quantity)
             .unwrap_or(self.requested_quantity);
         let strategy_variant = self.strategy_variant;
-        let portfolio_drawdown_action = if strategy_variant.uses_tail_guard() {
-            self.observe_portfolio_drawdown()
-        } else {
-            PortfolioDrawdownAction::Trading
-        };
+        let portfolio_drawdown_action = self.observe_portfolio_drawdown();
         self.update_adaptive_threshold_controller(
             symbol,
             timestamp_ms,
