@@ -36,7 +36,7 @@ lines. The deployable engine contains these planes:
    contract unless an outer supervisor remembered to enforce it.
 3. The engine now exposes canonical simulation and analytics modules. The largest simulator file still combines runtime, allocation, fills, state, metrics, and reporting responsibilities, so the next scale gate is responsibility extraction behind typed ports.
 4. The repository contains both the Rust engine and an archival Python
-   prototype under src/; the catalog correctly excludes the prototype from
+   prototype under research/legacy-python/src/; the catalog correctly excludes the prototype from
    live authority, but the boundary is not enforced by a CI vocabulary gate.
 5. More than 11 GB of untracked target-* build/run trees accumulated on the
    Windows host. They are build artifacts, not evidence, and were not covered

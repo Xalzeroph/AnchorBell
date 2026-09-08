@@ -24,6 +24,19 @@ pub struct SimulationRunManifest {
 }
 
 impl SimulationRunManifest {
+    pub fn compiled_build_identity() -> String {
+        let configured = std::env::var("ANCHORBELL_BUILD_IDENTITY").ok();
+        configured.unwrap_or_else(|| {
+            format!(
+                "pkg:{};git:{};tree:{};rustc:{}",
+                env!("CARGO_PKG_VERSION"),
+                option_env!("ANCHORBELL_GIT_SHA").unwrap_or("unknown"),
+                option_env!("ANCHORBELL_GIT_DIRTY").unwrap_or("unknown"),
+                option_env!("ANCHORBELL_RUSTC").unwrap_or("unknown"),
+            )
+        })
+    }
+
     pub fn new(
         run_id: impl Into<String>,
         mode: impl Into<String>,
@@ -45,8 +58,7 @@ impl SimulationRunManifest {
             effective_until_ms: None,
             approval_state: "isolated".to_owned(),
             rollback_target: None,
-            build_identity: std::env::var("ANCHORBELL_BUILD_IDENTITY")
-                .unwrap_or_else(|_| "unknown-build".to_owned()),
+            build_identity: Self::compiled_build_identity(),
             symbols,
             policy_variants,
         }
@@ -94,5 +106,7 @@ mod tests {
         assert_eq!(manifest.policy_id, "policy-v1");
         assert_eq!(manifest.parent_policy_id.as_deref(), Some("policy-v0"));
         assert_eq!(manifest.policy_variants, vec!["baseline"]);
+        assert!(!SimulationRunManifest::compiled_build_identity().is_empty());
+        assert!(!SimulationRunManifest::compiled_build_identity().contains("unknown-build"));
     }
 }
