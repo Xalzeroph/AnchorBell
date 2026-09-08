@@ -81,7 +81,7 @@ pub use session_checkpoint::{
 };
 pub use spot::{SpotDemoEndpoints, SpotOrderWire};
 pub use supervisor::{
-    ExecutionSupervisor, GateDecision, GateReason, SupervisorConfig, SupervisorState, LIVE_SYMBOLS,
+    ExecutionSupervisor, GateDecision, GateReason, SupervisorConfig, SupervisorState,
 };
 pub use user_data::{
     parse_user_data_message, AccountUpdate, BinanceUserDataStream, OrderUpdate, PositionUpdate,

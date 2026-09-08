@@ -7,16 +7,6 @@ use super::{
     OrderIntent, SessionCheckpoint, Side, UserDataEvent,
 };
 
-pub const LIVE_SYMBOLS: [&str; 7] = [
-    "CXMTUSDT",
-    "UNITREEUSDT",
-    "GIGADEVUSDT",
-    "HK0625USDT",
-    "MINIMAXUSDT",
-    "ZHIPUUSDT",
-    "ZHONGJIUSDT",
-];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupervisorState {
     Synchronizing,
@@ -107,7 +97,7 @@ struct SymbolState {
 pub struct ExecutionSupervisor {
     state: SupervisorState,
     config: SupervisorConfig,
-    symbols: BTreeMap<&'static str, SymbolState>,
+    symbols: BTreeMap<String, SymbolState>,
     tracked_orders: BTreeSet<String>,
     last_user_event_at_ms: u64,
     unknown_remote_state: bool,
@@ -116,7 +106,11 @@ pub struct ExecutionSupervisor {
 }
 
 impl ExecutionSupervisor {
-    pub fn new(config: SupervisorConfig) -> Result<Self, GateReason> {
+    pub fn new<I, S>(config: SupervisorConfig, symbols: I) -> Result<Self, GateReason>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         if config.max_market_age_ms == 0
             || config.max_fx_age_ms == 0
             || config.max_position <= 0
@@ -124,27 +118,35 @@ impl ExecutionSupervisor {
         {
             return Err(GateReason::InvalidIntent);
         }
-        let symbols = LIVE_SYMBOLS
-            .into_iter()
-            .map(|symbol| {
-                (
-                    symbol,
-                    SymbolState {
-                        market_at_ms: 0,
-                        fx_at_ms: 0,
-                        anchor_ready: false,
-                        equity_closed: false,
-                        funding_known: false,
-                        next_funding_at_ms: 0,
-                        position: 0,
-                    },
-                )
-            })
-            .collect();
+        let mut symbol_states = BTreeMap::new();
+        for raw_symbol in symbols {
+            let symbol = raw_symbol.as_ref().trim().to_ascii_uppercase();
+            if symbol.is_empty()
+                || symbol_states
+                    .insert(
+                        symbol,
+                        SymbolState {
+                            market_at_ms: 0,
+                            fx_at_ms: 0,
+                            anchor_ready: false,
+                            equity_closed: false,
+                            funding_known: false,
+                            next_funding_at_ms: 0,
+                            position: 0,
+                        },
+                    )
+                    .is_some()
+            {
+                return Err(GateReason::InvalidIntent);
+            }
+        }
+        if symbol_states.is_empty() {
+            return Err(GateReason::InvalidIntent);
+        }
         Ok(Self {
             state: SupervisorState::Synchronizing,
             config,
-            symbols,
+            symbols: symbol_states,
             tracked_orders: BTreeSet::new(),
             last_user_event_at_ms: 0,
             unknown_remote_state: false,
@@ -529,7 +531,7 @@ impl ExecutionSupervisor {
                 Err(GateReason::UnknownRemoteState)
             }
             UserDataEvent::OrderUpdate(update) => {
-                if !LIVE_SYMBOLS.contains(&update.symbol.as_str()) {
+                if !self.symbols.contains_key(update.symbol.as_str()) {
                     self.unknown_remote_state = true;
                     self.state = SupervisorState::Halted;
                     return Err(GateReason::UnknownSymbol);
@@ -599,8 +601,23 @@ fn parse_quantity_ticks(value: &str, scale: u32) -> Option<i64> {
 mod tests {
     use super::*;
 
+    fn test_symbols() -> Vec<String> {
+        [
+            "CXMTUSDT",
+            "UNITREEUSDT",
+            "GIGADEVUSDT",
+            "HK0625USDT",
+            "MINIMAXUSDT",
+            "ZHIPUUSDT",
+            "ZHONGJIUSDT",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+
     fn supervisor() -> ExecutionSupervisor {
-        ExecutionSupervisor::new(SupervisorConfig::default()).unwrap()
+        ExecutionSupervisor::new(SupervisorConfig::default(), test_symbols()).unwrap()
     }
 
     fn ready(mut value: ExecutionSupervisor) -> ExecutionSupervisor {
@@ -634,11 +651,20 @@ mod tests {
     }
 
     #[test]
-    fn exact_seven_symbol_universe_is_fixed() {
-        assert_eq!(LIVE_SYMBOLS.len(), 7);
-        assert!(LIVE_SYMBOLS.contains(&"CXMTUSDT"));
-        assert!(LIVE_SYMBOLS.contains(&"ZHONGJIUSDT"));
-        assert!(!LIVE_SYMBOLS.contains(&"BTCUSDT"));
+    fn configured_symbol_universe_is_normalized_and_explicit() {
+        let symbols = test_symbols();
+        assert_eq!(symbols.len(), 7);
+        assert!(symbols.iter().any(|symbol| symbol == "CXMTUSDT"));
+        assert!(symbols.iter().any(|symbol| symbol == "ZHONGJIUSDT"));
+        assert!(!symbols.iter().any(|symbol| symbol == "BTCUSDT"));
+        assert!(ExecutionSupervisor::new(
+            SupervisorConfig::default(),
+            [" cxmtusdt ".to_owned(), "UNITREEUSDT".to_owned()],
+        )
+        .is_ok());
+        assert!(
+            ExecutionSupervisor::new(SupervisorConfig::default(), Vec::<String>::new()).is_err()
+        );
     }
 
     #[test]

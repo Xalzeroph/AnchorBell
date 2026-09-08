@@ -19,7 +19,7 @@ use anchorbell_engine::{
         ReconnectPolicy,
     },
     platform::{HealthSnapshot, RuntimeProfile, SystemRegistry, SystemRole},
-    strategy::{instrument_for, EquityRegion},
+    strategy::{instrument_for, EquityRegion, StrategyProfile},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -103,15 +103,9 @@ struct RuntimeSnapshot {
     last_message: Option<String>,
 }
 
-const SIMULATION_SYMBOLS: [&str; 7] = [
-    "CXMTUSDT",
-    "UNITREEUSDT",
-    "GIGADEVUSDT",
-    "HK0625USDT",
-    "MINIMAXUSDT",
-    "ZHIPUUSDT",
-    "ZHONGJIUSDT",
-];
+fn configured_simulation_symbols() -> Result<Vec<String>, String> {
+    StrategyProfile::load("config/anchorbell-simulation.json").map(|profile| profile.symbols)
+}
 
 impl DashboardSession {
     fn with_credentials(credentials: Option<BinanceCredentials>) -> Self {
@@ -119,7 +113,10 @@ impl DashboardSession {
             config: DeploymentConfig::from_values(BinanceEnvironment::Testnet, false, false, None)
                 .expect("default Testnet configuration must be valid"),
             credentials,
-            symbol: "CXMTUSDT".to_owned(),
+            symbol: configured_simulation_symbols()
+                .ok()
+                .and_then(|symbols| symbols.into_iter().next())
+                .unwrap_or_default(),
             proxy: None,
         }
     }
@@ -502,11 +499,25 @@ async fn start_runtime(body: Vec<u8>, state: &DashboardState) -> (u16, &'static 
                     return json_response(500, json!({"ok": false, "message": message}))
                 }
             };
-            let symbols = request
+            let symbols = match request
                 .symbols
                 .clone()
                 .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| SIMULATION_SYMBOLS.join(","));
+            {
+                Some(symbols) => symbols,
+                None => match configured_simulation_symbols() {
+                    Ok(symbols) if !symbols.is_empty() => symbols.join(","),
+                    Ok(_) => {
+                        return json_response(
+                            500,
+                            json!({"ok": false, "message": "simulation profile has no symbols"}),
+                        )
+                    }
+                    Err(error) => {
+                        return json_response(500, json!({"ok": false, "message": error}))
+                    }
+                },
+            };
             let run_metrics = run_dir.join("metrics.json");
             let run_records = run_dir.join("records.jsonl");
             let run_market = run_dir.join("market.jsonl");

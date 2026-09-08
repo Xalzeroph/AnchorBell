@@ -1,17 +1,21 @@
 use std::time::Instant;
 
+use anchorbell_engine::strategy::StrategyProfile;
+
 use anchorbell_engine::execution::{
     parse_user_data_message, ExecutionSupervisor, GateDecision, OrderIntent, SupervisorConfig,
-    LIVE_SYMBOLS,
 };
 use serde_json::json;
 
 fn main() {
     let start = Instant::now();
-    let mut supervisor = ExecutionSupervisor::new(SupervisorConfig::default())
+    let symbols = StrategyProfile::load("config/anchorbell-simulation.json")
+        .expect("simulation strategy profile must be valid")
+        .symbols;
+    let mut supervisor = ExecutionSupervisor::new(SupervisorConfig::default(), symbols.clone())
         .expect("default supervisor configuration is valid");
 
-    for symbol in LIVE_SYMBOLS {
+    for symbol in &symbols {
         supervisor
             .observe_symbol(symbol, 1, 1, true, true, true, u64::MAX, 0)
             .expect("fixed symbol must be accepted");
@@ -65,7 +69,7 @@ fn main() {
         "state_after_malformed": format!("{:?}", supervisor.state()),
         "elapsed_ms": start.elapsed().as_millis(),
         "state": format!("{:?}", supervisor.state()),
-        "expected_symbols": LIVE_SYMBOLS.len(),
+        "expected_symbols": symbols.len(),
     });
     println!("{}", output);
     assert_eq!(allowed, 1_000_000);
