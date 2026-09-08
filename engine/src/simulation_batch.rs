@@ -970,8 +970,7 @@ pub async fn run(
                     );
                     for ledger in &mut ledgers {
                         let point = ledger.engine.performance_point(observed_at);
-                        ledger.history.push_back(point.clone());
-                        append_risk_history_sample(&mut ledger.risk_history, point, false);
+                        ledger.history.push_back(point);
                         while ledger.history.len() > DISPLAY_HISTORY_CAPACITY {
                             ledger.history.pop_front();
                         }
@@ -1059,6 +1058,13 @@ pub async fn run(
                             .map_err(|_| SimulationError::Io("evidence writer stopped".to_owned()))?;
                     }
                     for ledger in &mut ledgers {
+                        // Risk statistics are sampled on exchange event time, not
+                        // scheduler/metrics-tick time. Seed the fold before the
+                        // first mutation so early PnL is never absorbed as baseline.
+                        if ledger.risk_history.is_empty() {
+                            let baseline = ledger.engine.performance_point(envelope.observed_at_ms);
+                            append_risk_history_sample(&mut ledger.risk_history, baseline, false);
+                        }
                         for record in ledger.engine.on_enveloped_event(&envelope)? {
                             let line = serde_json::to_string(&record)?;
                             ledger
@@ -1067,6 +1073,8 @@ pub async fn run(
                                 .await
                                 .map_err(|_| SimulationError::Io("ledger writer stopped".to_owned()))?;
                         }
+                        let point = ledger.engine.performance_point(envelope.observed_at_ms);
+                        append_risk_history_sample(&mut ledger.risk_history, point, false);
                     }
                 }
                 resync = depth_resync_result_rx.recv() => {
@@ -1190,9 +1198,18 @@ pub async fn run(
                 .map_err(|_| SimulationError::Io("ledger writer stopped".to_owned()))?;
         }
         let observed_at = now_ms();
-        let point = ledger.engine.performance_point(observed_at);
-        ledger.history.push_back(point.clone());
-        append_risk_history_sample(&mut ledger.risk_history, point, true);
+        ledger
+            .history
+            .push_back(ledger.engine.performance_point(observed_at));
+        let event_at = ledger.engine.checkpoint_view(&ledger.spec.label).0;
+        let risk_at = ledger
+            .risk_history
+            .back()
+            .map(|point| point.observed_at_ms)
+            .unwrap_or(0)
+            .max(event_at);
+        let risk_point = ledger.engine.performance_point(risk_at);
+        append_risk_history_sample(&mut ledger.risk_history, risk_point, true);
         while ledger.history.len() > DISPLAY_HISTORY_CAPACITY {
             ledger.history.pop_front();
         }
