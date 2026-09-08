@@ -7,6 +7,8 @@ use std::{
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OosFoldMetrics {
     pub fold_id: String,
+    /// SHA-256 of the exact shared market-event ledger used by this fold.
+    pub data_digest: String,
     pub stress: bool,
     pub net_return_bps: f64,
     pub sharpe_ratio: Option<f64>,
@@ -16,9 +18,17 @@ pub struct OosFoldMetrics {
     pub trades: u64,
 }
 
+fn valid_sha256_digest(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 impl OosFoldMetrics {
     fn valid(&self) -> bool {
         !self.fold_id.trim().is_empty()
+            && valid_sha256_digest(&self.data_digest)
             && self.net_return_bps.is_finite()
             && self.max_drawdown_pct.is_finite()
             && self.max_drawdown_pct >= 0.0
@@ -57,6 +67,49 @@ impl OosFoldBundle {
     }
 }
 
+pub fn validate_candidate_fold_coverage(
+    candidates: &BTreeMap<String, Vec<OosFoldMetrics>>,
+) -> Result<(), &'static str> {
+    if candidates.is_empty() {
+        return Err("candidate_folds_required");
+    }
+    let mut expected_coverage: Option<BTreeSet<(String, bool, String)>> = None;
+    for (candidate_id, folds) in candidates {
+        if candidate_id.trim().is_empty()
+            || folds.is_empty()
+            || folds.iter().any(|fold| !fold.valid())
+        {
+            return Err("invalid_candidate_fold_metrics");
+        }
+        let mut fold_ids = BTreeSet::new();
+        let mut oos_data = BTreeSet::new();
+        let mut stress_data = BTreeSet::new();
+        let mut coverage = BTreeSet::new();
+        for fold in folds {
+            if !fold_ids.insert(fold.fold_id.clone()) {
+                return Err("duplicate_fold_id_within_candidate");
+            }
+            let data_set = if fold.stress {
+                &mut stress_data
+            } else {
+                &mut oos_data
+            };
+            if !data_set.insert(fold.data_digest.clone()) {
+                return Err("duplicate_data_window_within_fold_class");
+            }
+            coverage.insert((fold.fold_id.clone(), fold.stress, fold.data_digest.clone()));
+        }
+        match &expected_coverage {
+            Some(expected) if expected != &coverage => {
+                return Err("candidate_fold_coverage_mismatch")
+            }
+            None => expected_coverage = Some(coverage),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 pub fn merge_fold_bundles(
     bundles: &[OosFoldBundle],
 ) -> Result<BTreeMap<String, Vec<OosFoldMetrics>>, &'static str> {
@@ -64,11 +117,20 @@ pub fn merge_fold_bundles(
         return Err("fold_bundles_required");
     }
     let mut seen_folds = BTreeSet::new();
+    let mut expected_candidates: Option<BTreeSet<String>> = None;
     let mut candidates = BTreeMap::<String, Vec<OosFoldMetrics>>::new();
     for bundle in bundles {
         bundle.validate()?;
         if !seen_folds.insert(bundle.fold_id.clone()) {
             return Err("duplicate_fold_id");
+        }
+        let bundle_candidates = bundle.candidates.keys().cloned().collect::<BTreeSet<_>>();
+        match &expected_candidates {
+            Some(expected) if expected != &bundle_candidates => {
+                return Err("candidate_universe_mismatch")
+            }
+            None => expected_candidates = Some(bundle_candidates),
+            _ => {}
         }
         for (candidate_id, metrics) in &bundle.candidates {
             candidates
@@ -80,6 +142,7 @@ pub fn merge_fold_bundles(
     for folds in candidates.values_mut() {
         folds.sort_by(|left, right| left.fold_id.cmp(&right.fold_id));
     }
+    validate_candidate_fold_coverage(&candidates)?;
     Ok(candidates)
 }
 
@@ -178,6 +241,22 @@ pub fn evaluate_robust_candidate(
     }
     if folds.iter().any(|fold| !fold.valid()) {
         return base("invalid_fold_metrics");
+    }
+    let mut fold_ids = BTreeSet::new();
+    let mut oos_data = BTreeSet::new();
+    let mut stress_data = BTreeSet::new();
+    for fold in folds {
+        if !fold_ids.insert(fold.fold_id.clone()) {
+            return base("duplicate_fold_id");
+        }
+        let data_set = if fold.stress {
+            &mut stress_data
+        } else {
+            &mut oos_data
+        };
+        if !data_set.insert(fold.data_digest.clone()) {
+            return base("duplicate_data_window");
+        }
     }
 
     let oos = folds.iter().filter(|fold| !fold.stress).collect::<Vec<_>>();
@@ -301,8 +380,10 @@ mod tests {
     use super::*;
 
     fn fold(id: &str, stress: bool, ret: f64, sharpe: f64, dd: f64) -> OosFoldMetrics {
+        let digest_seed = id.bytes().fold(0_u8, |acc, byte| acc.wrapping_add(byte));
         OosFoldMetrics {
             fold_id: id.to_owned(),
+            data_digest: format!("sha256:{digest_seed:064x}"),
             stress,
             net_return_bps: ret,
             sharpe_ratio: Some(sharpe),
@@ -337,6 +418,45 @@ mod tests {
             merge_fold_bundles(&[first.clone(), first]).unwrap_err(),
             "duplicate_fold_id"
         );
+    }
+
+    #[test]
+    fn candidate_fold_coverage_mismatch_is_rejected() {
+        let mut candidates = BTreeMap::new();
+        candidates.insert(
+            "a".to_owned(),
+            vec![
+                fold("o1", false, 1.0, 1.0, 1.0),
+                fold("s1", true, -1.0, 0.2, 2.0),
+            ],
+        );
+        candidates.insert("b".to_owned(), vec![fold("o1", false, 1.0, 1.0, 1.0)]);
+        assert_eq!(
+            validate_candidate_fold_coverage(&candidates).unwrap_err(),
+            "candidate_fold_coverage_mismatch"
+        );
+    }
+
+    #[test]
+    fn duplicate_data_window_cannot_inflate_oos_fold_count() {
+        let mut first = fold("o1", false, 1.0, 1.0, 1.0);
+        let mut second = fold("o2", false, 2.0, 1.1, 1.0);
+        second.data_digest = first.data_digest.clone();
+        let result = evaluate_robust_candidate(
+            &[
+                first.clone(),
+                second,
+                fold("o3", false, 3.0, 1.2, 1.0),
+                fold("s1", true, 0.0, 0.2, 2.0),
+                fold("s2", true, 0.0, 0.2, 2.0),
+                fold("s3", true, 0.0, 0.2, 2.0),
+            ],
+            RobustSelectionConstraints::default(),
+        );
+        assert!(!result.eligible);
+        assert_eq!(result.reason, "duplicate_data_window");
+        first.data_digest = format!("sha256:{:064x}", 999_u64);
+        assert!(first.valid());
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    io::Read,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -164,6 +165,20 @@ fn now_ms() -> u64 {
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
 }
+fn sha256_file(path: &Path) -> Result<String, SimulationError> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
+}
+
 async fn available_storage_bytes(path: &Path) -> Result<u64, SimulationError> {
     let output = Command::new("df")
         .arg("-Pk")
@@ -1086,6 +1101,13 @@ pub async fn run(
         .await
         .map_err(|e| SimulationError::Io(e.to_string()))??;
     let evidence_summary = evidence.summary();
+    let validation_market_data_digest = if config.validation_fold_id.is_some() {
+        Some(sha256_file(
+            &config.output_root.join("shared-market.jsonl"),
+        )?)
+    } else {
+        None
+    };
     let mut ledger_results = Vec::with_capacity(ledgers.len());
     for ledger in ledgers {
         drop(ledger.record_tx);
@@ -1176,6 +1198,10 @@ pub async fn run(
                 candidate_id,
                 OosFoldMetrics {
                     fold_id: fold_id.to_owned(),
+                    data_digest: validation_market_data_digest
+                        .as_ref()
+                        .expect("validation digest exists when fold id is configured")
+                        .clone(),
                     stress: config.validation_stress,
                     net_return_bps: risk.total_return_pct * 100.0,
                     sharpe_ratio: risk.sharpe_ratio,

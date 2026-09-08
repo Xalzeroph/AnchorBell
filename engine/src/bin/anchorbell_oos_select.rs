@@ -1,8 +1,9 @@
 use std::{collections::BTreeSet, env, fs, path::PathBuf, process};
 
 use anchorbell_engine::oos_validation::{
-    compare_robust_candidates, evaluate_robust_candidate, merge_fold_bundles, OosFoldBundle,
-    OosFoldMetrics, RobustCandidateEvaluation, RobustSelectionConstraints,
+    compare_robust_candidates, evaluate_robust_candidate, merge_fold_bundles,
+    validate_candidate_fold_coverage, OosFoldBundle, OosFoldMetrics, RobustCandidateEvaluation,
+    RobustSelectionConstraints,
 };
 use serde::{Deserialize, Serialize};
 
@@ -81,6 +82,14 @@ fn main() {
     }) {
         fail("candidate ids must be non-empty and unique");
     }
+
+    let candidate_coverage = request
+        .candidates
+        .iter()
+        .map(|candidate| (candidate.candidate_id.clone(), candidate.folds.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    validate_candidate_fold_coverage(&candidate_coverage)
+        .unwrap_or_else(|reason| fail(format!("invalid candidate fold coverage: {reason}")));
 
     let constraints = request.constraints.unwrap_or_default();
     let mut candidates = request
