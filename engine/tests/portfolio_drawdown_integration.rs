@@ -43,16 +43,16 @@ fn portfolio_drawdown_uses_canonical_net_pnl_and_propagates_cross_symbol() {
     let a_quote = engine.on_event(event(
         r#"{"e":"bookTicker","E":2,"T":2,"u":1,"s":"CXMTUSDT","b":"98","B":"10","a":"99","A":"10"}"#,
     ));
-    assert!(a_quote.iter().any(|record| {
-        record.symbol == "CXMTUSDT" && record.kind == "order_placed"
-    }));
+    assert!(a_quote
+        .iter()
+        .any(|record| { record.symbol == "CXMTUSDT" && record.kind == "order_placed" }));
 
     let b_quote = engine.on_event(event(
         r#"{"e":"bookTicker","E":2,"T":2,"u":1,"s":"UNITREEUSDT","b":"98","B":"10","a":"99","A":"10"}"#,
     ));
-    assert!(b_quote.iter().any(|record| {
-        record.symbol == "UNITREEUSDT" && record.kind == "order_placed"
-    }));
+    assert!(b_quote
+        .iter()
+        .any(|record| { record.symbol == "UNITREEUSDT" && record.kind == "order_placed" }));
 
     let fill = engine.on_event(event(
         r#"{"e":"aggTrade","E":3,"s":"CXMTUSDT","a":1,"p":"98","q":"10","T":3,"m":true}"#,
@@ -70,9 +70,9 @@ fn portfolio_drawdown_uses_canonical_net_pnl_and_propagates_cross_symbol() {
 
     // B received no new market event. Its opening maker quote must still be
     // canceled in the same A event cycle by portfolio-level propagation.
-    assert!(breach.iter().any(|record| {
-        record.symbol == "UNITREEUSDT" && record.kind == "order_canceled"
-    }));
+    assert!(breach
+        .iter()
+        .any(|record| { record.symbol == "UNITREEUSDT" && record.kind == "order_canceled" }));
 
     let snapshot = engine.metrics_snapshot(4, 4);
     let drawdown = snapshot
@@ -98,8 +98,5 @@ fn portfolio_drawdown_uses_canonical_net_pnl_and_propagates_cross_symbol() {
         .find(|symbol| symbol.symbol == "UNITREEUSDT")
         .unwrap();
     assert_eq!(b_metrics.risk_state, "portfolio_drawdown_hard_stop");
-    assert_eq!(
-        b_metrics.entry_block_reason,
-        "portfolio_drawdown_hard_stop"
-    );
+    assert_eq!(b_metrics.entry_block_reason, "portfolio_drawdown_hard_stop");
 }
