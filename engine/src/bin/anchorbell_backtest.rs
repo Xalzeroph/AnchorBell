@@ -43,6 +43,8 @@ struct Args {
     live_risk_gates: bool,
     funding_controller_enabled: bool,
     capital_usdt_ticks: Option<i64>,
+    portfolio_drawdown_soft_limit_bps: i64,
+    portfolio_drawdown_hard_limit_bps: i64,
     require_flat_at_end: bool,
 }
 
@@ -122,6 +124,10 @@ async fn main() {
             live_risk_gates: args.live_risk_gates,
             funding_controller_enabled: args.funding_controller_enabled,
             capital_usdt_ticks: args.capital_usdt_ticks,
+            portfolio_drawdown_limits_bps: drawdown_limits(
+                args.portfolio_drawdown_soft_limit_bps,
+                args.portfolio_drawdown_hard_limit_bps,
+            ),
             calibration_updates_enabled: !args.freeze_calibration,
             calibration_seeds,
         },
@@ -180,6 +186,8 @@ async fn main() {
         "max_position": args.max_position,
         "requested_quantity": args.requested_quantity,
         "capital_usdt_ticks": args.capital_usdt_ticks,
+        "portfolio_drawdown_soft_limit_bps": args.portfolio_drawdown_soft_limit_bps,
+        "portfolio_drawdown_hard_limit_bps": args.portfolio_drawdown_hard_limit_bps,
         "max_mark_index_gap_bps": args.max_mark_index_gap_bps,
         "max_anchor_age_ms": args.max_anchor_age_ms,
         "maker_fee_ppm": args.fee_ppm,
@@ -341,6 +349,8 @@ fn parse_args() -> Result<Args, String> {
     let mut live_risk_gates = false;
     let mut funding_controller_enabled = true;
     let mut capital_usdt_ticks = None;
+    let mut portfolio_drawdown_soft_limit_bps = 0;
+    let mut portfolio_drawdown_hard_limit_bps = 0;
     let mut require_flat_at_end = false;
     let mut args = env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -386,12 +396,33 @@ fn parse_args() -> Result<Args, String> {
             "--capital-usdt" => {
                 capital_usdt_ticks = Some(parse_usdt_ticks(&next(&mut args, &flag)?)?)
             }
+            "--portfolio-drawdown-soft-bps" => {
+                portfolio_drawdown_soft_limit_bps = parse(&mut args, &flag)?
+            }
+            "--portfolio-drawdown-hard-bps" => {
+                portfolio_drawdown_hard_limit_bps = parse(&mut args, &flag)?
+            }
             "--require-flat-at-end" => require_flat_at_end = true,
             unknown => return Err(format!("unknown option {unknown}; use --help")),
         }
     }
     if !funding_controller_enabled && strategy_variant != SimulationPolicyVariant::M8FundingAware {
         return Err("--ablate-funding is valid only with --strategy-variant m8".to_owned());
+    }
+    drawdown_limits(
+        portfolio_drawdown_soft_limit_bps,
+        portfolio_drawdown_hard_limit_bps,
+    )
+    .map(|_| ())
+    .ok_or_else(|| "portfolio drawdown requires 0/0 or 0 < soft < hard <= 10000 bps".to_owned())?;
+    if drawdown_limits(
+        portfolio_drawdown_soft_limit_bps,
+        portfolio_drawdown_hard_limit_bps,
+    )
+    .is_some()
+        && capital_usdt_ticks.is_none()
+    {
+        return Err("portfolio drawdown limits require --capital-usdt".to_owned());
     }
     Ok(Args {
         input: input.ok_or("missing --input")?,
@@ -421,6 +452,8 @@ fn parse_args() -> Result<Args, String> {
         live_risk_gates,
         funding_controller_enabled,
         capital_usdt_ticks,
+        portfolio_drawdown_soft_limit_bps,
+        portfolio_drawdown_hard_limit_bps,
         require_flat_at_end,
     })
 }
@@ -446,6 +479,16 @@ fn parse_strategy_variant(value: &str) -> Result<SimulationPolicyVariant, String
             Ok(SimulationPolicyVariant::M9DeadlineCausalDroMpc)
         }
         _ => Err("invalid --strategy-variant; expected m0..m9".to_owned()),
+    }
+}
+
+fn drawdown_limits(soft: i64, hard: i64) -> Option<(i64, i64)> {
+    if soft == 0 && hard == 0 {
+        None
+    } else if soft > 0 && hard > soft && hard <= 10_000 {
+        Some((soft, hard))
+    } else {
+        None
     }
 }
 
@@ -500,7 +543,7 @@ fn sha256_file(path: &std::path::Path) -> Result<String, std::io::Error> {
 fn print_usage() {
     eprintln!(
         "usage: anchorbell_backtest --input EVENTS.jsonl --anchors ANCHORS.csv [options]\n\
-         options: --records PATH --strategy-variant m0..m9 --capital-usdt N\n\
+         options: --records PATH --strategy-variant m0..m9 --capital-usdt N --portfolio-drawdown-soft-bps N --portfolio-drawdown-hard-bps N\n\
          --calibration-store PATH --calibration-output PATH --calibration-source-label LABEL --freeze-calibration --ablate-funding\n\
          --price-scale N --quantity-scale N --entry-threshold-bps N\n\
          --threshold-scale-ppm N --max-position N --quantity N\n\

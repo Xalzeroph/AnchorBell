@@ -25,6 +25,10 @@ pub struct StrategyProfile {
     pub duration_secs: u64,
     pub entry_threshold_bps: i64,
     pub threshold_scale_ppm: i64,
+    #[serde(default)]
+    pub portfolio_drawdown_soft_limit_bps: i64,
+    #[serde(default)]
+    pub portfolio_drawdown_hard_limit_bps: i64,
     pub max_position: i64,
     pub requested_quantity: i64,
     pub max_mark_index_gap_bps: i64,
@@ -143,6 +147,16 @@ impl StrategyProfile {
         }
         if self.index_anchor_refresh_ms == 0 {
             return Err("strategy profile index-anchor refresh must be enabled".to_owned());
+        }
+        let drawdown_disabled = self.portfolio_drawdown_soft_limit_bps == 0
+            && self.portfolio_drawdown_hard_limit_bps == 0;
+        let drawdown_valid = self.portfolio_drawdown_soft_limit_bps > 0
+            && self.portfolio_drawdown_hard_limit_bps > self.portfolio_drawdown_soft_limit_bps
+            && self.portfolio_drawdown_hard_limit_bps <= 10_000;
+        if !drawdown_disabled && !drawdown_valid {
+            return Err(
+                "portfolio drawdown limits require 0/0 or 0 < soft < hard <= 10000 bps".to_owned(),
+            );
         }
         if self.experiments.is_empty() {
             return Err("strategy profile experiments cannot be empty".to_owned());
@@ -268,6 +282,17 @@ mod tests {
             .unwrap();
         assert_eq!(no_funding.strategy, "m8");
         assert_eq!(no_funding.ablations, vec!["funding".to_owned()]);
+    }
+
+    #[test]
+    fn portfolio_drawdown_limits_are_backward_compatible_and_validated() {
+        let mut profile = shipped_profile();
+        assert_eq!(profile.portfolio_drawdown_soft_limit_bps, 0);
+        assert_eq!(profile.portfolio_drawdown_hard_limit_bps, 0);
+        profile.portfolio_drawdown_soft_limit_bps = 500;
+        assert!(profile.validate().is_err());
+        profile.portfolio_drawdown_hard_limit_bps = 1_000;
+        assert!(profile.validate().is_ok());
     }
 
     #[test]

@@ -5287,27 +5287,7 @@ fn event_symbol(event: &BinanceMarketEvent) -> &str {
 // Legacy wrappers preserve the stable replay API. New research and OOS
 // validation should use ReplayConfig so strategy and execution assumptions are
 // carried by one auditable object.
-#[derive(Debug, Clone)]
-pub struct ReplayConfig {
-    pub price_scale: u32,
-    pub quantity_scale: u32,
-    pub entry_threshold_bps: i64,
-    pub max_position: i64,
-    pub requested_quantity: i64,
-    pub max_mark_index_gap_bps: i64,
-    pub max_anchor_age_ms: u64,
-    pub fee_ppm: i64,
-    pub realism: crate::backtest::realism::RealisticFillModel,
-    pub strategy_variant: SimulationPolicyVariant,
-    pub threshold_scale_ppm: i64,
-    pub quote_reprice_min_interval_ms: u64,
-    pub dynamic_capital_refresh_ms: u64,
-    pub live_risk_gates: bool,
-    pub funding_controller_enabled: bool,
-    pub capital_usdt_ticks: Option<i64>,
-    pub calibration_updates_enabled: bool,
-    pub calibration_seeds: BTreeMap<String, CalibrationState>,
-}
+pub use super::replay_config::ReplayConfig;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ReplayEvaluation {
@@ -5401,6 +5381,7 @@ pub fn replay_jsonl_with_realism(
             live_risk_gates: false,
             funding_controller_enabled: true,
             capital_usdt_ticks: None,
+            portfolio_drawdown_limits_bps: None,
             calibration_updates_enabled: true,
             calibration_seeds: BTreeMap::new(),
         },
@@ -5457,6 +5438,14 @@ pub fn replay_jsonl_with_config(
     engine.set_calibration_updates_enabled(config.calibration_updates_enabled);
     if let Some(allocations) = allocations {
         engine = engine.with_position_allocations(allocations)?;
+    }
+    if let Some((soft, hard)) = config.portfolio_drawdown_limits_bps {
+        let capital = config
+            .capital_usdt_ticks
+            .ok_or(SimulationError::InvalidConfig(
+                "drawdown limits require capital",
+            ))?;
+        engine = engine.with_portfolio_drawdown_limits_bps(capital, soft, hard)?;
     }
 
     let reader = BufReader::new(File::open(input_path)?);

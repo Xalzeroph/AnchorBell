@@ -189,6 +189,8 @@ fn main() {
             quantity_scale: profile.quantity_scale,
             price_scale: profile.price_scale,
             position_allocations: Some(allocations),
+            portfolio_drawdown_soft_limit_bps: profile.portfolio_drawdown_soft_limit_bps,
+            portfolio_drawdown_hard_limit_bps: profile.portfolio_drawdown_hard_limit_bps,
             output_root,
             specs,
             m9_calibration_source_label: profile.m9_calibration_source_label.clone(),

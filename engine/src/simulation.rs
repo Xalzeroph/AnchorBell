@@ -15,6 +15,8 @@ pub mod orchestration;
 pub mod portfolio_guard;
 #[path = "simulation/replay.rs"]
 pub mod replay;
+#[path = "simulation/replay_config.rs"]
+pub mod replay_config;
 #[path = "simulation/risk_metrics.rs"]
 pub mod risk_metrics;
 #[path = "simulation/runtime.rs"]

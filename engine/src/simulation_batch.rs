@@ -74,6 +74,8 @@ pub struct SimulationBatchConfig {
     pub quantity_scale: u32,
     pub price_scale: u32,
     pub position_allocations: Option<BTreeMap<String, PositionAllocation>>,
+    pub portfolio_drawdown_soft_limit_bps: i64,
+    pub portfolio_drawdown_hard_limit_bps: i64,
     pub output_root: PathBuf,
     pub specs: Vec<SimulationBatchSpec>,
     /// Declared candidate population used to seed/warm-start M9 calibration.
@@ -410,6 +412,24 @@ fn build_engine(
     if let Some(allocations) = config.position_allocations.clone() {
         engine = engine.with_position_allocations(allocations)?;
     }
+    if config.portfolio_drawdown_soft_limit_bps != 0
+        || config.portfolio_drawdown_hard_limit_bps != 0
+    {
+        let capital = config
+            .position_allocations
+            .as_ref()
+            .map(|allocations| {
+                allocations.values().fold(0_i64, |total, allocation| {
+                    total.saturating_add(allocation.budget_usdt_ticks)
+                })
+            })
+            .unwrap_or(0);
+        engine = engine.with_portfolio_drawdown_limits_bps(
+            capital,
+            config.portfolio_drawdown_soft_limit_bps,
+            config.portfolio_drawdown_hard_limit_bps,
+        )?;
+    }
     Ok(engine)
 }
 
@@ -560,6 +580,8 @@ pub async fn run(
     let manifest_created_at_ms = now_ms();
     let parameter_material = serde_json::json!({
         "policy_id": config.policy_id,
+        "portfolio_drawdown_soft_limit_bps": config.portfolio_drawdown_soft_limit_bps,
+        "portfolio_drawdown_hard_limit_bps": config.portfolio_drawdown_hard_limit_bps,
         "m9_calibration_source_label": config.m9_calibration_source_label,
         "specs": config.specs.iter().map(|spec| serde_json::json!({
             "label": spec.label,
@@ -592,6 +614,8 @@ pub async fn run(
         "depth_snapshot_limit": config.depth_snapshot_limit,
         "checkpoint_interval_ms": config.checkpoint_interval_ms,
         "duration_secs": config.duration_secs,
+        "portfolio_drawdown_soft_limit_bps": config.portfolio_drawdown_soft_limit_bps,
+        "portfolio_drawdown_hard_limit_bps": config.portfolio_drawdown_hard_limit_bps,
         "validation_fold_id": config.validation_fold_id,
         "validation_stress_profile": config.validation_stress_profile,
         "risk_history_window_ms": RISK_HISTORY_WINDOW_MS,
@@ -1414,6 +1438,8 @@ mod tests {
             quantity_scale: 8,
             price_scale: 8,
             position_allocations: Some(BTreeMap::new()),
+            portfolio_drawdown_soft_limit_bps: 0,
+            portfolio_drawdown_hard_limit_bps: 0,
             output_root: PathBuf::from("target/test-stress"),
             specs: vec![],
             m9_calibration_source_label: "F3_m3".to_owned(),
