@@ -46,12 +46,8 @@ use crate::{
     },
 };
 
-/// M9 uses a declared calibration population instead of whichever ledger has
-/// the largest sample count. This keeps the warm-start source auditable and
 const MIN_SIMULATION_FREE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const STORAGE_SAFETY_SCHEMA_VERSION: u16 = 1;
-/// avoids mixing policy-specific order selection into a single unlabeled model.
-const M9_CALIBRATION_SOURCE_LABEL: &str = "F3_m3";
 const DISPLAY_HISTORY_CAPACITY: usize = 900;
 
 #[derive(Debug, Clone)]
@@ -80,6 +76,8 @@ pub struct SimulationBatchConfig {
     pub position_allocations: Option<BTreeMap<String, PositionAllocation>>,
     pub output_root: PathBuf,
     pub specs: Vec<SimulationBatchSpec>,
+    /// Declared candidate population used to seed/warm-start M9 calibration.
+    pub m9_calibration_source_label: String,
     pub max_subscriptions_per_shard: usize,
     pub connect_timeout_ms: u64,
     pub read_timeout_ms: u64,
@@ -271,10 +269,10 @@ fn calibration_rank(snapshot: &CalibrationSnapshot) -> (u64, u64, u64, u64) {
     )
 }
 
-fn warm_start_m9_from_source(ledgers: &mut [Ledger]) {
+fn warm_start_m9_from_source(ledgers: &mut [Ledger], source_label: &str) {
     let seeds = ledgers
         .iter()
-        .find(|ledger| ledger.spec.label == M9_CALIBRATION_SOURCE_LABEL)
+        .find(|ledger| ledger.spec.label == source_label)
         .map(|ledger| {
             ledger
                 .engine
@@ -485,6 +483,26 @@ fn validate(config: &SimulationBatchConfig) -> Result<(), SimulationError> {
             "batch execution contains duplicate candidate semantics",
         ));
     }
+    if config
+        .specs
+        .iter()
+        .any(|spec| spec.variant == SimulationPolicyVariant::M9DeadlineCausalDroMpc)
+    {
+        let source = config
+            .specs
+            .iter()
+            .find(|spec| spec.label == config.m9_calibration_source_label)
+            .ok_or(SimulationError::InvalidConfig(
+                "M9 calibration source is missing from the batch",
+            ))?;
+        if source.variant == SimulationPolicyVariant::M9DeadlineCausalDroMpc
+            || !source.ablations.is_empty()
+        {
+            return Err(SimulationError::InvalidConfig(
+                "M9 calibration source must be non-M9 and non-ablated",
+            ));
+        }
+    }
     if let Some(fold_id) = config.validation_fold_id.as_deref() {
         if fold_id.trim().is_empty() {
             return Err(SimulationError::InvalidConfig(
@@ -541,6 +559,7 @@ pub async fn run(
     let manifest_created_at_ms = now_ms();
     let parameter_material = serde_json::json!({
         "policy_id": config.policy_id,
+        "m9_calibration_source_label": config.m9_calibration_source_label,
         "entry_threshold_bps": config.entry_threshold_bps,
         "threshold_scale_ppm": config.threshold_scale_ppm,
         "fee_ppm": config.fee_ppm,
@@ -588,6 +607,7 @@ pub async fn run(
             None,
         ),
         "policy_id": config.policy_id,
+        "m9_calibration_source_label": config.m9_calibration_source_label,
         "created_at_ms": manifest_created_at_ms,
         "parameter_digest": parameter_digest,
         "data_digest": data_digest,
@@ -643,7 +663,7 @@ pub async fn run(
     for spec in &config.specs {
         let calibration_source = if spec.variant == SimulationPolicyVariant::M9DeadlineCausalDroMpc
         {
-            M9_CALIBRATION_SOURCE_LABEL
+            config.m9_calibration_source_label.as_str()
         } else {
             spec.label.as_str()
         };
@@ -891,7 +911,10 @@ pub async fn run(
                         }
                     }
                     write_json_atomic(&evidence_summary_path, &evidence.summary()).await?;
-                    warm_start_m9_from_source(&mut ledgers);
+                    warm_start_m9_from_source(
+                        &mut ledgers,
+                        &config.m9_calibration_source_label,
+                    );
                     for ledger in &mut ledgers {
                         let point = ledger.engine.performance_point(observed_at);
                         ledger.history.push_back(point.clone());
@@ -1364,6 +1387,7 @@ mod tests {
             position_allocations: Some(BTreeMap::new()),
             output_root: PathBuf::from("target/test-stress"),
             specs: vec![],
+            m9_calibration_source_label: "F3_m3".to_owned(),
             max_subscriptions_per_shard: 1,
             connect_timeout_ms: 1,
             read_timeout_ms: 1,

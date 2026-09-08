@@ -3,6 +3,7 @@ pub mod anchor_policy;
 pub mod calendar;
 pub mod calibration;
 pub mod capital;
+pub mod config;
 pub mod flatten;
 pub mod instrument_profile;
 pub mod inventory;
@@ -29,6 +30,7 @@ pub use calibration::{
     CalibrationParameter, CalibrationSnapshot, CalibrationState, CalibrationStatus,
     CALIBRATION_MODEL_VERSION, CALIBRATION_SCHEMA_VERSION,
 };
+pub use config::StrategyProfile;
 pub use flatten::{DualFlattenPlan, FlattenPhase, FlattenReason};
 pub use instrument_profile::{profile_for, AnchorCurrency, InstrumentKind, InstrumentProfile};
 pub use inventory::InventoryState;
