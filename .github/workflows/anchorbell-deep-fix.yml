@@ -31,6 +31,9 @@ jobs:
       - name: Extract risk metrics module
         run: python3 .github/scripts/anchorbell_risk_metrics_module_fix.py
 
+      - name: Enforce causal walk-forward calibration
+        run: python3 .github/scripts/anchorbell_walkforward_contract_fix.py
+
       - name: Format
         run: cargo fmt --all
 
@@ -58,6 +61,6 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add engine/src/simulation.rs engine/src/simulation/runtime.rs engine/src/simulation/risk_metrics.rs
-          git commit -m "refactor: isolate simulation risk metrics"
+          git add engine/src/strategy/calibration.rs engine/src/simulation.rs engine/src/simulation/runtime.rs engine/src/simulation/risk_metrics.rs engine/src/bin/anchorbell_backtest.rs
+          git commit -m "fix: enforce causal walk-forward calibration"
           git push origin HEAD:diag-risk-20260908
