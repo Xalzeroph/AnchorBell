@@ -495,11 +495,12 @@ fn validate(config: &SimulationBatchConfig) -> Result<(), SimulationError> {
             .ok_or(SimulationError::InvalidConfig(
                 "M9 calibration source is missing from the batch",
             ))?;
-        if source.variant == SimulationPolicyVariant::M9DeadlineCausalDroMpc
+        if source.variant < SimulationPolicyVariant::M3FillAware
+            || source.variant > SimulationPolicyVariant::M8FundingAware
             || !source.ablations.is_empty()
         {
             return Err(SimulationError::InvalidConfig(
-                "M9 calibration source must be non-M9 and non-ablated",
+                "M9 calibration source must be an unablated fill-aware M3-M8 ledger",
             ));
         }
     }
@@ -560,18 +561,41 @@ pub async fn run(
     let parameter_material = serde_json::json!({
         "policy_id": config.policy_id,
         "m9_calibration_source_label": config.m9_calibration_source_label,
+        "specs": config.specs.iter().map(|spec| serde_json::json!({
+            "label": spec.label,
+            "strategy_variant": spec.variant.label(),
+            "ablations": spec.ablations,
+        })).collect::<Vec<_>>(),
         "entry_threshold_bps": config.entry_threshold_bps,
         "threshold_scale_ppm": config.threshold_scale_ppm,
+        "max_position": config.max_position,
+        "requested_quantity": config.requested_quantity,
+        "max_mark_index_gap_bps": config.max_mark_index_gap_bps,
+        "max_anchor_age_ms": config.max_anchor_age_ms,
         "fee_ppm": config.fee_ppm,
+        "quantity_scale": config.quantity_scale,
+        "price_scale": config.price_scale,
+        "max_subscriptions_per_shard": config.max_subscriptions_per_shard,
+        "connect_timeout_ms": config.connect_timeout_ms,
+        "read_timeout_ms": config.read_timeout_ms,
+        "metrics_refresh_ms": config.metrics_refresh_ms,
+        "index_anchor_refresh_ms": config.index_anchor_refresh_ms,
+        "fx_refresh_ms": config.fx_refresh_ms,
+        "fx_max_age_ms": config.fx_max_age_ms,
         "queue_ahead": config.queue_ahead,
         "trade_through": config.trade_through,
         "market_to_decision_ms": config.market_to_decision_ms,
         "decision_to_exchange_ms": config.decision_to_exchange_ms,
         "cancel_to_exchange_ms": config.cancel_to_exchange_ms,
+        "quote_reprice_min_interval_ms": config.quote_reprice_min_interval_ms,
         "dynamic_capital_refresh_ms": config.dynamic_capital_refresh_ms,
         "depth_snapshot_limit": config.depth_snapshot_limit,
+        "checkpoint_interval_ms": config.checkpoint_interval_ms,
         "duration_secs": config.duration_secs,
+        "validation_fold_id": config.validation_fold_id,
+        "validation_stress_profile": config.validation_stress_profile,
         "risk_history_window_ms": RISK_HISTORY_WINDOW_MS,
+        "evidence": config.evidence,
     });
     let parameter_bytes = serde_json::to_vec(&parameter_material)
         .map_err(|_| SimulationError::InvalidConfig("cannot encode parameter digest"))?;
@@ -608,6 +632,11 @@ pub async fn run(
         ),
         "policy_id": config.policy_id,
         "m9_calibration_source_label": config.m9_calibration_source_label,
+        "experiment_specs": config.specs.iter().map(|spec| serde_json::json!({
+            "label": spec.label,
+            "strategy_variant": spec.variant.label(),
+            "ablations": spec.ablations,
+        })).collect::<Vec<_>>(),
         "created_at_ms": manifest_created_at_ms,
         "parameter_digest": parameter_digest,
         "data_digest": data_digest,

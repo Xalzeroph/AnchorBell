@@ -178,9 +178,14 @@ impl StrategyProfile {
                 .iter()
                 .find(|experiment| experiment.label == self.m9_calibration_source_label)
                 .ok_or_else(|| "M9 calibration source is not present in experiments".to_owned())?;
-            if source.strategy == "m9" || !source.ablations.is_empty() {
+            if !matches!(
+                source.strategy.as_str(),
+                "m3" | "m4" | "m5" | "m6" | "m7" | "m8"
+            ) || !source.ablations.is_empty()
+            {
                 return Err(
-                    "M9 calibration source must be a non-M9, non-ablated candidate".to_owned(),
+                    "M9 calibration source must be an unablated fill-aware M3-M8 candidate"
+                        .to_owned(),
                 );
             }
         }
@@ -275,6 +280,17 @@ mod tests {
             .unwrap()
             .strategy = "m7".to_owned();
         assert!(profile.validate().is_err());
+    }
+
+    #[test]
+    fn m9_source_rejects_pre_fill_aware_candidates() {
+        let mut profile = shipped_profile();
+        profile.m9_calibration_source_label = "F1_m1".to_owned();
+        assert!(profile.validate().is_err());
+        profile.m9_calibration_source_label = "F2_m2".to_owned();
+        assert!(profile.validate().is_err());
+        profile.m9_calibration_source_label = "F3_m3".to_owned();
+        assert!(profile.validate().is_ok());
     }
 
     #[test]
