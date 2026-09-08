@@ -37,6 +37,9 @@ jobs:
       - name: Integrate portfolio drawdown runtime guard
         run: python3 .github/scripts/anchorbell_portfolio_drawdown_runtime_fix.py
 
+      - name: Compact portfolio drawdown runtime glue
+        run: python3 .github/scripts/anchorbell_portfolio_drawdown_budget_fix.py
+
       - name: Format
         run: cargo fmt --all
 
