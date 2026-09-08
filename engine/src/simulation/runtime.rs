@@ -1680,6 +1680,22 @@ impl SimulationEngine {
         }
     }
 
+    pub fn restore_calibration_states_if_unavailable(
+        &mut self,
+        seeds: &BTreeMap<String, CalibrationState>,
+    ) {
+        for (symbol, seed) in seeds {
+            if seed.instrument != symbol.as_str() || seed.snapshot(0).calibration.is_none() {
+                continue;
+            }
+            if let Some(state) = self.states.get_mut(symbol) {
+                if state.calibration.snapshot(0).calibration.is_none() {
+                    state.calibration = seed.clone();
+                }
+            }
+        }
+    }
+
     pub fn calibration_snapshots(
         &self,
         fee_pico_bps: i64,
@@ -2030,17 +2046,27 @@ impl SimulationEngine {
         last_received_at_ms: u64,
         history: &[PerformancePoint],
     ) -> MetricsSnapshot {
+        self.metrics_snapshot_with_histories(observed_at_ms, last_received_at_ms, history, history)
+    }
+
+    pub fn metrics_snapshot_with_histories(
+        &self,
+        observed_at_ms: u64,
+        last_received_at_ms: u64,
+        display_history: &[PerformancePoint],
+        risk_history: &[PerformancePoint],
+    ) -> MetricsSnapshot {
         let mut snapshot = self.metrics_snapshot(observed_at_ms, last_received_at_ms);
-        snapshot.history = history.to_vec();
+        snapshot.history = display_history.to_vec();
         if let Some(capital_ticks) = snapshot.capital_usdt_ticks.filter(|capital| *capital > 0) {
-            let portfolio_points = history
+            let portfolio_points = risk_history
                 .iter()
                 .map(|point| (point.observed_at_ms, point.net_pnl_ticks))
                 .collect::<Vec<_>>();
             snapshot.risk_metrics = Some(calculate_risk_metrics(&portfolio_points, capital_ticks));
 
             let mut symbol_points = BTreeMap::<String, Vec<(u64, i64)>>::new();
-            for point in history {
+            for point in risk_history {
                 for symbol_point in &point.symbols {
                     symbol_points
                         .entry(symbol_point.symbol.clone())
@@ -3821,7 +3847,11 @@ fn dynamic_threshold_diagnostic_for(
         .saturating_add(fill_feedback_pico_bps)
         .max(0);
     let statistical_pico_bps = if variant.uses_statistical_term() {
-        state.ewma_abs_return_pico_bps.saturating_mul(8)
+        uncertainty_pico_bps
+            .saturating_add(cost_pico_bps)
+            .saturating_add(spread_pico_bps)
+            .saturating_add(adverse_selection_pico_bps)
+            .saturating_add(state.ewma_abs_return_pico_bps.saturating_mul(8))
     } else {
         0
     };
@@ -4764,7 +4794,8 @@ pub async fn run_simulation(
     let quantity_scale = config.quantity_scale;
     let mut fx_latest_by_currency = BTreeMap::<String, FxUpdate>::new();
     let mut fx_last_update_at_ms = 0_u64;
-    let mut performance_history = VecDeque::with_capacity(900);
+    let mut performance_history = VecDeque::with_capacity(DISPLAY_HISTORY_CAPACITY);
+    let mut risk_history = VecDeque::with_capacity(RISK_HISTORY_CAPACITY);
     let run_result = tokio::time::timeout(run_duration, async {
         loop {
             tokio::select! {
@@ -4814,16 +4845,24 @@ pub async fn run_simulation(
                 _ = metrics_interval.tick(), if metrics_output_path.is_some() => {
                     if let Some(path) = metrics_output_path.as_deref() {
                         let observed_at_ms = now_ms();
-                        performance_history.push_back(engine.performance_point(observed_at_ms));
-                        while performance_history.len() > 900 {
+                        let point = engine.performance_point(observed_at_ms);
+                        performance_history.push_back(point.clone());
+                        risk_history.push_back(point);
+                        while performance_history.len() > DISPLAY_HISTORY_CAPACITY {
                             performance_history.pop_front();
                         }
+                        while risk_history.len() > RISK_HISTORY_CAPACITY {
+                            risk_history.pop_front();
+                        }
+                        let display = performance_history.make_contiguous().to_vec();
+                        let risk = risk_history.make_contiguous().to_vec();
                         write_json_atomic(
                             path,
-                            &engine.metrics_snapshot_with_history(
+                            &engine.metrics_snapshot_with_histories(
                                 observed_at_ms,
                                 last_received_at_ms,
-                                performance_history.make_contiguous(),
+                                &display,
+                                &risk,
                             ),
                         ).await?;
                     }
@@ -4907,16 +4946,24 @@ pub async fn run_simulation(
     }
     if let Some(path) = metrics_output_path.as_deref() {
         let observed_at_ms = now_ms();
-        performance_history.push_back(engine.performance_point(observed_at_ms));
-        while performance_history.len() > 900 {
+        let point = engine.performance_point(observed_at_ms);
+        performance_history.push_back(point.clone());
+        risk_history.push_back(point);
+        while performance_history.len() > DISPLAY_HISTORY_CAPACITY {
             performance_history.pop_front();
         }
+        while risk_history.len() > RISK_HISTORY_CAPACITY {
+            risk_history.pop_front();
+        }
+        let display = performance_history.make_contiguous().to_vec();
+        let risk = risk_history.make_contiguous().to_vec();
         write_json_atomic(
             path,
-            &engine.metrics_snapshot_with_history(
+            &engine.metrics_snapshot_with_histories(
                 observed_at_ms,
                 last_received_at_ms,
-                performance_history.make_contiguous(),
+                &display,
+                &risk,
             ),
         )
         .await?;
@@ -4969,7 +5016,10 @@ pub async fn run_simulation(
     })
 }
 
+const DISPLAY_HISTORY_CAPACITY: usize = 900;
+const RISK_HISTORY_CAPACITY: usize = 7_201;
 const RISK_SAMPLE_INTERVAL_MS: u64 = 30_000;
+const MIN_RISK_RETURN_SAMPLES: usize = 30;
 
 fn calculate_risk_metrics(points: &[(u64, i64)], capital_ticks: i64) -> RiskMetrics {
     let capital = capital_ticks.max(1) as f64;
@@ -5042,7 +5092,7 @@ fn calculate_risk_metrics(points: &[(u64, i64)], capital_ticks: i64) -> RiskMetr
         .sum::<f64>();
 
     RiskMetrics {
-        status: if sample_count >= 30 {
+        status: if sample_count >= MIN_RISK_RETURN_SAMPLES {
             "ok".to_owned()
         } else {
             "insufficient_history".to_owned()
@@ -5058,9 +5108,9 @@ fn calculate_risk_metrics(points: &[(u64, i64)], capital_ticks: i64) -> RiskMetr
         },
         average_return_bps: mean * 10_000.0,
         profit_factor: (gross_loss > 0.0).then_some(gross_profit / gross_loss),
-        sharpe_ratio: (sample_count >= 30 && standard_deviation > 0.0)
+        sharpe_ratio: (sample_count >= MIN_RISK_RETURN_SAMPLES && standard_deviation > 0.0)
             .then_some(mean / standard_deviation * annualization),
-        sortino_ratio: (sample_count >= 30 && downside_deviation > 0.0)
+        sortino_ratio: (sample_count >= MIN_RISK_RETURN_SAMPLES && downside_deviation > 0.0)
             .then_some(mean / downside_deviation * annualization),
     }
 }

@@ -46,7 +46,7 @@ impl ExperimentPlan {
         // economic hypothesis testing.
         experiments.push(ExperimentSpec {
             label: "M8_no_funding".into(),
-            strategy: "m7".into(),
+            strategy: "m8".into(),
             ablations: vec!["funding".into()],
         });
         Self {
@@ -92,11 +92,17 @@ impl ExperimentPlan {
         Ok(())
     }
 
-    pub fn runtime_specs(&self) -> Result<Vec<(String, SimulationPolicyVariant)>, &'static str> {
+    pub fn runtime_specs_with_ablations(
+        &self,
+    ) -> Result<Vec<(String, SimulationPolicyVariant, Vec<String>)>, &'static str> {
         self.validate()?;
         self.experiments
             .iter()
             .map(|experiment| {
+                let funding_disabled = experiment
+                    .ablations
+                    .iter()
+                    .any(|ablation| ablation == "funding");
                 let variant = match experiment.strategy.as_str() {
                     "m1" => SimulationPolicyVariant::M1AdaptiveRisk,
                     "m2" => SimulationPolicyVariant::M2Microstructure,
@@ -105,13 +111,27 @@ impl ExperimentPlan {
                     "m5" => SimulationPolicyVariant::M5Robust,
                     "m6" => SimulationPolicyVariant::M6DynamicCapital,
                     "m7" => SimulationPolicyVariant::M7EvidenceGated,
+                    "m8" if funding_disabled => SimulationPolicyVariant::M7EvidenceGated,
                     "m8" => SimulationPolicyVariant::M8FundingAware,
                     "m9" => SimulationPolicyVariant::M9DeadlineCausalDroMpc,
                     _ => return Err("unknown experiment strategy"),
                 };
-                Ok((experiment.label.clone(), variant))
+                Ok((
+                    experiment.label.clone(),
+                    variant,
+                    experiment.ablations.clone(),
+                ))
             })
             .collect()
+    }
+
+    pub fn runtime_specs(&self) -> Result<Vec<(String, SimulationPolicyVariant)>, &'static str> {
+        self.runtime_specs_with_ablations().map(|specs| {
+            specs
+                .into_iter()
+                .map(|(label, variant, _)| (label, variant))
+                .collect()
+        })
     }
 }
 
@@ -123,6 +143,19 @@ mod tests {
         let plan = ExperimentPlan::m1_to_m8();
         assert_eq!(plan.experiments.len(), 9);
         assert_eq!(plan.runtime_specs().unwrap().len(), 9);
+        let no_funding = plan
+            .experiments
+            .iter()
+            .find(|experiment| experiment.label == "M8_no_funding")
+            .unwrap();
+        assert_eq!(no_funding.strategy, "m8");
+        let runtime = plan.runtime_specs_with_ablations().unwrap();
+        let (_, variant, ablations) = runtime
+            .iter()
+            .find(|(label, _, _)| label == "M8_no_funding")
+            .unwrap();
+        assert_eq!(*variant, SimulationPolicyVariant::M7EvidenceGated);
+        assert_eq!(ablations, &vec!["funding".to_owned()]);
     }
 
     #[test]
