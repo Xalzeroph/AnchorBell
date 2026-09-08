@@ -55,10 +55,26 @@ jobs:
         run: python3 .github/scripts/anchorbell_drawdown_fixture_cleanup_fix.py
 
       - name: Propagate portfolio drawdown across symbols
-        run: python3 .github/scripts/anchorbell_drawdown_portfolio_propagation_fix.py
+        shell: bash
+        run: |
+          if grep -q 'let portfolio_drawdown_action = self.observe_portfolio_drawdown();' engine/src/simulation/runtime.rs \
+            && grep -q 'self.observe_portfolio_drawdown().blocks_new_risk()' engine/src/simulation/runtime.rs \
+            && grep -q 'eq_ignore_ascii_case(source)' engine/src/simulation/runtime.rs; then
+            echo "portfolio drawdown propagation already present"
+          else
+            python3 .github/scripts/anchorbell_drawdown_portfolio_propagation_fix.py
+          fi
 
       - name: Align drawdown metrics semantics
-        run: python3 .github/scripts/anchorbell_drawdown_metrics_semantics_fix.py
+        shell: bash
+        run: |
+          if grep -q 'pub fn metric_labels' engine/src/simulation/portfolio_guard.rs \
+            && grep -q 'then_some(s.net_pnl_ticks)' engine/src/simulation/runtime.rs \
+            && grep -q 'risk_state: labels.0.to_owned()' engine/src/simulation/runtime.rs; then
+            echo "portfolio drawdown observability already aligned"
+          else
+            python3 .github/scripts/anchorbell_drawdown_metrics_semantics_fix.py
+          fi
 
       - name: Format
         run: cargo fmt --all
