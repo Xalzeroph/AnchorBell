@@ -159,10 +159,14 @@ fn main() {
                 fail(format!("cannot allocate simulation-batch capital: {error}"))
             });
         let specs = experiment_plan
-            .runtime_specs()
+            .runtime_specs_with_ablations()
             .unwrap_or_else(|error| fail(format!("invalid experiment plan: {error}")))
             .into_iter()
-            .map(|(label, variant)| SimulationBatchSpec { label, variant })
+            .map(|(label, variant, ablations)| SimulationBatchSpec {
+                label,
+                variant,
+                ablations,
+            })
             .collect();
         registry
             .transition(&run_id, RunStatus::Running, timestamp_ms())

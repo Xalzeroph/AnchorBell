@@ -49,11 +49,14 @@ const MIN_SIMULATION_FREE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const STORAGE_SAFETY_SCHEMA_VERSION: u16 = 1;
 /// avoids mixing policy-specific order selection into a single unlabeled model.
 const M9_CALIBRATION_SOURCE_LABEL: &str = "F3_m3";
+const DISPLAY_HISTORY_CAPACITY: usize = 900;
+const RISK_HISTORY_CAPACITY: usize = 7_201;
 
 #[derive(Debug, Clone)]
 pub struct SimulationBatchSpec {
     pub label: String,
     pub variant: SimulationPolicyVariant,
+    pub ablations: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +106,7 @@ pub struct SimulationBatchConfig {
 pub struct SimulationLedgerResult {
     pub label: String,
     pub strategy_variant: String,
+    pub ablations: Vec<String>,
     pub evidence_record_id: String,
     pub summary: SimulationSummary,
     pub settlement_status: String,
@@ -142,6 +146,7 @@ struct Ledger {
     record_dropped: Arc<AtomicU64>,
     metrics_path: PathBuf,
     history: VecDeque<PerformancePoint>,
+    risk_history: VecDeque<PerformancePoint>,
     settlement_status: String,
     flatten_requested: bool,
 }
@@ -240,6 +245,34 @@ fn calibration_rank(snapshot: &CalibrationSnapshot) -> (u64, u64, u64, u64) {
         snapshot.state.completed_orders,
         snapshot.window_end_event_time_ms,
     )
+}
+
+fn warm_start_m9_from_source(ledgers: &mut [Ledger]) {
+    let seeds = ledgers
+        .iter()
+        .find(|ledger| ledger.spec.label == M9_CALIBRATION_SOURCE_LABEL)
+        .map(|ledger| {
+            ledger
+                .engine
+                .calibration_snapshots(0)
+                .into_iter()
+                .filter_map(|(symbol, snapshot)| {
+                    snapshot.calibration.map(|_| (symbol, snapshot.state))
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    if seeds.is_empty() {
+        return;
+    }
+    for ledger in ledgers
+        .iter_mut()
+        .filter(|ledger| ledger.spec.variant == SimulationPolicyVariant::M9DeadlineCausalDroMpc)
+    {
+        ledger
+            .engine
+            .restore_calibration_states_if_unavailable(&seeds);
+    }
 }
 
 async fn persist_calibration_store(path: &Path, ledgers: &[Ledger]) -> Result<(), SimulationError> {
@@ -451,6 +484,7 @@ pub async fn run(
         "data_digest": data_digest,
         "strategy_variants": config.specs.iter().map(|spec| spec.variant.label()).collect::<Vec<_>>(),
         "spec_labels": config.specs.iter().map(|spec| spec.label.as_str()).collect::<Vec<_>>(),
+        "spec_ablations": config.specs.iter().map(|spec| &spec.ablations).collect::<Vec<_>>(),
         "symbols": config.symbols,
         "output_root": config.output_root,
         "entry_threshold_bps": config.entry_threshold_bps,
@@ -520,7 +554,8 @@ pub async fn run(
             record_written,
             record_dropped,
             metrics_path: dir.join("metrics.json"),
-            history: VecDeque::with_capacity(900),
+            history: VecDeque::with_capacity(DISPLAY_HISTORY_CAPACITY),
+            risk_history: VecDeque::with_capacity(RISK_HISTORY_CAPACITY),
             settlement_status: "not_started".to_owned(),
             flatten_requested: false,
         });
@@ -744,10 +779,25 @@ pub async fn run(
                         }
                     }
                     write_json_atomic(&evidence_summary_path, &evidence.summary()).await?;
+                    warm_start_m9_from_source(&mut ledgers);
                     for ledger in &mut ledgers {
-                        ledger.history.push_back(ledger.engine.performance_point(observed_at));
-                        while ledger.history.len() > 900 { ledger.history.pop_front(); }
-                        let snapshot = ledger.engine.metrics_snapshot_with_history(observed_at, last_received_at_ms, ledger.history.make_contiguous());
+                        let point = ledger.engine.performance_point(observed_at);
+                        ledger.history.push_back(point.clone());
+                        ledger.risk_history.push_back(point);
+                        while ledger.history.len() > DISPLAY_HISTORY_CAPACITY {
+                            ledger.history.pop_front();
+                        }
+                        while ledger.risk_history.len() > RISK_HISTORY_CAPACITY {
+                            ledger.risk_history.pop_front();
+                        }
+                        let display = ledger.history.make_contiguous().to_vec();
+                        let risk = ledger.risk_history.make_contiguous().to_vec();
+                        let snapshot = ledger.engine.metrics_snapshot_with_histories(
+                            observed_at,
+                            last_received_at_ms,
+                            &display,
+                            &risk,
+                        );
                         write_json_atomic(&ledger.metrics_path, &snapshot).await?;
                     }
                     persist_calibration_store(&calibration_store_path, &ledgers).await?;
@@ -955,16 +1005,22 @@ pub async fn run(
                 .map_err(|_| SimulationError::Io("ledger writer stopped".to_owned()))?;
         }
         let observed_at = now_ms();
-        ledger
-            .history
-            .push_back(ledger.engine.performance_point(observed_at));
-        while ledger.history.len() > 900 {
+        let point = ledger.engine.performance_point(observed_at);
+        ledger.history.push_back(point.clone());
+        ledger.risk_history.push_back(point);
+        while ledger.history.len() > DISPLAY_HISTORY_CAPACITY {
             ledger.history.pop_front();
         }
-        let snapshot = ledger.engine.metrics_snapshot_with_history(
+        while ledger.risk_history.len() > RISK_HISTORY_CAPACITY {
+            ledger.risk_history.pop_front();
+        }
+        let display = ledger.history.make_contiguous().to_vec();
+        let risk = ledger.risk_history.make_contiguous().to_vec();
+        let snapshot = ledger.engine.metrics_snapshot_with_histories(
             observed_at,
             last_received_at_ms,
-            ledger.history.make_contiguous(),
+            &display,
+            &risk,
         );
         write_json_atomic(&ledger.metrics_path, &snapshot).await?;
     }
@@ -992,6 +1048,7 @@ pub async fn run(
         ledger_results.push(SimulationLedgerResult {
             label: ledger.spec.label,
             strategy_variant: ledger.spec.variant.label().to_owned(),
+            ablations: ledger.spec.ablations,
             evidence_record_id: evidence.evidence_id(),
             summary: ledger.engine.summary(),
             settlement_status: ledger.settlement_status,
