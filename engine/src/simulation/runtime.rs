@@ -1391,6 +1391,26 @@ impl SimulationEngine {
             as i64
     }
 
+    fn stable_post_fee_loss_bps(net_pnl_ticks: i64, fills: u64, baseline_budget: i64) -> i64 {
+        if fills < Self::DYNAMIC_PERFORMANCE_MIN_FILLS || net_pnl_ticks >= 0 || baseline_budget <= 0
+        {
+            return 0;
+        }
+        (i128::from(net_pnl_ticks).abs().saturating_mul(10_000) / i128::from(baseline_budget))
+            .clamp(0, 250) as i64
+    }
+
+    /// Penalize fee inefficiency without making the penalty grow merely because
+    /// a simulation has been running longer. Fees are already included in net
+    /// PnL; this bounded term measures how much positive gross edge they consume.
+    fn fee_efficiency_penalty_bps(gross_pnl_ticks: i64, fees_ticks: i64, fills: u64) -> i64 {
+        if fills < Self::DYNAMIC_PERFORMANCE_MIN_FILLS || gross_pnl_ticks <= 0 || fees_ticks <= 0 {
+            return 0;
+        }
+        (i128::from(fees_ticks).saturating_mul(100) / i128::from(gross_pnl_ticks)).clamp(0, 100)
+            as i64
+    }
+
     fn refresh_dynamic_allocations(&mut self, timestamp_ms: u64) -> Vec<SimulationRecord> {
         if !self.strategy_variant.uses_dynamic_capital()
             || self.capital_usdt_ticks.is_none()
@@ -1420,32 +1440,22 @@ impl SimulationEngine {
                 } else {
                     0
                 };
-                let allocated_capital = self
-                    .position_allocations
-                    .get(symbol)
-                    .map(|allocation| allocation.budget_usdt_ticks)
-                    .filter(|budget| *budget > 0)
-                    .unwrap_or(fallback_budget.max(1));
-                let net_pnl_ticks = state
+                // Performance penalties must use a stable denominator. Using the
+                // current dynamic allocation creates a positive-feedback loop: reducing a
+                // budget makes the same historical loss look larger and forces another cut.
+                let performance_budget = fallback_budget.max(1);
+                let gross_pnl_ticks = state
                     .market_pnl_ticks
                     .saturating_add(state.strategy_pnl_ticks)
-                    .saturating_add(state.funding_pnl_ticks)
-                    .saturating_sub(state.fees_ticks);
+                    .saturating_add(state.funding_pnl_ticks);
+                let net_pnl_ticks = gross_pnl_ticks.saturating_sub(state.fees_ticks);
                 let post_fee_loss_bps =
-                    if state.fills >= Self::DYNAMIC_PERFORMANCE_MIN_FILLS && net_pnl_ticks < 0 {
-                        (i128::from(net_pnl_ticks).abs().saturating_mul(10_000)
-                            / i128::from(allocated_capital))
-                        .clamp(0, 250) as i64
-                    } else {
-                        0
-                    };
-                let fee_drag_bps = if state.fills >= Self::DYNAMIC_PERFORMANCE_MIN_FILLS {
-                    (i128::from(state.fees_ticks.max(0)).saturating_mul(10_000)
-                        / i128::from(allocated_capital))
-                    .clamp(0, 100) as i64
-                } else {
-                    0
-                };
+                    Self::stable_post_fee_loss_bps(net_pnl_ticks, state.fills, performance_budget);
+                let fee_drag_bps = Self::fee_efficiency_penalty_bps(
+                    gross_pnl_ticks,
+                    state.fees_ticks,
+                    state.fills,
+                );
                 let adverse_markout_bps =
                     pico_bps_to_bps(state.ewma_adverse_markout_pico_bps).clamp(0, 100);
                 let risk_bps = 1_i64
@@ -5935,6 +5945,35 @@ mod tests {
             Err(SimulationError::ReplaySymbolNotConfigured(symbol)) if symbol == "XYZUSDT"
         ));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    #[test]
+    fn allocator_performance_penalty_uses_stable_scale() {
+        assert_eq!(
+            SimulationEngine::stable_post_fee_loss_bps(-50, 10, 10_000),
+            50
+        );
+        assert_eq!(
+            SimulationEngine::stable_post_fee_loss_bps(-50, 10, 20_000),
+            25
+        );
+        assert_eq!(
+            SimulationEngine::stable_post_fee_loss_bps(-50, 9, 10_000),
+            0
+        );
+    }
+
+    #[test]
+    fn fee_efficiency_penalty_is_ratio_based_not_runtime_accumulation() {
+        let short = SimulationEngine::fee_efficiency_penalty_bps(1_000, 200, 10);
+        let long = SimulationEngine::fee_efficiency_penalty_bps(10_000, 2_000, 100);
+        assert_eq!(short, 20);
+        assert_eq!(short, long);
+        assert_eq!(
+            SimulationEngine::fee_efficiency_penalty_bps(-1, 200, 100),
+            0
+        );
     }
 
     #[test]
