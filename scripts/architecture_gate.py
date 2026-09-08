@@ -22,9 +22,7 @@ analytics = ROOT / "engine" / "src" / "analytics.rs"
 analytics_text = analytics.read_text(encoding="utf-8")
 if re.search(r"crate::execution|crate::market::live|tokio_tungstenite|reqwest", analytics_text):
     raise SystemExit(f"analytics execution coupling: {analytics}")
-decision_execution = [
-    p for root in (strategy, execution) for p in root.rglob("*.rs")
-]
+decision_execution = [p for root in (strategy, execution) for p in root.rglob("*.rs")]
 legacy_boundary = re.compile(r"crate::(analytics_evidence|analytics_validation|analytics)")
 for path in decision_execution:
     text = path.read_text(encoding="utf-8", errors="replace")
@@ -73,7 +71,7 @@ for obsolete in ("control.registry", "control.recovery", "control.console"):
 
 for path in (ROOT / "engine" / "src" / "bin").glob("*.rs"):
     text = path.read_text(encoding="utf-8", errors="replace")
-    if re.search(r"RuntimeHealthReporter[\\s\\S]{0,400}\\.start\\(\\s*&\\[", text):
+    if re.search(r"RuntimeHealthReporter[\s\S]{0,400}\.start\(\s*&\[", text):
         raise SystemExit(f"entrypoint owns a manual health system list: {path}")
 
 print("ARCHITECTURE_GATE_PASS")
