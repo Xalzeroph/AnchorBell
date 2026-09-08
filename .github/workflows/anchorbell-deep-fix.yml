@@ -40,6 +40,9 @@ jobs:
       - name: Extract replay configuration module
         run: python3 .github/scripts/anchorbell_replay_config_module_fix.py
 
+      - name: Repair drawdown fixtures and replay imports
+        run: python3 .github/scripts/anchorbell_drawdown_fixture_cleanup_fix.py
+
       - name: Format
         run: cargo fmt --all
 
