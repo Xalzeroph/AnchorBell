@@ -25,11 +25,8 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Apply stateful maker queue repair
-        run: python3 .github/scripts/anchorbell_stateful_queue_fix.py
-
-      - name: Repair stateful queue regression fixtures
-        run: python3 .github/scripts/anchorbell_stateful_queue_test_fix.py
+      - name: Apply allocator feedback stability repair
+        run: python3 .github/scripts/anchorbell_allocator_feedback_fix.py
 
       - name: Format
         run: cargo fmt --all
@@ -59,5 +56,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add engine/src/simulation/runtime.rs
-          git commit -m "fix: consume observed maker queue before fills"
+          git commit -m "fix: stabilize post-fee dynamic allocation scoring"
           git push origin HEAD:diag-risk-20260908
