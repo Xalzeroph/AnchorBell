@@ -4935,12 +4935,9 @@ pub async fn run_simulation(
                         let observed_at_ms = now_ms();
                         let point = engine.performance_point(observed_at_ms);
                         performance_history.push_back(point.clone());
-                        risk_history.push_back(point);
+                        push_risk_history_point(&mut risk_history, point, false);
                         while performance_history.len() > DISPLAY_HISTORY_CAPACITY {
                             performance_history.pop_front();
-                        }
-                        while risk_history.len() > RISK_HISTORY_CAPACITY {
-                            risk_history.pop_front();
                         }
                         let display = performance_history.make_contiguous().to_vec();
                         let risk = risk_history.make_contiguous().to_vec();
@@ -5036,12 +5033,9 @@ pub async fn run_simulation(
         let observed_at_ms = now_ms();
         let point = engine.performance_point(observed_at_ms);
         performance_history.push_back(point.clone());
-        risk_history.push_back(point);
+        push_risk_history_point(&mut risk_history, point, true);
         while performance_history.len() > DISPLAY_HISTORY_CAPACITY {
             performance_history.pop_front();
-        }
-        while risk_history.len() > RISK_HISTORY_CAPACITY {
-            risk_history.pop_front();
         }
         let display = performance_history.make_contiguous().to_vec();
         let risk = risk_history.make_contiguous().to_vec();
@@ -5105,20 +5099,47 @@ pub async fn run_simulation(
 }
 
 const DISPLAY_HISTORY_CAPACITY: usize = 900;
-const RISK_HISTORY_CAPACITY: usize = 7_201;
 const RISK_SAMPLE_INTERVAL_MS: u64 = 30_000;
+const RISK_HISTORY_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+const RISK_HISTORY_CAPACITY: usize =
+    (RISK_HISTORY_RETENTION_MS / RISK_SAMPLE_INTERVAL_MS) as usize + 2;
 const MIN_RISK_RETURN_SAMPLES: usize = 30;
+
+fn push_risk_history_point(
+    history: &mut VecDeque<PerformancePoint>,
+    point: PerformancePoint,
+    force_endpoint: bool,
+) {
+    if history
+        .back()
+        .is_some_and(|last| last.observed_at_ms == point.observed_at_ms)
+    {
+        history.pop_back();
+        history.push_back(point);
+    } else if force_endpoint
+        || history.back().is_none_or(|last| {
+            point.observed_at_ms.saturating_sub(last.observed_at_ms) >= RISK_SAMPLE_INTERVAL_MS
+        })
+    {
+        history.push_back(point);
+    }
+    while history.len() > RISK_HISTORY_CAPACITY {
+        history.pop_front();
+    }
+}
 
 fn calculate_risk_metrics(points: &[(u64, i64)], capital_ticks: i64) -> RiskMetrics {
     let capital = capital_ticks.max(1) as f64;
+    let baseline_pnl_ticks = points.first().map(|(_, pnl)| *pnl).unwrap_or(0);
     let total_return_pct = points
         .last()
-        .map(|(_, pnl)| (*pnl as f64 / capital) * 100.0)
+        .map(|(_, pnl)| (pnl.saturating_sub(baseline_pnl_ticks) as f64 / capital) * 100.0)
         .unwrap_or(0.0);
     let mut max_drawdown_pct = 0.0_f64;
     let mut peak_equity = 1.0_f64;
     for (_, pnl) in points {
-        let equity = 1.0 + (*pnl as f64 / capital);
+        let window_pnl_ticks = pnl.saturating_sub(baseline_pnl_ticks);
+        let equity = 1.0 + (window_pnl_ticks as f64 / capital);
         peak_equity = peak_equity.max(equity);
         if peak_equity > 0.0 {
             max_drawdown_pct = max_drawdown_pct.max((peak_equity - equity) / peak_equity * 100.0);
@@ -5689,6 +5710,38 @@ mod tests {
             .iter()
             .any(|record| record.kind == "order_canceled"));
         assert_eq!(engine.summary().working_orders, 0);
+    }
+
+    #[test]
+    fn risk_history_uses_independent_sampling_and_forced_endpoint() {
+        let point = |observed_at_ms, net_pnl_ticks| PerformancePoint {
+            observed_at_ms,
+            market_pnl_ticks: net_pnl_ticks,
+            strategy_pnl_ticks: 0,
+            funding_pnl_ticks: 0,
+            fees_ticks: 0,
+            gross_pnl_ticks: net_pnl_ticks,
+            net_pnl_ticks,
+            current_absolute_position: 0,
+            symbols: Vec::new(),
+        };
+        let mut history = VecDeque::new();
+        push_risk_history_point(&mut history, point(0, 100), false);
+        push_risk_history_point(&mut history, point(1_000, 101), false);
+        assert_eq!(history.len(), 1);
+        push_risk_history_point(&mut history, point(30_000, 102), false);
+        assert_eq!(history.len(), 2);
+        push_risk_history_point(&mut history, point(31_000, 103), true);
+        assert_eq!(history.len(), 3);
+        assert_eq!(history.back().unwrap().net_pnl_ticks, 103);
+    }
+
+    #[test]
+    fn rolling_risk_metrics_normalize_to_window_start() {
+        let points = vec![(0, 1_000), (30_000, 1_100), (60_000, 1_200)];
+        let metrics = calculate_risk_metrics(&points, 10_000);
+        assert!((metrics.total_return_pct - 2.0).abs() < 1e-9);
+        assert!(metrics.max_drawdown_pct.abs() < 1e-9);
     }
 
     #[test]

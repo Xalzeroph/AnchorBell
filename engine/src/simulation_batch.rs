@@ -52,7 +52,11 @@ const STORAGE_SAFETY_SCHEMA_VERSION: u16 = 1;
 /// avoids mixing policy-specific order selection into a single unlabeled model.
 const M9_CALIBRATION_SOURCE_LABEL: &str = "F3_m3";
 const DISPLAY_HISTORY_CAPACITY: usize = 900;
-const RISK_HISTORY_CAPACITY: usize = 7_201;
+const RISK_SAMPLE_INTERVAL_MS: u64 = 30_000;
+const RISK_HISTORY_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+const RISK_HISTORY_CAPACITY: usize =
+    (RISK_HISTORY_RETENTION_MS / RISK_SAMPLE_INTERVAL_MS) as usize + 2;
+const MAX_VALIDATION_FOLD_DURATION_SECS: u64 = RISK_HISTORY_RETENTION_MS / 1_000;
 
 #[derive(Debug, Clone)]
 pub struct SimulationBatchSpec {
@@ -159,6 +163,29 @@ struct Ledger {
     settlement_status: String,
     flatten_requested: bool,
 }
+fn push_batch_risk_history_point(
+    history: &mut VecDeque<PerformancePoint>,
+    point: PerformancePoint,
+    force_endpoint: bool,
+) {
+    if history
+        .back()
+        .is_some_and(|last| last.observed_at_ms == point.observed_at_ms)
+    {
+        history.pop_back();
+        history.push_back(point);
+    } else if force_endpoint
+        || history.back().is_none_or(|last| {
+            point.observed_at_ms.saturating_sub(last.observed_at_ms) >= RISK_SAMPLE_INTERVAL_MS
+        })
+    {
+        history.push_back(point);
+    }
+    while history.len() > RISK_HISTORY_CAPACITY {
+        history.pop_front();
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -460,6 +487,11 @@ fn validate(config: &SimulationBatchConfig) -> Result<(), SimulationError> {
         if config.duration_secs == 0 {
             return Err(SimulationError::InvalidConfig(
                 "validation folds require a finite duration",
+            ));
+        }
+        if config.duration_secs > MAX_VALIDATION_FOLD_DURATION_SECS {
+            return Err(SimulationError::InvalidConfig(
+                "validation fold exceeds retained risk-history window",
             ));
         }
         if config.position_allocations.is_none() {
@@ -845,12 +877,9 @@ pub async fn run(
                     for ledger in &mut ledgers {
                         let point = ledger.engine.performance_point(observed_at);
                         ledger.history.push_back(point.clone());
-                        ledger.risk_history.push_back(point);
+                        push_batch_risk_history_point(&mut ledger.risk_history, point, false);
                         while ledger.history.len() > DISPLAY_HISTORY_CAPACITY {
                             ledger.history.pop_front();
-                        }
-                        while ledger.risk_history.len() > RISK_HISTORY_CAPACITY {
-                            ledger.risk_history.pop_front();
                         }
                         let display = ledger.history.make_contiguous().to_vec();
                         let risk = ledger.risk_history.make_contiguous().to_vec();
@@ -1069,12 +1098,9 @@ pub async fn run(
         let observed_at = now_ms();
         let point = ledger.engine.performance_point(observed_at);
         ledger.history.push_back(point.clone());
-        ledger.risk_history.push_back(point);
+        push_batch_risk_history_point(&mut ledger.risk_history, point, true);
         while ledger.history.len() > DISPLAY_HISTORY_CAPACITY {
             ledger.history.pop_front();
-        }
-        while ledger.risk_history.len() > RISK_HISTORY_CAPACITY {
-            ledger.risk_history.pop_front();
         }
         let display = ledger.history.make_contiguous().to_vec();
         let risk = ledger.risk_history.make_contiguous().to_vec();
