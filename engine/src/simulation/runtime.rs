@@ -1371,15 +1371,37 @@ impl SimulationEngine {
         records
     }
 
+    const DYNAMIC_ALLOCATION_MIN_REFRESH_MS: u64 = 5 * 60 * 1_000;
+    const DYNAMIC_ALLOCATION_REBALANCE_DEADBAND_BPS: i64 = 100;
+    const DYNAMIC_PERFORMANCE_MIN_FILLS: u64 = 10;
+
+    fn allocation_budget_change_bps(old_budget: i64, new_budget: i64, total_capital: i64) -> i64 {
+        if total_capital <= 0 {
+            return i64::MAX;
+        }
+        let delta = i128::from(new_budget)
+            .saturating_sub(i128::from(old_budget))
+            .abs();
+        (delta.saturating_mul(10_000) / i128::from(total_capital)).clamp(0, i128::from(i64::MAX))
+            as i64
+    }
+
     fn refresh_dynamic_allocations(&mut self, timestamp_ms: u64) -> Vec<SimulationRecord> {
         if !self.strategy_variant.uses_dynamic_capital()
             || self.capital_usdt_ticks.is_none()
             || (self.last_dynamic_capital_update_ms > 0
                 && timestamp_ms.saturating_sub(self.last_dynamic_capital_update_ms)
-                    < self.dynamic_capital_refresh_ms)
+                    < self
+                        .dynamic_capital_refresh_ms
+                        .max(Self::DYNAMIC_ALLOCATION_MIN_REFRESH_MS))
         {
             return Vec::new();
         }
+        let total_capital = self.capital_usdt_ticks.unwrap_or(0);
+        if total_capital <= 0 {
+            return Vec::new();
+        }
+        let fallback_budget = total_capital / i64::try_from(self.states.len()).unwrap_or(1).max(1);
         let risk_inputs = self
             .states
             .iter()
@@ -1393,11 +1415,42 @@ impl SimulationEngine {
                 } else {
                     0
                 };
+                let allocated_capital = self
+                    .position_allocations
+                    .get(symbol)
+                    .map(|allocation| allocation.budget_usdt_ticks)
+                    .filter(|budget| *budget > 0)
+                    .unwrap_or(fallback_budget.max(1));
+                let net_pnl_ticks = state
+                    .market_pnl_ticks
+                    .saturating_add(state.strategy_pnl_ticks)
+                    .saturating_add(state.funding_pnl_ticks)
+                    .saturating_sub(state.fees_ticks);
+                let post_fee_loss_bps =
+                    if state.fills >= Self::DYNAMIC_PERFORMANCE_MIN_FILLS && net_pnl_ticks < 0 {
+                        (i128::from(net_pnl_ticks).abs().saturating_mul(10_000)
+                            / i128::from(allocated_capital))
+                        .clamp(0, 250) as i64
+                    } else {
+                        0
+                    };
+                let fee_drag_bps = if state.fills >= Self::DYNAMIC_PERFORMANCE_MIN_FILLS {
+                    (i128::from(state.fees_ticks.max(0)).saturating_mul(10_000)
+                        / i128::from(allocated_capital))
+                    .clamp(0, 100) as i64
+                } else {
+                    0
+                };
+                let adverse_markout_bps =
+                    pico_bps_to_bps(state.ewma_adverse_markout_pico_bps).clamp(0, 100);
                 let risk_bps = 1_i64
                     .saturating_add(state.ewma_abs_return_bps.saturating_mul(3))
                     .saturating_add(state.ewma_spread_bps)
                     .saturating_add(gap_bps / 2)
                     .saturating_add(tail_bps / 2)
+                    .saturating_add(adverse_markout_bps.saturating_mul(2))
+                    .saturating_add(fee_drag_bps)
+                    .saturating_add(post_fee_loss_bps)
                     .max(1);
                 let eligible = data_quality_for(state, timestamp_ms, self.max_mark_index_gap_bps)
                     == DataQualityStatus::Fresh
@@ -1411,10 +1464,6 @@ impl SimulationEngine {
             Ok(weights) => weights,
             Err(_) => return Vec::new(),
         };
-        let total_capital = self.capital_usdt_ticks.unwrap_or(0);
-        if total_capital <= 0 {
-            return Vec::new();
-        }
         let symbols = self.states.keys().cloned().collect::<Vec<_>>();
         let mut budget_left = i128::from(total_capital);
         let mut weight_left = 10_000_i64;
@@ -1449,13 +1498,22 @@ impl SimulationEngine {
             .filter(|symbol| {
                 let old = self.position_allocations.get(*symbol);
                 let candidate = allocations.get(*symbol);
-                old.map(|allocation| {
-                    candidate.is_some_and(|candidate| {
-                        allocation.budget_usdt_ticks != candidate.budget_usdt_ticks
-                            || allocation.max_position != candidate.max_position
-                    })
-                })
-                .unwrap_or(true)
+                match (old, candidate) {
+                    (Some(old), Some(candidate)) => {
+                        let budget_change_bps = Self::allocation_budget_change_bps(
+                            old.budget_usdt_ticks,
+                            candidate.budget_usdt_ticks,
+                            total_capital,
+                        );
+                        let absolute_position = self.states[*symbol]
+                            .position
+                            .checked_abs()
+                            .unwrap_or(i64::MAX);
+                        budget_change_bps >= Self::DYNAMIC_ALLOCATION_REBALANCE_DEADBAND_BPS
+                            || candidate.max_position < absolute_position
+                    }
+                    _ => true,
+                }
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -4514,6 +4572,10 @@ fn apply_position_fill(
         Side::Buy => quantity,
         Side::Sell => -quantity,
     };
+    let notional = i128::from(price_ticks).abs() * i128::from(quantity).abs();
+    let fill_fee_ticks = clamp_i128(
+        notional * i128::from(fee_ppm) / 1_000_000 / quantity_scale_multiplier(quantity_scale),
+    );
     let execution_alpha = state.mark_price_ticks.map(|mark| match side {
         Side::Buy => i128::from(mark) - i128::from(price_ticks),
         Side::Sell => i128::from(price_ticks) - i128::from(mark),
@@ -4522,9 +4584,10 @@ fn apply_position_fill(
         let alpha_ticks = alpha * i128::from(quantity) / quantity_scale_multiplier(quantity_scale);
         let alpha_ticks = clamp_i128(alpha_ticks);
         state.strategy_pnl_ticks = state.strategy_pnl_ticks.saturating_add(alpha_ticks);
-        if alpha_ticks > 0 {
+        let fee_adjusted_alpha = alpha_ticks.saturating_sub(fill_fee_ticks);
+        if fee_adjusted_alpha > 0 {
             state.winning_fills = state.winning_fills.saturating_add(1);
-        } else if alpha_ticks < 0 {
+        } else if fee_adjusted_alpha < 0 {
             state.losing_fills = state.losing_fills.saturating_add(1);
         }
     }
@@ -4557,10 +4620,7 @@ fn apply_position_fill(
         }
     }
     state.position = clamp_i128(i128::from(old_position) + i128::from(delta));
-    let notional = i128::from(price_ticks).abs() * i128::from(quantity).abs();
-    state.fees_ticks = state.fees_ticks.saturating_add(clamp_i128(
-        notional * i128::from(fee_ppm) / 1_000_000 / quantity_scale_multiplier(quantity_scale),
-    ));
+    state.fees_ticks = state.fees_ticks.saturating_add(fill_fee_ticks);
 }
 
 fn quantity_scale_multiplier(quantity_scale: u32) -> i128 {
@@ -5597,6 +5657,22 @@ mod tests {
             Err(SimulationError::ReplaySymbolNotConfigured(symbol)) if symbol == "XYZUSDT"
         ));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dynamic_allocation_deadband_ignores_sub_percent_noise() {
+        assert_eq!(
+            SimulationEngine::allocation_budget_change_bps(2_000, 2_050, 10_000),
+            50
+        );
+        assert_eq!(
+            SimulationEngine::allocation_budget_change_bps(2_000, 2_200, 10_000),
+            200
+        );
+        assert!(
+            SimulationEngine::allocation_budget_change_bps(2_000, 2_050, 10_000)
+                < SimulationEngine::DYNAMIC_ALLOCATION_REBALANCE_DEADBAND_BPS
+        );
     }
 
     #[test]

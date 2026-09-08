@@ -680,6 +680,18 @@ pub struct SimulationPromotionGate {
 
 pub fn evaluate_simulation_promotion(input: SimulationPromotionInput) -> SimulationPromotionGate {
     const MINIMUM_FILLS: u64 = 100;
+    if input.ledger_count > 1 {
+        return SimulationPromotionGate {
+            methodology_id: "anchorbell-automatic-promotion-v2".to_owned(),
+            minimum_fills: MINIMUM_FILLS,
+            integrity_passed: input.records_dropped == 0,
+            evidence_sufficient: false,
+            economic_passed: false,
+            survival_passed: input.valuation_incomplete_ledgers == 0 && input.non_flat_ledgers == 0,
+            verdict: ValidationVerdict::Indeterminate,
+            reason: "candidate_level_oos_validation_required".to_owned(),
+        };
+    }
     let integrity_passed = input.ledger_count > 0 && input.records_dropped == 0;
     let evidence_sufficient = input.fills >= MINIMUM_FILLS && input.orders >= input.fills;
     let economic_passed = evidence_sufficient && input.total_net_pnl_ticks > 0;
@@ -704,7 +716,7 @@ pub fn evaluate_simulation_promotion(input: SimulationPromotionInput) -> Simulat
         "all_promotion_conditions_passed".to_owned()
     };
     SimulationPromotionGate {
-        methodology_id: "anchorbell-automatic-promotion-v1".to_owned(),
+        methodology_id: "anchorbell-automatic-promotion-v2".to_owned(),
         minimum_fills: MINIMUM_FILLS,
         integrity_passed,
         evidence_sufficient,
@@ -741,6 +753,22 @@ mod method_tests {
         );
         assert_eq!(result.net_edge_bps, Some(193));
         assert_eq!(result.markout_samples, 1);
+    }
+
+    #[test]
+    fn multi_ledger_matrix_requires_candidate_level_oos_validation() {
+        let gate = evaluate_simulation_promotion(SimulationPromotionInput {
+            ledger_count: 10,
+            orders: 1_000,
+            fills: 500,
+            records_dropped: 0,
+            valuation_incomplete_ledgers: 0,
+            non_flat_ledgers: 0,
+            total_net_pnl_ticks: 1_000_000,
+        });
+        assert_eq!(gate.verdict, ValidationVerdict::Indeterminate);
+        assert_eq!(gate.reason, "candidate_level_oos_validation_required");
+        assert!(!gate.economic_passed);
     }
 
     #[test]
