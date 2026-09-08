@@ -22,7 +22,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::{
-    backtest::{MakerQuote, TopOfBook},
+    backtest::TopOfBook,
     execution::BinanceEnvironment,
     execution::{OrderIntent, Side},
     market::{
@@ -625,8 +625,13 @@ struct WorkingOrder {
     price_ticks: i64,
     remaining_quantity: i64,
     reduce_only: bool,
-    /// Quantity resting ahead of this order when it reached the exchange.
+    /// Initial modeled quantity resting ahead of this order. When local depth is
+    /// seeded this includes the observed quantity at our price plus any explicit
+    /// synthetic queue/trade-through stress.
     queue_ahead_quantity: i64,
+    /// Stateful queue barrier still requiring compatible aggressor volume before
+    /// this maker order may fill. This can only decrease after exchange arrival.
+    queue_ahead_remaining: i64,
     /// Absolute distance from the contemporaneous mid, in basis points.
     quote_distance_bps: i64,
     placed_at_ms: u64,
@@ -2091,8 +2096,9 @@ impl SimulationEngine {
                 crate::execution::binance_wire::format_ticks(capital, self.price_scale)
             }),
             model_assumptions: ModelAssumptions {
-                fill_model: "local_depth_when_seeded_else_top_of_book_plus_aggregate_trade_queue"
-                    .to_owned(),
+                fill_model:
+                    "stateful_fifo_observed_depth_plus_synthetic_queue_then_aggregate_trade"
+                        .to_owned(),
                 queue_ahead: self.realism.queue.visible_ahead,
                 trade_through: self.realism.queue.trade_through,
                 market_to_decision_ms: self.realism.latency.market_to_decision_ms,
@@ -2358,7 +2364,6 @@ impl SimulationEngine {
         let symbol = trade.symbol.to_ascii_uppercase();
         let fee_ppm = self.fee_ppm;
         let quantity_scale = self.quantity_scale;
-        let realism = self.realism;
         let (quantity, order) = {
             let Some(state) = self.states.get_mut(&symbol) else {
                 return Vec::new();
@@ -2428,24 +2433,37 @@ impl SimulationEngine {
                     ask_quantity: book.ask_quantity,
                 }
             };
-            let fill_quantity = realism.evaluate_after_latency(
-                MakerQuote {
-                    side: order.side,
-                    price_ticks: order.price_ticks,
-                    quantity: order.remaining_quantity,
-                },
-                book,
-                trade.quantity.0,
-            );
-            let quantity = match fill_quantity {
-                crate::backtest::FillDecision::Fill { quantity } => quantity,
-                crate::backtest::FillDecision::NoFill => 0,
-            };
-            if quantity <= 0 {
+            // Consume FIFO queue state cumulatively across compatible trades. The
+            // previous model compared each aggregate trade independently against a
+            // fixed global queue threshold and ignored the observed per-order queue.
+            let mut updated_order = order;
+            let aggressed_quantity = trade.quantity.0.max(0);
+            let consumed_ahead = aggressed_quantity.min(updated_order.queue_ahead_remaining.max(0));
+            updated_order.queue_ahead_remaining = updated_order
+                .queue_ahead_remaining
+                .saturating_sub(consumed_ahead);
+            let executable_quantity = aggressed_quantity.saturating_sub(consumed_ahead);
+            if executable_quantity <= 0 {
+                state.working = Some(updated_order);
                 return Vec::new();
             }
-            let mut updated_order = order;
-            updated_order.remaining_quantity -= quantity;
+            // Queue and trade-through assumptions were incorporated once at order
+            // placement. After they are exhausted, cap the fill by currently
+            // displayed depth and remaining maker quantity without double-counting.
+            let displayed_depth = match order.side {
+                Side::Buy => book.bid_quantity,
+                Side::Sell => book.ask_quantity,
+            };
+            let quantity = executable_quantity
+                .min(displayed_depth.max(0))
+                .min(updated_order.remaining_quantity)
+                .max(0);
+            if quantity <= 0 {
+                state.working = Some(updated_order);
+                return Vec::new();
+            }
+            updated_order.remaining_quantity =
+                updated_order.remaining_quantity.saturating_sub(quantity);
             state.working = (updated_order.remaining_quantity > 0).then_some(updated_order);
             apply_position_fill(
                 state,
@@ -3006,16 +3024,21 @@ impl SimulationEngine {
         }
         let mid_ticks = book.bid_price_ticks.saturating_add(book.ask_price_ticks) / 2;
         let quote_distance_bps = bps_between(intent.price, mid_ticks);
-        let queue_ahead_quantity = if state.local_book.is_valid() {
+        // A new maker order joins behind the observable resting quantity at its
+        // price. With no seeded local depth (legacy/simple replay), only explicit
+        // synthetic queue assumptions are applied; we do not pretend top-of-book
+        // size is a fully reconstructed FIFO queue.
+        let observed_queue_ahead = if state.local_book.is_valid() {
             state
                 .local_book
                 .quantity_at(intent.side == Side::Buy, intent.price)
+                .max(0)
         } else {
-            match intent.side {
-                Side::Buy => book.bid_quantity.max(0),
-                Side::Sell => book.ask_quantity.max(0),
-            }
+            0
         };
+        let queue_ahead_quantity = observed_queue_ahead
+            .saturating_add(self.realism.queue.visible_ahead.max(0))
+            .saturating_add(self.realism.queue.trade_through.max(0));
         state.working = Some(WorkingOrder {
             client_id,
             decision_id,
@@ -3024,6 +3047,7 @@ impl SimulationEngine {
             remaining_quantity: intent.quantity,
             reduce_only,
             queue_ahead_quantity,
+            queue_ahead_remaining: queue_ahead_quantity,
             quote_distance_bps,
             placed_at_ms: timestamp_ms,
             exchange_arrival_at_ms: self
@@ -5638,6 +5662,44 @@ mod tests {
     }
 
     #[test]
+    fn latency_rejected_trade_does_not_consume_queue() {
+        let mut engine = engine().with_realism(crate::backtest::realism::RealisticFillModel {
+            queue: crate::backtest::realism::QueueModel {
+                visible_ahead: 2,
+                trade_through: 0,
+            },
+            latency: crate::backtest::realism::LatencyModel {
+                market_to_decision_ms: 5,
+                decision_to_exchange_ms: 5,
+                cancel_to_exchange_ms: 0,
+            },
+        });
+        feed(
+            &mut engine,
+            br#"{"e":"markPriceUpdate","E":1,"s":"CXMTUSDT","p":"100","i":"100","T":600000,"r":"0"}"#,
+        );
+        feed(
+            &mut engine,
+            br#"{"e":"bookTicker","u":1,"E":2,"T":2,"s":"CXMTUSDT","b":"98","B":"10","a":"99","A":"10"}"#,
+        );
+        let early = feed(
+            &mut engine,
+            br#"{"e":"aggTrade","E":4,"s":"CXMTUSDT","a":1,"p":"98","q":"2","T":4,"m":true}"#,
+        );
+        assert!(early.is_empty());
+        let at_exchange = feed(
+            &mut engine,
+            br#"{"e":"aggTrade","E":12,"s":"CXMTUSDT","a":2,"p":"98","q":"2","T":12,"m":true}"#,
+        );
+        assert!(at_exchange.is_empty());
+        let through = feed(
+            &mut engine,
+            br#"{"e":"aggTrade","E":13,"s":"CXMTUSDT","a":3,"p":"98","q":"1","T":13,"m":true}"#,
+        );
+        assert_eq!(through[0].quantity, Some(1));
+    }
+
+    #[test]
     fn exchange_arrival_uses_local_receipt_time_not_exchange_event_time() {
         let mut engine = engine().with_realism(crate::backtest::realism::RealisticFillModel {
             queue: crate::backtest::realism::QueueModel::default(),
@@ -5677,6 +5739,42 @@ mod tests {
         .unwrap();
         assert_eq!(engine.on_event_at_ref(&available, 3_020).len(), 1);
         assert_eq!(engine.summary().current_absolute_position, 3);
+    }
+
+    #[test]
+    fn observed_queue_is_consumed_across_multiple_compatible_trades() {
+        let mut engine = engine();
+        engine
+            .load_depth_snapshot("CXMTUSDT", 10, &[(98, 5)], &[(99, 10)])
+            .unwrap();
+        feed(
+            &mut engine,
+            br#"{"e":"markPriceUpdate","E":1,"s":"CXMTUSDT","p":"100","i":"100","T":600000,"r":"0"}"#,
+        );
+        let placed = feed(
+            &mut engine,
+            br#"{"e":"bookTicker","u":1,"E":2,"T":2,"s":"CXMTUSDT","b":"98","B":"5","a":"99","A":"10"}"#,
+        );
+        let order = placed
+            .iter()
+            .find(|record| record.kind == "order_placed")
+            .unwrap();
+        assert_eq!(order.queue_ahead_quantity, Some(5));
+
+        let first = feed(
+            &mut engine,
+            br#"{"e":"aggTrade","E":3,"s":"CXMTUSDT","a":1,"p":"98","q":"3","T":3,"m":true}"#,
+        );
+        assert!(first.is_empty());
+        assert_eq!(engine.summary().current_absolute_position, 0);
+
+        let second = feed(
+            &mut engine,
+            br#"{"e":"aggTrade","E":4,"s":"CXMTUSDT","a":2,"p":"98","q":"3","T":4,"m":true}"#,
+        );
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].quantity, Some(1));
+        assert_eq!(engine.summary().current_absolute_position, 1);
     }
 
     #[test]
