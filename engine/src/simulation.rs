@@ -13,6 +13,8 @@ pub mod experiment_plan;
 pub mod orchestration;
 #[path = "simulation/replay.rs"]
 pub mod replay;
+#[path = "simulation/risk_metrics.rs"]
+pub mod risk_metrics;
 #[path = "simulation/runtime.rs"]
 pub mod runtime;
 
