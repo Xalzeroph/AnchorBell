@@ -14,6 +14,15 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
 
 runtime = RUNTIME.read_text(encoding="utf-8")
 
+if (
+    'capital: i64,\n        soft: i64,\n        hard: i64,' in runtime
+    and 'SimulationError::InvalidConfig("drawdown capital mismatch")' in runtime
+    and 'guard.observe(summary.unrealized_valuation_complete.then(||' in runtime
+    and '.map(PortfolioDrawdownGuard::snapshot)' in runtime
+):
+    print("drawdown runtime glue already compacted")
+    raise SystemExit(0)
+
 runtime = replace_once(
     runtime,
     '''    pub fn with_portfolio_drawdown_limits_bps(
