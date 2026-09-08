@@ -24,7 +24,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Apply deterministic repairs
-        run: python3 .github/scripts/anchorbell_deep_fix.py
+        run: |
+          python3 .github/scripts/anchorbell_deep_fix.py
+          python3 .github/scripts/anchorbell_semantics_fix.py
 
       - name: Format
         run: cargo fmt --all
@@ -49,5 +51,5 @@ jobs:
                   engine/src/simulation_batch.rs \
                   engine/src/simulation/runtime.rs \
                   engine/src/strategy/calibration.rs
-          git commit -m "fix: repair simulation experiment and risk statistics"
+          git commit -m "fix: enforce cumulative strategy semantics"
           git push origin HEAD:diag-risk-20260908
