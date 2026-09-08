@@ -8,7 +8,7 @@ Type=simple
 User=anchorbell
 Group=anchorbell
 WorkingDirectory=/var/lib/anchorbell
-ExecStart=/opt/anchorbell/target/release/anchorbell_simulation_batch --policy-id M1-M9-pico-bps-server-20260906 --index-anchors --environment production --symbols CXMTUSDT,UNITREEUSDT,GIGADEVUSDT,HK0625USDT,MINIMAXUSDT,ZHIPUUSDT,ZHONGJIUSDT --output-root /var/lib/anchorbell/simulation-batch-m1-m9-pico-20260906 --capital-usdt 1500 --duration-secs 0 --include-m9
+ExecStart=/opt/anchorbell/target/release/anchorbell_simulation_batch --strategy-profile /opt/anchorbell/config/anchorbell-simulation.json
 # Exit status 2 is the deterministic storage safety stop. Do not spin while
 # the host is below the minimum free-space floor.
 Restart=on-failure

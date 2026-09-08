@@ -13,7 +13,7 @@ use anchorbell_engine::{
     execution::{
         BinanceCredentials, BinanceEnvironment, BinanceMakerOrderRequest, BinanceRestClient,
         BinanceUserDataStream, DeploymentConfig, ExecutionSupervisor, GateDecision,
-        SessionCheckpoint, Side, SupervisorConfig, SupervisorState, UserDataEvent, LIVE_SYMBOLS,
+        SessionCheckpoint, Side, SupervisorConfig, SupervisorState, UserDataEvent,
     },
     market::{
         binance::{BinanceMarketEvent, BookTicker, MarkPrice},
@@ -30,7 +30,7 @@ use anchorbell_engine::{
     simulation::{AnchorSnapshot, SimulationEngine, SimulationPolicyVariant, SimulationRecord},
     strategy::{
         adaptive_intent_from_market, calendar_for, profile_for, AnchorCurrency, EquityRegion,
-        VenueSessionState,
+        StrategyProfile, VenueSessionState,
     },
 };
 
@@ -400,15 +400,13 @@ async fn run(args: Args) -> Result<i32, String> {
     if args.send_orders && !policy.allow_live_orders {
         return Err("order submission is disabled by deployment policy".into());
     }
+    let strategy_profile = StrategyProfile::load("config/anchorbell-simulation.json")?;
+    let symbols = strategy_profile.symbols.clone();
     let client = Arc::new(
         BinanceRestClient::new(args.environment, policy, args.proxy.as_deref())
             .map_err(|error| error.to_string())?,
     );
     let server_time = client.server_time_ms().await.map_err(|e| e.to_string())?;
-    let symbols = LIVE_SYMBOLS
-        .iter()
-        .map(|s| (*s).to_owned())
-        .collect::<Vec<_>>();
     let run_id = format!("live-{}-{}", args.environment.as_str(), now_ms());
     let registry = RunRegistry::new("target/live-runs");
     registry
@@ -456,7 +454,7 @@ async fn run(args: Args) -> Result<i32, String> {
     .await
     .map_err(|error| format!("cannot load Binance index anchors: {error}"))?
     .anchors;
-    if anchors.len() != LIVE_SYMBOLS.len() {
+    if anchors.len() != symbols.len() {
         return Err("anchor set is not the exact nine-symbol universe".into());
     }
     let shadow_dir = checkpoint_path
@@ -477,13 +475,16 @@ async fn run(args: Args) -> Result<i32, String> {
 
     let mut control_plane = RuntimeControlPlane::new();
     let mut audit_sink = AuditSink::from_environment("target/runtime-audit.jsonl");
-    let mut supervisor = ExecutionSupervisor::new(SupervisorConfig {
-        max_market_age_ms: 5_000,
-        max_fx_age_ms: FxPollerConfig::high_frequency().max_stale_ms,
-        funding_lead_ms: args.funding_lead_ms,
-        max_position: args.max_position,
-        quantity_scale: args.quantity_scale,
-    })
+    let mut supervisor = ExecutionSupervisor::new(
+        SupervisorConfig {
+            max_market_age_ms: 5_000,
+            max_fx_age_ms: FxPollerConfig::high_frequency().max_stale_ms,
+            funding_lead_ms: args.funding_lead_ms,
+            max_position: args.max_position,
+            quantity_scale: args.quantity_scale,
+        },
+        symbols.clone(),
+    )
     .map_err(|reason| format!("supervisor config rejected: {reason:?}"))?;
     let mut state = BTreeMap::<String, SymbolState>::new();
     let mut recovered_working = BTreeMap::<String, WorkingOrder>::new();
@@ -529,7 +530,7 @@ async fn run(args: Args) -> Result<i32, String> {
     let mut truth_sequence = 0_u64;
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(16_384);
-    spawn_market(&args, tx.clone())?;
+    spawn_market(&args, tx.clone(), &symbols)?;
     spawn_fx(&args, tx.clone())?;
     spawn_user_data(&args, client.clone(), credentials.clone(), tx.clone()).await?;
 
@@ -1142,11 +1143,15 @@ fn make_intent(
     )
 }
 
-fn spawn_market(args: &Args, tx: tokio::sync::mpsc::Sender<Event>) -> Result<(), String> {
+fn spawn_market(
+    args: &Args,
+    tx: tokio::sync::mpsc::Sender<Event>,
+    symbols: &[String],
+) -> Result<(), String> {
     let endpoints = args.environment.endpoints();
     let shards = BinanceMarketConfig::for_symbols(
         endpoints.market_ws_base,
-        &LIVE_SYMBOLS,
+        symbols,
         BinanceMarketFeed::ReferenceAndTrades,
         args.price_scale,
         args.quantity_scale,

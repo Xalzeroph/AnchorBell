@@ -24,6 +24,8 @@ jobs:
         run: python3 scripts/resource_gate.py
       - name: Dependency audit
         uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
       - name: Enforce production vocabulary boundary
         run: |
           python3 - <<'PY'

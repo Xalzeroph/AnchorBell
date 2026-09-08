@@ -196,8 +196,9 @@ impl MethodRegistry {
         Ok(())
     }
 
-    /// The canonical AnchorBell chain. New methods should register as a child
-    /// or overlay instead of copying an existing method implementation.
+    /// Build the canonical method graph from the single method catalog.
+    /// Adding a method therefore updates the graph and experiment resolver
+    /// together instead of maintaining a second hand-written chain.
     pub fn anchorbell_defaults() -> Result<Self, MethodGraphError> {
         let immutable = [
             "anchor_definition",
@@ -207,56 +208,23 @@ impl MethodRegistry {
             "maker_only",
         ];
         let mut registry = Self::new(immutable);
-        let m1 = MethodId::new("M1")?;
-        let m2 = MethodId::new("M2")?;
-        let m3 = MethodId::new("M3")?;
-        let m4 = MethodId::new("M4")?;
-        let m5 = MethodId::new("M5")?;
-        let m6 = MethodId::new("M6")?;
-        let m7 = MethodId::new("M7")?;
-        let m8 = MethodId::new("M8")?;
-        let m9 = MethodId::new("M9")?;
-        registry.register(MethodSpec::root(m1.clone(), MethodLayer::Signal))?;
-        registry.register(MethodSpec::child(
-            m2.clone(),
-            MethodLayer::Microstructure,
-            m1.clone(),
-        ))?;
-        registry.register(MethodSpec::child(m3.clone(), MethodLayer::Fill, m2.clone()))?;
-        registry.register(MethodSpec::child(
-            m4.clone(),
-            MethodLayer::Signal,
-            m3.clone(),
-        ))?;
-        registry.register(MethodSpec::child(m5.clone(), MethodLayer::Risk, m4.clone()))?;
-        registry.register(MethodSpec::child(
-            m6.clone(),
-            MethodLayer::Capital,
-            m5.clone(),
-        ))?;
-        registry.register(MethodSpec::child(
-            m7.clone(),
-            MethodLayer::Evidence,
-            m6.clone(),
-        ))?;
-        registry.register(
-            MethodSpec::child(m8.clone(), MethodLayer::Funding, m7)
-                .with_overlay("funding_controller")
-                .requires_feature("funding_rate_state")
-                .requires_feature("funding_schedule")
-                .overrides("funding_entry_policy"),
-        )?;
-        registry.register(
-            MethodSpec::child(m9, MethodLayer::Risk, m8)
-                .with_overlay("causal_residual")
-                .with_overlay("joint_fill_markout_exit")
-                .with_overlay("deadline_mpc")
-                .with_overlay("distributionally_robust_optimizer")
-                .requires_feature("versioned_fair_value")
-                .requires_feature("deadline_exit_plan")
-                .requires_feature("joint_outcome_forecast")
-                .requires_feature("robust_risk_certificate"),
-        )?;
+        for descriptor in super::method_catalog::all() {
+            let id = MethodId::new(descriptor.id)?;
+            let mut spec = match descriptor.parent {
+                Some(parent) => MethodSpec::child(id, descriptor.layer, MethodId::new(parent)?),
+                None => MethodSpec::root(id, descriptor.layer),
+            };
+            for overlay in descriptor.overlays {
+                spec = spec.with_overlay(*overlay);
+            }
+            for feature in descriptor.required_features {
+                spec = spec.requires_feature(*feature);
+            }
+            for contract in descriptor.immutable_overrides {
+                spec = spec.overrides(*contract);
+            }
+            registry.register(spec)?;
+        }
         Ok(registry)
     }
 }

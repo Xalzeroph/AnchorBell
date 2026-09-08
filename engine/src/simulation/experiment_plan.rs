@@ -1,4 +1,7 @@
-use crate::simulation::engine::SimulationPolicyVariant;
+use crate::{
+    simulation::engine::SimulationPolicyVariant,
+    strategy::method_catalog::resolve as resolve_strategy_method,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -19,6 +22,20 @@ pub struct ExperimentPlan {
 impl ExperimentPlan {
     pub const SCHEMA_VERSION: u16 = 1;
 
+    pub fn from_specs(
+        plan_id: String,
+        experiments: Vec<ExperimentSpec>,
+    ) -> Result<Self, &'static str> {
+        let plan = Self {
+            schema_version: Self::SCHEMA_VERSION,
+            plan_id,
+            experiments,
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    #[cfg(test)]
     pub fn m1_to_m8() -> Self {
         let names = [
             ("F1_m1", "m1"),
@@ -46,7 +63,7 @@ impl ExperimentPlan {
         // economic hypothesis testing.
         experiments.push(ExperimentSpec {
             label: "M8_no_funding".into(),
-            strategy: "m7".into(),
+            strategy: "m8".into(),
             ablations: vec!["funding".into()],
         });
         Self {
@@ -58,6 +75,7 @@ impl ExperimentPlan {
 
     /// The M1-M8 matrix plus the full M9 challenger. Kept separate so an
     /// existing M1-M8 run cannot silently change its strategy population.
+    #[cfg(test)]
     pub fn m1_to_m9() -> Self {
         let mut plan = Self::m1_to_m8();
         plan.plan_id = "m1-m9-single-ledger-ablation-matrix".into();
@@ -73,9 +91,17 @@ impl ExperimentPlan {
         if self.schema_version != Self::SCHEMA_VERSION || self.plan_id.trim().is_empty() {
             return Err("invalid experiment plan identity");
         }
-        if self.experiments.is_empty() || self.experiments.iter().any(|e| e.label.trim().is_empty())
+        if self.experiments.is_empty()
+            || self.experiments.iter().any(|e| {
+                e.label.trim().is_empty() || e.strategy.trim().is_empty() || {
+                    let mut values = BTreeSet::new();
+                    e.ablations.iter().any(|ablation| {
+                        ablation.trim().is_empty() || !values.insert(ablation.trim().to_owned())
+                    })
+                }
+            })
         {
-            return Err("experiment plan cannot be empty");
+            return Err("experiment plan contains an invalid experiment");
         }
         let mut labels = BTreeSet::new();
         let mut identities = BTreeSet::new();
@@ -88,30 +114,35 @@ impl ExperimentPlan {
             if !identities.insert((experiment.strategy.clone(), ablations)) {
                 return Err("experiment identities must be unique");
             }
+            resolve_strategy_method(&experiment.strategy, &experiment.ablations)?;
         }
         Ok(())
     }
 
-    pub fn runtime_specs(&self) -> Result<Vec<(String, SimulationPolicyVariant)>, &'static str> {
+    pub fn runtime_specs_with_ablations(
+        &self,
+    ) -> Result<Vec<(String, SimulationPolicyVariant, Vec<String>)>, &'static str> {
         self.validate()?;
         self.experiments
             .iter()
             .map(|experiment| {
-                let variant = match experiment.strategy.as_str() {
-                    "m1" => SimulationPolicyVariant::M1AdaptiveRisk,
-                    "m2" => SimulationPolicyVariant::M2Microstructure,
-                    "m3" => SimulationPolicyVariant::M3FillAware,
-                    "m4" => SimulationPolicyVariant::M4Statistical,
-                    "m5" => SimulationPolicyVariant::M5Robust,
-                    "m6" => SimulationPolicyVariant::M6DynamicCapital,
-                    "m7" => SimulationPolicyVariant::M7EvidenceGated,
-                    "m8" => SimulationPolicyVariant::M8FundingAware,
-                    "m9" => SimulationPolicyVariant::M9DeadlineCausalDroMpc,
-                    _ => return Err("unknown experiment strategy"),
-                };
-                Ok((experiment.label.clone(), variant))
+                let variant = resolve_strategy_method(&experiment.strategy, &experiment.ablations)?;
+                Ok((
+                    experiment.label.clone(),
+                    variant,
+                    experiment.ablations.clone(),
+                ))
             })
             .collect()
+    }
+
+    pub fn runtime_specs(&self) -> Result<Vec<(String, SimulationPolicyVariant)>, &'static str> {
+        self.runtime_specs_with_ablations().map(|specs| {
+            specs
+                .into_iter()
+                .map(|(label, variant, _)| (label, variant))
+                .collect()
+        })
     }
 }
 
@@ -123,6 +154,19 @@ mod tests {
         let plan = ExperimentPlan::m1_to_m8();
         assert_eq!(plan.experiments.len(), 9);
         assert_eq!(plan.runtime_specs().unwrap().len(), 9);
+        let no_funding = plan
+            .experiments
+            .iter()
+            .find(|experiment| experiment.label == "M8_no_funding")
+            .unwrap();
+        assert_eq!(no_funding.strategy, "m8");
+        let runtime = plan.runtime_specs_with_ablations().unwrap();
+        let (_, variant, ablations) = runtime
+            .iter()
+            .find(|(label, _, _)| label == "M8_no_funding")
+            .unwrap();
+        assert_eq!(*variant, SimulationPolicyVariant::M7EvidenceGated);
+        assert_eq!(ablations, &vec!["funding".to_owned()]);
     }
 
     #[test]

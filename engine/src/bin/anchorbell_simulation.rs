@@ -424,23 +424,8 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn parse_strategy_variant(value: &str) -> Result<SimulationPolicyVariant, String> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "m0" | "m0_fixed" | "fixed" => Ok(SimulationPolicyVariant::M0Fixed),
-        "m1" | "m1_adaptive_risk" | "adaptive" => Ok(SimulationPolicyVariant::M1AdaptiveRisk),
-        "m2" | "m2_microstructure" | "microstructure" => {
-            Ok(SimulationPolicyVariant::M2Microstructure)
-        }
-        "m3" | "m3_fill_aware" | "fill_aware" => Ok(SimulationPolicyVariant::M3FillAware),
-        "m4" | "m4_statistical" | "statistical" => Ok(SimulationPolicyVariant::M4Statistical),
-        "m5" | "m5_robust" | "robust" => Ok(SimulationPolicyVariant::M5Robust),
-        "m6" | "m6_dynamic_capital" => Ok(SimulationPolicyVariant::M6DynamicCapital),
-        "m7" | "m7_evidence_gated" | "evidence_gated" => {
-            Ok(SimulationPolicyVariant::M7EvidenceGated)
-        }
-        other => Err(format!(
-            "unsupported --strategy-variant {other}; use m0|m1|m2|m3|m4|m5|m6|m7"
-        )),
-    }
+    anchorbell_engine::strategy::resolve_strategy_method(value, &[])
+        .map_err(|reason| format!("unsupported --strategy-variant {}: {reason}", value.trim()))
 }
 
 fn next(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {

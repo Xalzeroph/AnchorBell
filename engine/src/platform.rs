@@ -537,22 +537,10 @@ impl SystemRegistry {
     }
 
     pub fn contract(&self, id: &str) -> Option<SystemContract> {
-        self.contracts.get(id).cloned().or_else(|| {
-            self.descriptor(id).map(|descriptor| {
-                let provides = Self::registrations()
-                    .into_iter()
-                    .find(|registration| registration.descriptor.role == descriptor.role)
-                    .map(|registration| registration.contract.provides)
-                    .unwrap_or(&[]);
-                SystemContract {
-                    system_id: descriptor.id,
-                    requires: descriptor.dependencies,
-                    provides,
-                    consumes: &[],
-                    recovery: recovery_for(descriptor.role, descriptor.restartable),
-                }
-            })
-        })
+        self.contracts
+            .get(id)
+            .cloned()
+            .or_else(|| self.descriptor(id).map(|descriptor| descriptor.contract()))
     }
 
     pub fn contracts(&self) -> impl Iterator<Item = SystemContract> + '_ {
@@ -1287,6 +1275,24 @@ mod tests {
     }
 
     #[test]
+    fn unregistered_catalog_entries_never_inherit_role_capabilities() {
+        let descriptor = SystemDescriptor {
+            id: "replacement.strategy",
+            layer: PlatformLayer::Decision,
+            role: SystemRole::Strategy,
+            authority: Authority::Internal,
+            mutability: Mutability::GovernedPolicy,
+            dependencies: &[],
+            health_interval_ms: 1_000,
+            restartable: true,
+        };
+        let registry = SystemRegistry::from_catalog(vec![descriptor]).unwrap();
+        let contract = registry.contract("replacement.strategy").unwrap();
+        assert!(contract.provides.is_empty());
+        assert!(contract.consumes.is_empty());
+    }
+
+    #[test]
     fn profiles_expand_only_registered_dependency_closures() {
         let registry = SystemRegistry::default();
         let dashboard = registry
@@ -1468,6 +1474,18 @@ mod tests {
             },
         ])
         .unwrap();
+        for id in ["execution.primary", "execution.standby"] {
+            registry.contracts.insert(
+                id,
+                SystemContract {
+                    system_id: id,
+                    requires: &["control.kernel"],
+                    provides: &["execution.submit"],
+                    consumes: &[],
+                    recovery: RecoveryPolicy::RestartThenReconcile,
+                },
+            );
+        }
         registry.bootstrap_health(1_000);
         registry
             .report_health(HealthSnapshot::ready("control.kernel", 1_000))

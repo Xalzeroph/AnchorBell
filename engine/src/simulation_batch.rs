@@ -45,22 +45,22 @@ use crate::{
 
 const MIN_SIMULATION_FREE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const STORAGE_SAFETY_SCHEMA_VERSION: u16 = 1;
-const METRICS_HISTORY_CAPACITY: usize = 901;
-/// M9 uses a declared calibration population instead of whichever ledger has
-/// the largest sample count. This keeps the source auditable and avoids mixing
-/// policy-specific order selection into a single unlabeled model.
-const M9_CALIBRATION_SOURCE_LABEL: &str = "F3_m3";
+const DISPLAY_HISTORY_CAPACITY: usize = 900;
+const RISK_HISTORY_CAPACITY: usize = 7_201;
 
 #[derive(Debug, Clone)]
 pub struct SimulationBatchSpec {
     pub label: String,
     pub variant: SimulationPolicyVariant,
+    pub ablations: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SimulationBatchConfig {
     /// Human-readable run generation. Each run writes it into its manifest.
     pub policy_id: String,
+    pub experiment_plan_id: String,
+    pub universe_id: String,
     pub environment: BinanceEnvironment,
     pub symbols: Vec<String>,
     pub anchors: BTreeMap<String, AnchorSnapshot>,
@@ -98,12 +98,14 @@ pub struct SimulationBatchConfig {
     pub duration_secs: u64,
     /// Shared, deterministic evidence test fed exactly once per public event.
     pub evidence: EvidenceConfig,
+    pub m9_calibration_source_label: String,
 }
 
 #[derive(Debug, Serialize)]
 pub struct SimulationLedgerResult {
     pub label: String,
     pub strategy_variant: String,
+    pub ablations: Vec<String>,
     pub evidence_record_id: String,
     pub summary: SimulationSummary,
     pub settlement_status: String,
@@ -143,6 +145,7 @@ struct Ledger {
     record_dropped: Arc<AtomicU64>,
     metrics_path: PathBuf,
     history: VecDeque<PerformancePoint>,
+    risk_history: VecDeque<PerformancePoint>,
     settlement_status: String,
     flatten_requested: bool,
 }
@@ -243,6 +246,34 @@ fn calibration_rank(snapshot: &CalibrationSnapshot) -> (u64, u64, u64, u64) {
     )
 }
 
+fn warm_start_m9_from_source(ledgers: &mut [Ledger], source_label: &str) {
+    let seeds = ledgers
+        .iter()
+        .find(|ledger| ledger.spec.label == source_label)
+        .map(|ledger| {
+            ledger
+                .engine
+                .calibration_snapshots(0)
+                .into_iter()
+                .filter_map(|(symbol, snapshot)| {
+                    snapshot.calibration.map(|_| (symbol, snapshot.state))
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    if seeds.is_empty() {
+        return;
+    }
+    for ledger in ledgers
+        .iter_mut()
+        .filter(|ledger| ledger.spec.variant == SimulationPolicyVariant::M9DeadlineCausalDroMpc)
+    {
+        ledger
+            .engine
+            .restore_calibration_states_if_unavailable(&seeds);
+    }
+}
+
 async fn persist_calibration_store(path: &Path, ledgers: &[Ledger]) -> Result<(), SimulationError> {
     let mut snapshots = BTreeMap::<String, CalibrationSnapshot>::new();
     for ledger in ledgers {
@@ -270,29 +301,6 @@ async fn persist_calibration_store(path: &Path, ledgers: &[Ledger]) -> Result<()
     };
     write_json_atomic(path, &store).await?;
     Ok(())
-}
-
-fn synchronize_m9_calibration(ledgers: &mut [Ledger]) {
-    let Some(seeds) = ledgers
-        .iter()
-        .find(|ledger| ledger.spec.label == M9_CALIBRATION_SOURCE_LABEL)
-        .map(|ledger| {
-            ledger
-                .engine
-                .calibration_snapshots(0)
-                .into_iter()
-                .map(|(symbol, snapshot)| (symbol, snapshot.state))
-                .collect::<BTreeMap<_, _>>()
-        })
-    else {
-        return;
-    };
-    for ledger in ledgers
-        .iter_mut()
-        .filter(|ledger| ledger.spec.variant == SimulationPolicyVariant::M9DeadlineCausalDroMpc)
-    {
-        ledger.engine.restore_calibration_states(&seeds);
-    }
 }
 
 #[allow(clippy::type_complexity)]
@@ -384,6 +392,8 @@ fn build_engine(
 fn validate(config: &SimulationBatchConfig) -> Result<(), SimulationError> {
     if config.symbols.is_empty()
         || config.specs.is_empty()
+        || config.experiment_plan_id.trim().is_empty()
+        || config.universe_id.trim().is_empty()
         || config.max_subscriptions_per_shard == 0
     {
         return Err(SimulationError::InvalidConfig(
@@ -424,6 +434,8 @@ pub async fn run(
     let manifest_created_at_ms = now_ms();
     let parameter_material = serde_json::json!({
         "policy_id": config.policy_id,
+        "experiment_plan_id": config.experiment_plan_id,
+        "universe_id": config.universe_id,
         "entry_threshold_bps": config.entry_threshold_bps,
         "threshold_scale_ppm": config.threshold_scale_ppm,
         "fee_ppm": config.fee_ppm,
@@ -470,11 +482,15 @@ pub async fn run(
             None,
         ),
         "policy_id": config.policy_id,
+        "experiment_plan_id": config.experiment_plan_id,
+        "universe_id": config.universe_id,
+        "method_catalog": crate::strategy::strategy_methods(),
         "created_at_ms": manifest_created_at_ms,
         "parameter_digest": parameter_digest,
         "data_digest": data_digest,
         "strategy_variants": config.specs.iter().map(|spec| spec.variant.label()).collect::<Vec<_>>(),
         "spec_labels": config.specs.iter().map(|spec| spec.label.as_str()).collect::<Vec<_>>(),
+        "spec_ablations": config.specs.iter().map(|spec| &spec.ablations).collect::<Vec<_>>(),
         "symbols": config.symbols,
         "output_root": config.output_root,
         "entry_threshold_bps": config.entry_threshold_bps,
@@ -522,7 +538,7 @@ pub async fn run(
     for spec in &config.specs {
         let calibration_source = if spec.variant == SimulationPolicyVariant::M9DeadlineCausalDroMpc
         {
-            M9_CALIBRATION_SOURCE_LABEL
+            config.m9_calibration_source_label.as_str()
         } else {
             spec.label.as_str()
         };
@@ -544,7 +560,8 @@ pub async fn run(
             record_written,
             record_dropped,
             metrics_path: dir.join("metrics.json"),
-            history: VecDeque::with_capacity(METRICS_HISTORY_CAPACITY),
+            history: VecDeque::with_capacity(DISPLAY_HISTORY_CAPACITY),
+            risk_history: VecDeque::with_capacity(RISK_HISTORY_CAPACITY),
             settlement_status: "not_started".to_owned(),
             flatten_requested: false,
         });
@@ -768,15 +785,25 @@ pub async fn run(
                         }
                     }
                     write_json_atomic(&evidence_summary_path, &evidence.summary()).await?;
-                    // Copy only state learned before the next market event. M9 therefore
-                    // consumes the declared F3 population without same-event lookahead.
-                    synchronize_m9_calibration(&mut ledgers);
+                    warm_start_m9_from_source(&mut ledgers, &config.m9_calibration_source_label);
                     for ledger in &mut ledgers {
-                        ledger.history.push_back(ledger.engine.performance_point(observed_at));
-                        while ledger.history.len() > METRICS_HISTORY_CAPACITY {
+                        let point = ledger.engine.performance_point(observed_at);
+                        ledger.history.push_back(point.clone());
+                        ledger.risk_history.push_back(point);
+                        while ledger.history.len() > DISPLAY_HISTORY_CAPACITY {
                             ledger.history.pop_front();
                         }
-                        let snapshot = ledger.engine.metrics_snapshot_with_history(observed_at, last_received_at_ms, ledger.history.make_contiguous());
+                        while ledger.risk_history.len() > RISK_HISTORY_CAPACITY {
+                            ledger.risk_history.pop_front();
+                        }
+                        let display = ledger.history.make_contiguous().to_vec();
+                        let risk = ledger.risk_history.make_contiguous().to_vec();
+                        let snapshot = ledger.engine.metrics_snapshot_with_histories(
+                            observed_at,
+                            last_received_at_ms,
+                            &display,
+                            &risk,
+                        );
                         write_json_atomic(&ledger.metrics_path, &snapshot).await?;
                     }
                     persist_calibration_store(&calibration_store_path, &ledgers).await?;
@@ -984,16 +1011,22 @@ pub async fn run(
                 .map_err(|_| SimulationError::Io("ledger writer stopped".to_owned()))?;
         }
         let observed_at = now_ms();
-        ledger
-            .history
-            .push_back(ledger.engine.performance_point(observed_at));
-        while ledger.history.len() > METRICS_HISTORY_CAPACITY {
+        let point = ledger.engine.performance_point(observed_at);
+        ledger.history.push_back(point.clone());
+        ledger.risk_history.push_back(point);
+        while ledger.history.len() > DISPLAY_HISTORY_CAPACITY {
             ledger.history.pop_front();
         }
-        let snapshot = ledger.engine.metrics_snapshot_with_history(
+        while ledger.risk_history.len() > RISK_HISTORY_CAPACITY {
+            ledger.risk_history.pop_front();
+        }
+        let display = ledger.history.make_contiguous().to_vec();
+        let risk = ledger.risk_history.make_contiguous().to_vec();
+        let snapshot = ledger.engine.metrics_snapshot_with_histories(
             observed_at,
             last_received_at_ms,
-            ledger.history.make_contiguous(),
+            &display,
+            &risk,
         );
         write_json_atomic(&ledger.metrics_path, &snapshot).await?;
     }
@@ -1021,6 +1054,7 @@ pub async fn run(
         ledger_results.push(SimulationLedgerResult {
             label: ledger.spec.label,
             strategy_variant: ledger.spec.variant.label().to_owned(),
+            ablations: ledger.spec.ablations,
             evidence_record_id: evidence.evidence_id(),
             summary: ledger.engine.summary(),
             settlement_status: ledger.settlement_status,

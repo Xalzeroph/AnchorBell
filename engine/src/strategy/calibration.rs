@@ -5,10 +5,15 @@ use std::collections::VecDeque;
 pub const CALIBRATION_SCHEMA_VERSION: u32 = 2;
 pub const CALIBRATION_MODEL_VERSION: &str = "m9-data-driven-calibration-v2";
 const ROLLING_WINDOW_CAPACITY: usize = 4096;
-/// A calibration is not usable merely because every field has one sample.
-/// This floor matches the minimum history required before the runtime reports
-/// risk statistics as usable and keeps M9 fail-closed during warm-up.
+/// Common effective-sample scale used in calibration reports. Individual
+/// evidence streams have different natural frequencies, so readiness is based
+/// on component-specific floors rather than the raw minimum count.
 const MIN_CALIBRATION_EFFECTIVE_SAMPLE_SIZE: u64 = 30;
+const MIN_MARKET_SAMPLES: u64 = 30;
+const MIN_REVERSION_SAMPLES: u64 = 8;
+const MIN_ORDER_LIFECYCLE_SAMPLES: u64 = 30;
+const MIN_FILL_PARTICIPATION_SAMPLES: u64 = 10;
+const MIN_MARKOUT_SAMPLES: u64 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -195,19 +200,31 @@ impl CalibrationSnapshot {
         let fill_horizon = median_u64(&state.order_wait_ms);
         let participation = median(&state.fill_participation_bps);
         let residual_count = state.residual_abs_pico_bps.len() as u64;
+        let market_samples = (state.return_abs_pico_bps.len() as u64)
+            .min(state.spread_pico_bps.len() as u64)
+            .min(residual_count);
+        let reversion_samples = state.reversion_half_life_ms.len() as u64;
+        let order_lifecycle_samples = state.order_wait_ms.len() as u64;
+        let fill_participation_samples = state.fill_participation_bps.len() as u64;
+        let markout_samples = state.adverse_markout_pico_bps.len() as u64;
+        let scaled = |count: u64, required: u64| {
+            count.saturating_mul(MIN_CALIBRATION_EFFECTIVE_SAMPLE_SIZE) / required.max(1)
+        };
         let effective = [
-            state.return_abs_pico_bps.len(),
-            state.spread_pico_bps.len(),
-            residual_count as usize,
-            state.reversion_half_life_ms.len(),
-            state.order_wait_ms.len(),
-            state.fill_participation_bps.len(),
-            state.adverse_markout_pico_bps.len(),
+            scaled(market_samples, MIN_MARKET_SAMPLES),
+            scaled(reversion_samples, MIN_REVERSION_SAMPLES),
+            scaled(order_lifecycle_samples, MIN_ORDER_LIFECYCLE_SAMPLES),
+            scaled(fill_participation_samples, MIN_FILL_PARTICIPATION_SAMPLES),
+            scaled(markout_samples, MIN_MARKOUT_SAMPLES),
         ]
         .into_iter()
-        .filter(|count| *count > 0)
         .min()
-        .unwrap_or(0) as u64;
+        .unwrap_or(0);
+        let component_history_ready = market_samples >= MIN_MARKET_SAMPLES
+            && reversion_samples >= MIN_REVERSION_SAMPLES
+            && order_lifecycle_samples >= MIN_ORDER_LIFECYCLE_SAMPLES
+            && fill_participation_samples >= MIN_FILL_PARTICIPATION_SAMPLES
+            && markout_samples >= MIN_MARKOUT_SAMPLES;
         let mut missing = Vec::new();
         if residual.is_none() {
             missing.push("residual");
@@ -230,7 +247,22 @@ impl CalibrationSnapshot {
         if state.fill_events == 0 {
             missing.push("fill_events");
         }
-        if effective < MIN_CALIBRATION_EFFECTIVE_SAMPLE_SIZE {
+        if market_samples < MIN_MARKET_SAMPLES {
+            missing.push("market_samples");
+        }
+        if reversion_samples < MIN_REVERSION_SAMPLES {
+            missing.push("reversion_samples");
+        }
+        if order_lifecycle_samples < MIN_ORDER_LIFECYCLE_SAMPLES {
+            missing.push("order_lifecycle_samples");
+        }
+        if fill_participation_samples < MIN_FILL_PARTICIPATION_SAMPLES {
+            missing.push("fill_participation_samples");
+        }
+        if markout_samples < MIN_MARKOUT_SAMPLES {
+            missing.push("markout_samples");
+        }
+        if !component_history_ready {
             missing.push("effective_sample_size");
         }
         let residual_mad = residual.map(|(_, mad)| mad).unwrap_or(0);
@@ -276,7 +308,7 @@ impl CalibrationSnapshot {
                 Some(_),
                 Some(_),
                 Some(_),
-            ) if fill_hazard > 0 && effective >= MIN_CALIBRATION_EFFECTIVE_SAMPLE_SIZE => {
+            ) if fill_hazard > 0 && component_history_ready => {
                 let value = M9Calibration {
                     half_life_ms,
                     exit_lead_ms: fill_horizon_ms,
@@ -499,6 +531,35 @@ mod tests {
         let snapshot = state.snapshot(2_000_000_000_000);
         assert_eq!(snapshot.status, CalibrationStatus::Calibrated);
         assert_eq!(snapshot.calibration.unwrap().fill_horizon_ms, 1);
+    }
+
+    #[test]
+    fn heterogeneous_stream_rates_can_calibrate_safely() {
+        let mut state = CalibrationState::new("TESTUSDT");
+        for time in 1..=30 {
+            state.observe_market(
+                time,
+                Some(2_000_000_000_000),
+                Some(1_000_000_000_000),
+                Some(if time % 2 == 0 {
+                    4_000_000_000_000
+                } else {
+                    8_000_000_000_000
+                }),
+            );
+        }
+        for index in 0..30 {
+            let placed_at = 100 + index * 3;
+            state.observe_order_placed(placed_at);
+            if index < 10 {
+                state.observe_fill(placed_at + 1, placed_at, 10, 100);
+                state.observe_markout(placed_at + 2, 1_000_000_000_000);
+            }
+            state.observe_order_terminal(placed_at + 1, placed_at);
+        }
+        let snapshot = state.snapshot(2_000_000_000_000);
+        assert_eq!(snapshot.status, CalibrationStatus::Calibrated);
+        assert!(snapshot.effective_sample_size >= MIN_CALIBRATION_EFFECTIVE_SAMPLE_SIZE);
     }
 
     #[test]

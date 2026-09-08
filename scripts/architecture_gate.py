@@ -22,9 +22,7 @@ analytics = ROOT / "engine" / "src" / "analytics.rs"
 analytics_text = analytics.read_text(encoding="utf-8")
 if re.search(r"crate::execution|crate::market::live|tokio_tungstenite|reqwest", analytics_text):
     raise SystemExit(f"analytics execution coupling: {analytics}")
-decision_execution = [
-    p for root in (strategy, execution) for p in root.rglob("*.rs")
-]
+decision_execution = [p for root in (strategy, execution) for p in root.rglob("*.rs")]
 legacy_boundary = re.compile(r"crate::(analytics_evidence|analytics_validation|analytics)")
 for path in decision_execution:
     text = path.read_text(encoding="utf-8", errors="replace")
@@ -37,8 +35,14 @@ if re.search(r"::simulation::|use anchorbell_engine::simulation\s*::", live_text
     raise SystemExit(f"live runtime imports simulation facade: {live}")
 
 authority = ROOT / "engine" / "src" / "runtime" / "reference_authority.rs"
+# The internal loader is implemented in the simulation engine and exposed only
+# through reference_authority. Keep both the current module path and the legacy
+# pre-refactor path explicit so this gate follows source layout changes without
+# weakening the single-authority invariant for any other caller.
+authority_implementation = ROOT / "engine" / "src" / "simulation" / "runtime.rs"
+legacy_authority_implementation = ROOT / "engine" / "src" / "simulation_runtime.rs"
 for path in (ROOT / "engine" / "src").rglob("*.rs"):
-    if path in {authority, ROOT / "engine" / "src" / "simulation_runtime.rs"}:
+    if path in {authority, authority_implementation, legacy_authority_implementation}:
         continue
     text = path.read_text(encoding="utf-8", errors="replace")
     if "load_index_anchor_set_internal" in text:
@@ -67,7 +71,7 @@ for obsolete in ("control.registry", "control.recovery", "control.console"):
 
 for path in (ROOT / "engine" / "src" / "bin").glob("*.rs"):
     text = path.read_text(encoding="utf-8", errors="replace")
-    if re.search(r"RuntimeHealthReporter[\\s\\S]{0,400}\\.start\\(\\s*&\\[", text):
+    if re.search(r"RuntimeHealthReporter[\s\S]{0,400}\.start\(\s*&\[", text):
         raise SystemExit(f"entrypoint owns a manual health system list: {path}")
 
 print("ARCHITECTURE_GATE_PASS")

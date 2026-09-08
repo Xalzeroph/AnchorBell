@@ -3,12 +3,14 @@ pub mod anchor_policy;
 pub mod calendar;
 pub mod calibration;
 pub mod capital;
+pub mod config;
 pub mod flatten;
 pub mod instrument_profile;
 pub mod inventory;
 pub mod m9;
 pub mod maker_exit;
 pub mod market_context;
+pub mod method_catalog;
 pub mod method_graph;
 pub mod price_engine;
 pub mod quote_engine;
@@ -29,6 +31,7 @@ pub use calibration::{
     CalibrationParameter, CalibrationSnapshot, CalibrationState, CalibrationStatus,
     CALIBRATION_MODEL_VERSION, CALIBRATION_SCHEMA_VERSION,
 };
+pub use config::{StrategyProfile, STRATEGY_PROFILE_SCHEMA_VERSION};
 pub use flatten::{DualFlattenPlan, FlattenPhase, FlattenReason};
 pub use instrument_profile::{profile_for, AnchorCurrency, InstrumentKind, InstrumentProfile};
 pub use inventory::InventoryState;
@@ -40,6 +43,9 @@ pub use maker_exit::{
     MakerExitDecision, MakerExitInput,
 };
 pub use market_context::MarketContext;
+pub use method_catalog::{
+    all as strategy_methods, resolve as resolve_strategy_method, StrategyMethodDescriptor,
+};
 pub use method_graph::{
     MethodGraphError, MethodId, MethodLayer, MethodRegistry, MethodSpec, ResolvedMethod,
 };
