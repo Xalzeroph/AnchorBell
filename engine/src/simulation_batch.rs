@@ -36,8 +36,9 @@ use crate::{
         DataQuality, EventEnvelope, EventSource,
     },
     simulation::engine::{
-        AnchorSnapshot, PerformancePoint, PositionAllocation, RiskMetrics, SimulationEngine,
-        SimulationError, SimulationPolicyVariant, SimulationSummary,
+        append_risk_history_sample, AnchorSnapshot, PerformancePoint, PositionAllocation,
+        RiskMetrics, SimulationEngine, SimulationError, SimulationPolicyVariant, SimulationSummary,
+        RISK_HISTORY_WINDOW_MS,
     },
     strategy::{
         CalibrationSnapshot, CalibrationState, CALIBRATION_MODEL_VERSION,
@@ -52,7 +53,6 @@ const STORAGE_SAFETY_SCHEMA_VERSION: u16 = 1;
 /// avoids mixing policy-specific order selection into a single unlabeled model.
 const M9_CALIBRATION_SOURCE_LABEL: &str = "F3_m3";
 const DISPLAY_HISTORY_CAPACITY: usize = 900;
-const RISK_HISTORY_CAPACITY: usize = 7_201;
 
 #[derive(Debug, Clone)]
 pub struct SimulationBatchSpec {
@@ -496,6 +496,11 @@ fn validate(config: &SimulationBatchConfig) -> Result<(), SimulationError> {
                 "validation folds require a finite duration",
             ));
         }
+        if config.duration_secs.saturating_mul(1_000) > RISK_HISTORY_WINDOW_MS {
+            return Err(SimulationError::InvalidConfig(
+                "validation fold exceeds the complete risk-history window",
+            ));
+        }
         if config.position_allocations.is_none() {
             return Err(SimulationError::InvalidConfig(
                 "validation folds require explicit capital allocations",
@@ -547,6 +552,7 @@ pub async fn run(
         "dynamic_capital_refresh_ms": config.dynamic_capital_refresh_ms,
         "depth_snapshot_limit": config.depth_snapshot_limit,
         "duration_secs": config.duration_secs,
+        "risk_history_window_ms": RISK_HISTORY_WINDOW_MS,
     });
     let parameter_bytes = serde_json::to_vec(&parameter_material)
         .map_err(|_| SimulationError::InvalidConfig("cannot encode parameter digest"))?;
@@ -660,7 +666,7 @@ pub async fn run(
             record_dropped,
             metrics_path: dir.join("metrics.json"),
             history: VecDeque::with_capacity(DISPLAY_HISTORY_CAPACITY),
-            risk_history: VecDeque::with_capacity(RISK_HISTORY_CAPACITY),
+            risk_history: VecDeque::new(),
             final_risk_metrics: None,
             settlement_status: "not_started".to_owned(),
             flatten_requested: false,
@@ -889,12 +895,9 @@ pub async fn run(
                     for ledger in &mut ledgers {
                         let point = ledger.engine.performance_point(observed_at);
                         ledger.history.push_back(point.clone());
-                        ledger.risk_history.push_back(point);
+                        append_risk_history_sample(&mut ledger.risk_history, point, false);
                         while ledger.history.len() > DISPLAY_HISTORY_CAPACITY {
                             ledger.history.pop_front();
-                        }
-                        while ledger.risk_history.len() > RISK_HISTORY_CAPACITY {
-                            ledger.risk_history.pop_front();
                         }
                         let display = ledger.history.make_contiguous().to_vec();
                         let risk = ledger.risk_history.make_contiguous().to_vec();
@@ -1113,12 +1116,9 @@ pub async fn run(
         let observed_at = now_ms();
         let point = ledger.engine.performance_point(observed_at);
         ledger.history.push_back(point.clone());
-        ledger.risk_history.push_back(point);
+        append_risk_history_sample(&mut ledger.risk_history, point, true);
         while ledger.history.len() > DISPLAY_HISTORY_CAPACITY {
             ledger.history.pop_front();
-        }
-        while ledger.risk_history.len() > RISK_HISTORY_CAPACITY {
-            ledger.risk_history.pop_front();
         }
         let display = ledger.history.make_contiguous().to_vec();
         let risk = ledger.risk_history.make_contiguous().to_vec();

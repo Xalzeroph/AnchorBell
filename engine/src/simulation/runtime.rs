@@ -4935,12 +4935,9 @@ pub async fn run_simulation(
                         let observed_at_ms = now_ms();
                         let point = engine.performance_point(observed_at_ms);
                         performance_history.push_back(point.clone());
-                        risk_history.push_back(point);
+                        append_risk_history_sample(&mut risk_history, point, false);
                         while performance_history.len() > DISPLAY_HISTORY_CAPACITY {
                             performance_history.pop_front();
-                        }
-                        while risk_history.len() > RISK_HISTORY_CAPACITY {
-                            risk_history.pop_front();
                         }
                         let display = performance_history.make_contiguous().to_vec();
                         let risk = risk_history.make_contiguous().to_vec();
@@ -5036,12 +5033,9 @@ pub async fn run_simulation(
         let observed_at_ms = now_ms();
         let point = engine.performance_point(observed_at_ms);
         performance_history.push_back(point.clone());
-        risk_history.push_back(point);
+        append_risk_history_sample(&mut risk_history, point, true);
         while performance_history.len() > DISPLAY_HISTORY_CAPACITY {
             performance_history.pop_front();
-        }
-        while risk_history.len() > RISK_HISTORY_CAPACITY {
-            risk_history.pop_front();
         }
         let display = performance_history.make_contiguous().to_vec();
         let risk = risk_history.make_contiguous().to_vec();
@@ -5105,20 +5099,52 @@ pub async fn run_simulation(
 }
 
 const DISPLAY_HISTORY_CAPACITY: usize = 900;
-const RISK_HISTORY_CAPACITY: usize = 7_201;
 const RISK_SAMPLE_INTERVAL_MS: u64 = 30_000;
+pub(crate) const RISK_HISTORY_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+const RISK_HISTORY_CAPACITY: usize =
+    (RISK_HISTORY_WINDOW_MS / RISK_SAMPLE_INTERVAL_MS) as usize + 2;
 const MIN_RISK_RETURN_SAMPLES: usize = 30;
+
+/// Store statistically independent risk samples instead of every metrics tick.
+/// `force_final` replaces a sub-interval tail sample so shutdown/fold-end PnL is
+/// reflected without creating a spuriously tiny return interval.
+pub(crate) fn append_risk_history_sample(
+    history: &mut VecDeque<PerformancePoint>,
+    point: PerformancePoint,
+    force_final: bool,
+) {
+    match history.back() {
+        None => history.push_back(point),
+        Some(last)
+            if point.observed_at_ms.saturating_sub(last.observed_at_ms)
+                >= RISK_SAMPLE_INTERVAL_MS =>
+        {
+            history.push_back(point);
+        }
+        Some(_) if force_final => {
+            if let Some(last) = history.back_mut() {
+                *last = point;
+            }
+        }
+        Some(_) => {}
+    }
+    while history.len() > RISK_HISTORY_CAPACITY {
+        history.pop_front();
+    }
+}
 
 fn calculate_risk_metrics(points: &[(u64, i64)], capital_ticks: i64) -> RiskMetrics {
     let capital = capital_ticks.max(1) as f64;
+    let window_start_pnl = points.first().map(|(_, pnl)| *pnl).unwrap_or(0);
     let total_return_pct = points
         .last()
-        .map(|(_, pnl)| (*pnl as f64 / capital) * 100.0)
+        .map(|(_, pnl)| (pnl.saturating_sub(window_start_pnl) as f64 / capital) * 100.0)
         .unwrap_or(0.0);
     let mut max_drawdown_pct = 0.0_f64;
     let mut peak_equity = 1.0_f64;
     for (_, pnl) in points {
-        let equity = 1.0 + (*pnl as f64 / capital);
+        let window_pnl = pnl.saturating_sub(window_start_pnl);
+        let equity = 1.0 + (window_pnl as f64 / capital);
         peak_equity = peak_equity.max(equity);
         if peak_equity > 0.0 {
             max_drawdown_pct = max_drawdown_pct.max((peak_equity - equity) / peak_equity * 100.0);
@@ -5136,9 +5162,11 @@ fn calculate_risk_metrics(points: &[(u64, i64)], capital_ticks: i64) -> RiskMetr
     let mut returns = Vec::with_capacity(sampled_points.len().saturating_sub(1));
     let mut observed_seconds = 0.0_f64;
     for pair in sampled_points.windows(2) {
-        let dt = (pair[1].0.saturating_sub(pair[0].0) as f64 / 1_000.0).max(0.001);
+        let dt_ms = pair[1].0.saturating_sub(pair[0].0).max(1);
+        let dt = dt_ms as f64 / 1_000.0;
         observed_seconds += dt;
-        returns.push((pair[1].1.saturating_sub(pair[0].1)) as f64 / capital);
+        let interval_scale = RISK_SAMPLE_INTERVAL_MS as f64 / dt_ms as f64;
+        returns.push((pair[1].1.saturating_sub(pair[0].1)) as f64 / capital * interval_scale);
     }
     let sample_count = returns.len();
     let mean = if sample_count == 0 {
@@ -5166,8 +5194,8 @@ fn calculate_risk_metrics(points: &[(u64, i64)], capital_ticks: i64) -> RiskMetr
             / sample_count as f64)
             .sqrt()
     };
-    let annualization = if sample_count > 0 && observed_seconds > 0.0 {
-        (365.0 * 24.0 * 60.0 * 60.0 / (observed_seconds / sample_count as f64)).sqrt()
+    let annualization = if sample_count > 0 {
+        (365.0 * 24.0 * 60.0 * 60.0 / (RISK_SAMPLE_INTERVAL_MS as f64 / 1_000.0)).sqrt()
     } else {
         0.0
     };
@@ -5200,6 +5228,45 @@ fn calculate_risk_metrics(points: &[(u64, i64)], capital_ticks: i64) -> RiskMetr
             .then_some(mean / standard_deviation * annualization),
         sortino_ratio: (sample_count >= MIN_RISK_RETURN_SAMPLES && downside_deviation > 0.0)
             .then_some(mean / downside_deviation * annualization),
+    }
+}
+
+#[cfg(test)]
+mod risk_window_regression_tests {
+    use super::*;
+
+    fn point(timestamp_ms: u64, pnl: i64) -> PerformancePoint {
+        PerformancePoint {
+            observed_at_ms: timestamp_ms,
+            market_pnl_ticks: pnl,
+            strategy_pnl_ticks: 0,
+            funding_pnl_ticks: 0,
+            fees_ticks: 0,
+            gross_pnl_ticks: pnl,
+            net_pnl_ticks: pnl,
+            current_absolute_position: 0,
+            symbols: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn risk_history_is_downsampled_and_keeps_the_fold_end() {
+        let mut history = VecDeque::new();
+        append_risk_history_sample(&mut history, point(0, 100), false);
+        append_risk_history_sample(&mut history, point(1_000, 101), false);
+        append_risk_history_sample(&mut history, point(30_000, 102), false);
+        append_risk_history_sample(&mut history, point(31_000, 103), true);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history.front().unwrap().observed_at_ms, 0);
+        assert_eq!(history.back().unwrap().observed_at_ms, 31_000);
+        assert_eq!(history.back().unwrap().net_pnl_ticks, 103);
+    }
+
+    #[test]
+    fn risk_metrics_are_relative_to_the_retained_window() {
+        let metrics = calculate_risk_metrics(&[(0, 1_000), (30_000, 1_100)], 10_000);
+        assert!((metrics.total_return_pct - 1.0).abs() < 1e-9);
+        assert!((metrics.max_drawdown_pct - 0.0).abs() < 1e-9);
     }
 }
 
