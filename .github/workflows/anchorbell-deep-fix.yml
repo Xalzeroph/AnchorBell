@@ -25,8 +25,8 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Apply allocator feedback stability repair
-        run: python3 .github/scripts/anchorbell_allocator_feedback_fix.py
+      - name: Apply M9 cumulative semantics repair
+        run: python3 .github/scripts/anchorbell_m9_cumulative_semantics_fix.py
 
       - name: Format
         run: cargo fmt --all
@@ -56,5 +56,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add engine/src/simulation/runtime.rs
-          git commit -m "fix: stabilize post-fee dynamic allocation scoring"
+          git commit -m "fix: make M9 inherit M7 and M8 controls"
           git push origin HEAD:diag-risk-20260908
