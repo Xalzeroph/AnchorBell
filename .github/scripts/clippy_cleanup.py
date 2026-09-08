@@ -57,11 +57,13 @@ text = text.replace(
     'use std::collections::BTreeSet;\n\npub type RuntimeExperimentSpec = (String, SimulationPolicyVariant, Vec<String>);\n',
     1,
 )
-text = text.replace(
-    ') -> Result<Vec<(String, SimulationPolicyVariant, Vec<String>)>, \'static str> {',
-    ') -> Result<Vec<RuntimeExperimentSpec>, \'static str> {',
-    1,
-)
+old_signature = "Result<Vec<(String, SimulationPolicyVariant, Vec<String>)>, &'static str>"
+new_signature = "Result<Vec<RuntimeExperimentSpec>, &'static str>"
+if text.count(old_signature) != 1:
+    raise SystemExit(
+        f"expected one runtime spec return type, found {text.count(old_signature)}"
+    )
+text = text.replace(old_signature, new_signature, 1)
 p.write_text(text)
 print("patched engine/src/simulation/experiment_plan.rs")
 
