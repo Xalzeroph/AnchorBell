@@ -97,6 +97,16 @@ jobs:
             python3 .github/scripts/anchorbell_oos_parameter_provenance_fix.py
           fi
 
+      - name: Harden OOS parameter binding
+        shell: bash
+        run: |
+          if grep -q 'candidate_parameter_digest_mismatch' engine/src/oos_validation.rs \
+            && grep -q 'candidate_id.ends_with' engine/src/oos_validation.rs; then
+            echo "OOS candidate parameter binding already hardened"
+          else
+            python3 .github/scripts/anchorbell_oos_parameter_binding_hardening_fix.py
+          fi
+
       - name: Format
         run: cargo fmt --all
 
@@ -125,7 +135,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "fix: bind OOS candidates to behavior parameters"
+          git commit -m "fix: harden OOS candidate parameter binding"
           git fetch origin diag-risk-20260908
           git rebase origin/diag-risk-20260908
           git push origin HEAD:diag-risk-20260908
