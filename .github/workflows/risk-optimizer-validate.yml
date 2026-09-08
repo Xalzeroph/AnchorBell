@@ -1,0 +1,45 @@
+name: Risk optimizer validation
+
+on:
+  push:
+    branches:
+      - risk-optimizer-20260908
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: risk-optimizer-20260908
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Apply policy replay transformation
+        run: python3 .github/scripts/risk_optimizer_transform.py
+      - run: cargo fmt --all
+      - name: Architecture gate
+        run: python3 scripts/architecture_gate.py
+      - name: Resource gate
+        run: python3 scripts/resource_gate.py
+      - run: cargo check --workspace --locked
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Commit validated source
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add engine/src/simulation/runtime.rs engine/src/bin/anchorbell_backtest.rs
+          git commit -m "feat: add policy-aware replay evaluation"
+          git push origin HEAD:risk-optimizer-20260908
