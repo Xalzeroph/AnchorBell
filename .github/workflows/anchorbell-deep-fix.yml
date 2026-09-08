@@ -34,6 +34,9 @@ jobs:
       - name: Add calibration store round-trip regression
         run: python3 .github/scripts/anchorbell_calibration_store_roundtrip_fix.py
 
+      - name: Integrate portfolio drawdown runtime guard
+        run: python3 .github/scripts/anchorbell_portfolio_drawdown_runtime_fix.py
+
       - name: Format
         run: cargo fmt --all
 
@@ -61,6 +64,6 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add engine/src/bin/anchorbell_backtest.rs
-          git commit -m "test: cover calibration store round trip"
+          git add engine/src/simulation.rs engine/src/simulation/runtime.rs engine/src/bin/anchorbell_backtest.rs
+          git commit -m "feat: enforce portfolio drawdown runtime guard"
           git push origin HEAD:diag-risk-20260908
