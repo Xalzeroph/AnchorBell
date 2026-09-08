@@ -36,17 +36,15 @@ new_event_tail = '''        records.extend(match event {
             BinanceMarketEvent::DepthUpdate(depth) => self.on_depth_update(depth),
         });
         if self.observe_portfolio_drawdown().blocks_new_risk() {
-            let source_symbol = event_symbol(event).to_ascii_uppercase();
-            let source_already_rebalanced = matches!(
+            let source = event_symbol(event);
+            let source_rebalanced = matches!(
                 event,
                 BinanceMarketEvent::BookTicker(_) | BinanceMarketEvent::MarkPrice(_)
             );
-            let symbols = self.states.keys().cloned().collect::<Vec<_>>();
-            for symbol in symbols {
-                if source_already_rebalanced && symbol == source_symbol {
-                    continue;
+            for symbol in self.states.keys().cloned().collect::<Vec<_>>() {
+                if !source_rebalanced || !symbol.eq_ignore_ascii_case(source) {
+                    records.extend(self.rebalance_symbol(&symbol, self.last_event_at_ms));
                 }
-                records.extend(self.rebalance_symbol(&symbol, self.last_event_at_ms));
             }
         }
         records
