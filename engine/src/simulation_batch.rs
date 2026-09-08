@@ -59,6 +59,8 @@ pub struct SimulationBatchSpec {
 pub struct SimulationBatchConfig {
     /// Human-readable run generation. Each run writes it into its manifest.
     pub policy_id: String,
+    pub experiment_plan_id: String,
+    pub universe_id: String,
     pub environment: BinanceEnvironment,
     pub symbols: Vec<String>,
     pub anchors: BTreeMap<String, AnchorSnapshot>,
@@ -390,6 +392,8 @@ fn build_engine(
 fn validate(config: &SimulationBatchConfig) -> Result<(), SimulationError> {
     if config.symbols.is_empty()
         || config.specs.is_empty()
+        || config.experiment_plan_id.trim().is_empty()
+        || config.universe_id.trim().is_empty()
         || config.max_subscriptions_per_shard == 0
     {
         return Err(SimulationError::InvalidConfig(
@@ -430,6 +434,8 @@ pub async fn run(
     let manifest_created_at_ms = now_ms();
     let parameter_material = serde_json::json!({
         "policy_id": config.policy_id,
+        "experiment_plan_id": config.experiment_plan_id,
+        "universe_id": config.universe_id,
         "entry_threshold_bps": config.entry_threshold_bps,
         "threshold_scale_ppm": config.threshold_scale_ppm,
         "fee_ppm": config.fee_ppm,
@@ -476,6 +482,9 @@ pub async fn run(
             None,
         ),
         "policy_id": config.policy_id,
+        "experiment_plan_id": config.experiment_plan_id,
+        "universe_id": config.universe_id,
+        "method_catalog": crate::strategy::strategy_methods(),
         "created_at_ms": manifest_created_at_ms,
         "parameter_digest": parameter_digest,
         "data_digest": data_digest,

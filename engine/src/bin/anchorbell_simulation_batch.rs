@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     fs::{self, OpenOptions},
     io::Write,
@@ -78,7 +78,7 @@ fn main() {
         .build()
         .unwrap_or_else(|error| fail(format!("cannot create runtime: {error}")));
     runtime.block_on(async move {
-        let mut health = RuntimeHealthReporter::new("target/batch-runtime-audit.jsonl");
+        let mut health = RuntimeHealthReporter::new(profile.runtime_audit_path.clone());
         health
             .start(RuntimeProfile::Batch, timestamp_ms())
             .await
@@ -102,11 +102,17 @@ fn main() {
                     policy_id: policy_id.clone(),
                     capital_currency: "USDT".into(),
                     capital_minor_units: capital_usdt,
-                    universe: "frozen-close-ah".into(),
+                    universe: profile.universe_id.clone(),
                     strategies,
-                    ablations: vec!["funding".into()],
-                    checkpoint_interval_ms: 5_000,
-                    max_stale_ms: 5_000,
+                    ablations: experiment_plan
+                        .experiments
+                        .iter()
+                        .flat_map(|experiment| experiment.ablations.iter().cloned())
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect(),
+                    checkpoint_interval_ms: profile.checkpoint_interval_ms,
+                    max_stale_ms: profile.max_stale_ms,
                     auto_restart: true,
                     build_identity: env!("CARGO_PKG_VERSION").into(),
                 },
@@ -184,9 +190,12 @@ fn main() {
         registry
             .heartbeat(&run_id, timestamp_ms())
             .unwrap_or_else(|error| fail(format!("run registry heartbeat failed: {error}")));
-        let heartbeat_task = registry.spawn_heartbeat(run_id.clone(), 5_000);
+        let heartbeat_task =
+            registry.spawn_heartbeat(run_id.clone(), profile.run_registry_heartbeat_ms);
         let config = SimulationBatchConfig {
             policy_id,
+            experiment_plan_id: experiment_plan.plan_id.clone(),
+            universe_id: profile.universe_id.clone(),
             environment,
             symbols,
             anchors,
@@ -443,10 +452,7 @@ fn terminate_simulation_batch_process(pid: u32) {
 }
 
 fn print_usage() {
-    eprintln!("usage: anchorbell_simulation_batch [--policy-id M6] --index-anchors [--environment production] [--symbols S1,S2] [--output-root PATH] [--capital-usdt N] [--duration-secs N] [--include-m9]");
-    eprintln!(
-        "defaults: shared feed + M1..M8; pass --include-m9 to opt into the separate M1..M9 plan"
-    );
+    eprintln!("usage: anchorbell_simulation_batch [--strategy-profile PATH] [--policy-id ID] [--index-anchors] [--environment production] [--symbols S1,S2] [--output-root PATH] [--capital-usdt N] [--duration-secs N]");
     eprintln!(
         "execution economics, queueing, latency, and refresh cadence are controlled by the unified runtime profile"
     );

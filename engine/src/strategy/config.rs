@@ -2,7 +2,7 @@
 use crate::execution::BinanceEnvironment;
 use crate::simulation::experiment_plan::ExperimentSpec;
 use serde::{Deserialize, Serialize};
-use std::{fs, path::Path};
+use std::{collections::BTreeSet, fs, path::Path};
 
 pub const STRATEGY_PROFILE_SCHEMA_VERSION: u16 = 1;
 
@@ -10,6 +10,8 @@ pub const STRATEGY_PROFILE_SCHEMA_VERSION: u16 = 1;
 pub struct StrategyProfile {
     pub schema_version: u16,
     pub policy_id: String,
+    pub experiment_plan_id: String,
+    pub universe_id: String,
     pub environment: BinanceEnvironment,
     pub index_anchors: bool,
     pub symbols: Vec<String>,
@@ -41,6 +43,9 @@ pub struct StrategyProfile {
     pub dynamic_capital_refresh_ms: u64,
     pub depth_snapshot_limit: usize,
     pub checkpoint_interval_ms: u64,
+    pub max_stale_ms: u64,
+    pub run_registry_heartbeat_ms: u64,
+    pub runtime_audit_path: String,
     pub m9_calibration_source_label: String,
     pub experiments: Vec<ExperimentSpec>,
 }
@@ -64,6 +69,8 @@ impl StrategyProfile {
             ));
         }
         if self.policy_id.trim().is_empty()
+            || self.experiment_plan_id.trim().is_empty()
+            || self.universe_id.trim().is_empty()
             || self.symbols.is_empty()
             || self.output_root.trim().is_empty()
             || self.capital_usdt.trim().is_empty()
@@ -72,6 +79,13 @@ impl StrategyProfile {
             return Err(
                 "strategy profile identity, symbols, output, and capital are required".into(),
             );
+        }
+        let mut symbols = BTreeSet::new();
+        if self.symbols.iter().any(|symbol| {
+            let normalized = symbol.trim().to_ascii_uppercase();
+            normalized.is_empty() || !symbols.insert(normalized)
+        }) {
+            return Err("strategy profile symbols must be non-empty and unique".into());
         }
         if self.entry_threshold_bps < 0
             || self.threshold_scale_ppm <= 0
@@ -83,17 +97,26 @@ impl StrategyProfile {
             || self.price_scale > 18
             || self.max_subscriptions_per_shard == 0
             || self.experiments.is_empty()
+            || self.checkpoint_interval_ms == 0
+            || self.max_stale_ms == 0
+            || self.run_registry_heartbeat_ms == 0
+            || self.runtime_audit_path.trim().is_empty()
         {
             return Err("strategy profile contains invalid numeric or experiment values".into());
         }
+        self.experiment_plan()
+            .map_err(|error| format!("invalid experiment plan: {error}"))?;
         Ok(())
     }
 
     pub fn experiment_plan(
         &self,
     ) -> Result<crate::simulation::experiment_plan::ExperimentPlan, String> {
-        crate::simulation::experiment_plan::ExperimentPlan::from_specs(self.experiments.clone())
-            .map_err(str::to_owned)
+        crate::simulation::experiment_plan::ExperimentPlan::from_specs(
+            self.experiment_plan_id.clone(),
+            self.experiments.clone(),
+        )
+        .map_err(str::to_owned)
     }
 
     pub fn capital_usdt_ticks(&self) -> Result<i64, String> {
@@ -120,5 +143,71 @@ impl StrategyProfile {
             .checked_mul(100_000_000)
             .and_then(|value| value.checked_add(fraction_ticks))
             .ok_or_else(|| "capital_usdt is too large".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repository_profile_is_typed_and_resolves_every_method() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../config/anchorbell-simulation.json");
+        let profile = StrategyProfile::load(path).unwrap();
+        let plan = profile.experiment_plan().unwrap();
+        assert_eq!(plan.experiments.len(), 10);
+        assert!(plan.runtime_specs_with_ablations().is_ok());
+    }
+
+    #[test]
+    fn duplicate_symbols_are_rejected_before_runtime() {
+        let profile = StrategyProfile {
+            schema_version: STRATEGY_PROFILE_SCHEMA_VERSION,
+            policy_id: "test".into(),
+            experiment_plan_id: "test".into(),
+            universe_id: "test".into(),
+            environment: BinanceEnvironment::Production,
+            index_anchors: true,
+            symbols: vec!["CXMTUSDT".into(), "cxmtusdt".into()],
+            output_root: "target/test".into(),
+            capital_usdt: "1".into(),
+            duration_secs: 1,
+            entry_threshold_bps: 1,
+            threshold_scale_ppm: 1,
+            max_position: 1,
+            requested_quantity: 1,
+            max_mark_index_gap_bps: 1,
+            max_anchor_age_ms: 1,
+            fee_ppm: 1,
+            quantity_scale: 1,
+            price_scale: 1,
+            max_subscriptions_per_shard: 1,
+            connect_timeout_ms: 1,
+            read_timeout_ms: 1,
+            metrics_refresh_ms: 1,
+            index_anchor_refresh_ms: 1,
+            fx_refresh_ms: 1,
+            fx_max_age_ms: 1,
+            queue_ahead: 0,
+            trade_through: 0,
+            market_to_decision_ms: 0,
+            decision_to_exchange_ms: 0,
+            cancel_to_exchange_ms: 0,
+            quote_reprice_min_interval_ms: 1,
+            dynamic_capital_refresh_ms: 1,
+            depth_snapshot_limit: 1,
+            checkpoint_interval_ms: 1,
+            max_stale_ms: 1,
+            run_registry_heartbeat_ms: 1,
+            runtime_audit_path: "target/test-audit.jsonl".into(),
+            m9_calibration_source_label: "F3_m3".into(),
+            experiments: vec![ExperimentSpec {
+                label: "M1".into(),
+                strategy: "m1".into(),
+                ablations: vec![],
+            }],
+        };
+        assert!(profile.validate().is_err());
     }
 }

@@ -10,6 +10,7 @@ pub mod inventory;
 pub mod m9;
 pub mod maker_exit;
 pub mod market_context;
+pub mod method_catalog;
 pub mod method_graph;
 pub mod price_engine;
 pub mod quote_engine;
@@ -42,6 +43,9 @@ pub use maker_exit::{
     MakerExitDecision, MakerExitInput,
 };
 pub use market_context::MarketContext;
+pub use method_catalog::{
+    all as strategy_methods, resolve as resolve_strategy_method, StrategyMethodDescriptor,
+};
 pub use method_graph::{
     MethodGraphError, MethodId, MethodLayer, MethodRegistry, MethodSpec, ResolvedMethod,
 };

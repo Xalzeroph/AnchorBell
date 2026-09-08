@@ -3,7 +3,15 @@
   "policy_id": "M1-M9-pico-bps-server-20260906",
   "environment": "Production",
   "index_anchors": true,
-  "symbols": ["CXMTUSDT", "UNITREEUSDT", "GIGADEVUSDT", "HK0625USDT", "MINIMAXUSDT", "ZHIPUUSDT", "ZHONGJIUSDT"],
+  "symbols": [
+    "CXMTUSDT",
+    "UNITREEUSDT",
+    "GIGADEVUSDT",
+    "HK0625USDT",
+    "MINIMAXUSDT",
+    "ZHIPUUSDT",
+    "ZHONGJIUSDT"
+  ],
   "output_root": "/var/lib/anchorbell/simulation-batch-m1-m9-pico-20260906",
   "capital_usdt": "1500",
   "duration_secs": 0,
@@ -34,15 +42,62 @@
   "checkpoint_interval_ms": 5000,
   "m9_calibration_source_label": "F3_m3",
   "experiments": [
-    {"label":"F1_m1","strategy":"m1","ablations":[]},
-    {"label":"F2_m2","strategy":"m2","ablations":[]},
-    {"label":"F3_m3","strategy":"m3","ablations":[]},
-    {"label":"F4_m4","strategy":"m4","ablations":[]},
-    {"label":"F5_m5","strategy":"m5","ablations":[]},
-    {"label":"F6_m6","strategy":"m6","ablations":[]},
-    {"label":"F7_m7","strategy":"m7","ablations":[]},
-    {"label":"M8_full","strategy":"m8","ablations":[]},
-    {"label":"M8_no_funding","strategy":"m7","ablations":["funding"]},
-    {"label":"M9_full","strategy":"m9","ablations":[]}
-  ]
+    {
+      "label": "F1_m1",
+      "strategy": "m1",
+      "ablations": []
+    },
+    {
+      "label": "F2_m2",
+      "strategy": "m2",
+      "ablations": []
+    },
+    {
+      "label": "F3_m3",
+      "strategy": "m3",
+      "ablations": []
+    },
+    {
+      "label": "F4_m4",
+      "strategy": "m4",
+      "ablations": []
+    },
+    {
+      "label": "F5_m5",
+      "strategy": "m5",
+      "ablations": []
+    },
+    {
+      "label": "F6_m6",
+      "strategy": "m6",
+      "ablations": []
+    },
+    {
+      "label": "F7_m7",
+      "strategy": "m7",
+      "ablations": []
+    },
+    {
+      "label": "M8_full",
+      "strategy": "m8",
+      "ablations": []
+    },
+    {
+      "label": "M8_no_funding",
+      "strategy": "m8",
+      "ablations": [
+        "funding"
+      ]
+    },
+    {
+      "label": "M9_full",
+      "strategy": "m9",
+      "ablations": []
+    }
+  ],
+  "experiment_plan_id": "m1-m9-single-ledger-ablation-matrix",
+  "universe_id": "frozen-close-ah",
+  "max_stale_ms": 5000,
+  "run_registry_heartbeat_ms": 5000,
+  "runtime_audit_path": "target/batch-runtime-audit.jsonl"
 }
