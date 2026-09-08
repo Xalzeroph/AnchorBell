@@ -33,7 +33,7 @@ struct SelectionOutput {
 }
 
 fn main() {
-    let input = parse_args().unwrap_or_else(fail);
+    let input = parse_args().unwrap_or_else(|message| fail(message));
     let bytes = fs::read(&input)
         .unwrap_or_else(|error| fail(format!("cannot read {}: {error}", input.display())));
     let request: SelectionInput = serde_json::from_slice(&bytes)
