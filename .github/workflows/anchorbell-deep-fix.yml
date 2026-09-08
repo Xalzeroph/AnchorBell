@@ -1,0 +1,53 @@
+name: AnchorBell deep fix
+
+on:
+  push:
+    branches:
+      - diag-risk-20260908
+
+permissions:
+  contents: write
+
+jobs:
+  deep-fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout diagnostic branch
+        uses: actions/checkout@v4
+        with:
+          ref: diag-risk-20260908
+          fetch-depth: 0
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Apply deterministic repairs
+        run: python3 .github/scripts/anchorbell_deep_fix.py
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Check workspace
+        run: cargo check --workspace --locked
+
+      - name: Test workspace
+        run: cargo test --workspace --locked
+
+      - name: Commit validated repairs
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            echo "No source changes to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add engine/src/simulation/experiment_plan.rs \
+                  engine/src/bin/anchorbell_simulation_batch.rs \
+                  engine/src/simulation_batch.rs \
+                  engine/src/simulation/runtime.rs \
+                  engine/src/strategy/calibration.rs
+          git commit -m "fix: repair simulation experiment and risk statistics"
+          git push origin HEAD:diag-risk-20260908
