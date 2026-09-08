@@ -11,6 +11,8 @@ pub mod engine;
 pub mod experiment_plan;
 #[path = "simulation/orchestration.rs"]
 pub mod orchestration;
+#[path = "simulation/profile.rs"]
+pub mod profile;
 #[path = "simulation/replay.rs"]
 pub mod replay;
 #[path = "simulation/runtime.rs"]
@@ -28,3 +30,4 @@ pub use contract::{SimulationRunManifest, SIMULATION_MANIFEST_SCHEMA_VERSION};
 pub use engine::*;
 pub use experiment_plan::{ExperimentPlan, ExperimentSpec};
 pub use orchestration::*;
+pub use profile::*;

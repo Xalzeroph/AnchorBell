@@ -51,7 +51,6 @@ use crate::{
 const MIN_SIMULATION_FREE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const STORAGE_SAFETY_SCHEMA_VERSION: u16 = 1;
 /// avoids mixing policy-specific order selection into a single unlabeled model.
-const M9_CALIBRATION_SOURCE_LABEL: &str = "F3_m3";
 const DISPLAY_HISTORY_CAPACITY: usize = 900;
 
 #[derive(Debug, Clone)]
@@ -65,6 +64,10 @@ pub struct SimulationBatchSpec {
 pub struct SimulationBatchConfig {
     /// Human-readable run generation. Each run writes it into its manifest.
     pub policy_id: String,
+    /// Identity of the experiment matrix that produced `specs`.
+    pub experiment_plan_id: String,
+    /// Declared non-M9 ledger used to warm-start M9 calibration.
+    pub m9_calibration_source_label: String,
     pub environment: BinanceEnvironment,
     pub symbols: Vec<String>,
     pub anchors: BTreeMap<String, AnchorSnapshot>,
@@ -271,10 +274,10 @@ fn calibration_rank(snapshot: &CalibrationSnapshot) -> (u64, u64, u64, u64) {
     )
 }
 
-fn warm_start_m9_from_source(ledgers: &mut [Ledger]) {
+fn warm_start_m9_from_source(ledgers: &mut [Ledger], source_label: &str) {
     let seeds = ledgers
         .iter()
-        .find(|ledger| ledger.spec.label == M9_CALIBRATION_SOURCE_LABEL)
+        .find(|ledger| ledger.spec.label == source_label)
         .map(|ledger| {
             ledger
                 .engine
@@ -485,6 +488,31 @@ fn validate(config: &SimulationBatchConfig) -> Result<(), SimulationError> {
             "batch execution contains duplicate candidate semantics",
         ));
     }
+    if config.experiment_plan_id.trim().is_empty() {
+        return Err(SimulationError::InvalidConfig(
+            "batch execution requires experiment_plan_id",
+        ));
+    }
+    let source_label = config.m9_calibration_source_label.trim();
+    if source_label.is_empty() {
+        return Err(SimulationError::InvalidConfig(
+            "batch execution requires m9_calibration_source_label",
+        ));
+    }
+    let source = config
+        .specs
+        .iter()
+        .find(|spec| spec.label == source_label)
+        .ok_or(SimulationError::InvalidConfig(
+            "M9 calibration source must be present in the experiment matrix",
+        ))?;
+    if source.variant < SimulationPolicyVariant::M3FillAware
+        || source.variant > SimulationPolicyVariant::M8FundingAware
+    {
+        return Err(SimulationError::InvalidConfig(
+            "M9 calibration source must be a fill-aware M3-M8 ledger",
+        ));
+    }
     if let Some(fold_id) = config.validation_fold_id.as_deref() {
         if fold_id.trim().is_empty() {
             return Err(SimulationError::InvalidConfig(
@@ -541,7 +569,29 @@ pub async fn run(
     let manifest_created_at_ms = now_ms();
     let parameter_material = serde_json::json!({
         "policy_id": config.policy_id,
+        "experiment_plan_id": config.experiment_plan_id,
+        "m9_calibration_source_label": config.m9_calibration_source_label,
+        "specs": config.specs.iter().map(|spec| serde_json::json!({
+            "label": spec.label,
+            "strategy_variant": spec.variant.label(),
+            "ablations": spec.ablations,
+        })).collect::<Vec<_>>(),
         "entry_threshold_bps": config.entry_threshold_bps,
+        "max_position": config.max_position,
+        "requested_quantity": config.requested_quantity,
+        "max_mark_index_gap_bps": config.max_mark_index_gap_bps,
+        "max_anchor_age_ms": config.max_anchor_age_ms,
+        "quantity_scale": config.quantity_scale,
+        "price_scale": config.price_scale,
+        "max_subscriptions_per_shard": config.max_subscriptions_per_shard,
+        "connect_timeout_ms": config.connect_timeout_ms,
+        "read_timeout_ms": config.read_timeout_ms,
+        "metrics_refresh_ms": config.metrics_refresh_ms,
+        "index_anchor_refresh_ms": config.index_anchor_refresh_ms,
+        "fx_refresh_ms": config.fx_refresh_ms,
+        "fx_max_age_ms": config.fx_max_age_ms,
+        "quote_reprice_min_interval_ms": config.quote_reprice_min_interval_ms,
+        "checkpoint_interval_ms": config.checkpoint_interval_ms,
         "threshold_scale_ppm": config.threshold_scale_ppm,
         "fee_ppm": config.fee_ppm,
         "queue_ahead": config.queue_ahead,
@@ -588,6 +638,8 @@ pub async fn run(
             None,
         ),
         "policy_id": config.policy_id,
+        "experiment_plan_id": config.experiment_plan_id,
+        "m9_calibration_source_label": config.m9_calibration_source_label,
         "created_at_ms": manifest_created_at_ms,
         "parameter_digest": parameter_digest,
         "data_digest": data_digest,
@@ -643,7 +695,7 @@ pub async fn run(
     for spec in &config.specs {
         let calibration_source = if spec.variant == SimulationPolicyVariant::M9DeadlineCausalDroMpc
         {
-            M9_CALIBRATION_SOURCE_LABEL
+            config.m9_calibration_source_label.as_str()
         } else {
             spec.label.as_str()
         };
@@ -891,7 +943,7 @@ pub async fn run(
                         }
                     }
                     write_json_atomic(&evidence_summary_path, &evidence.summary()).await?;
-                    warm_start_m9_from_source(&mut ledgers);
+                    warm_start_m9_from_source(&mut ledgers, &config.m9_calibration_source_label);
                     for ledger in &mut ledgers {
                         let point = ledger.engine.performance_point(observed_at);
                         ledger.history.push_back(point.clone());
@@ -1349,6 +1401,8 @@ mod tests {
     fn execution_adverse_stress_profile_changes_economics_and_latency() {
         let mut config = SimulationBatchConfig {
             policy_id: "test".to_owned(),
+            experiment_plan_id: "test-plan".to_owned(),
+            m9_calibration_source_label: "F3_m3".to_owned(),
             environment: BinanceEnvironment::Testnet,
             symbols: vec!["CXMTUSDT".to_owned()],
             anchors: BTreeMap::new(),
@@ -1363,7 +1417,11 @@ mod tests {
             price_scale: 8,
             position_allocations: Some(BTreeMap::new()),
             output_root: PathBuf::from("target/test-stress"),
-            specs: vec![],
+            specs: vec![SimulationBatchSpec {
+                label: "F3_m3".to_owned(),
+                variant: SimulationPolicyVariant::M3FillAware,
+                ablations: vec![],
+            }],
             max_subscriptions_per_shard: 1,
             connect_timeout_ms: 1,
             read_timeout_ms: 1,
