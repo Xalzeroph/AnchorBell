@@ -28,6 +28,9 @@ jobs:
       - name: Apply strategy-profile convergence repair
         run: python3 .github/scripts/anchorbell_strategy_profile_fix.py
 
+      - name: Complete test fixture and parameter-lineage migration
+        run: python3 .github/scripts/anchorbell_strategy_profile_compile_fix.py
+
       - name: Format
         run: cargo fmt --all
 
