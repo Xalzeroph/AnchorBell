@@ -28,6 +28,9 @@ jobs:
       - name: Apply stateful maker queue repair
         run: python3 .github/scripts/anchorbell_stateful_queue_fix.py
 
+      - name: Repair stateful queue regression fixtures
+        run: python3 .github/scripts/anchorbell_stateful_queue_test_fix.py
+
       - name: Format
         run: cargo fmt --all
 
