@@ -380,7 +380,7 @@ backtest = replace_once(
             &args.calibration_source_label,
             &evaluation.calibration_snapshots,
         )
-        .unwrap_or_else(fail);
+        .unwrap_or_else(|error| fail(error));
         sha256_file(path).unwrap_or_else(|error| {
             fail(format!("cannot hash calibration output {}: {error}", path.display()))
         })
@@ -532,15 +532,9 @@ backtest = replace_once(
     '''fn sha256_file(path: &std::path::Path) -> Result<String, std::io::Error> {''',
     "generic sha256 path",
 )
-backtest = replace_once(
-    backtest,
-    '''         --calibration-store PATH --calibration-source-label LABEL --ablate-funding\n\\
-''',
-    '''         --calibration-store PATH --calibration-output PATH --calibration-source-label LABEL\n\\
-         --freeze-calibration --ablate-funding\n\\
-''',
-    "backtest walk-forward usage",
-)
+usage_old = "--calibration-store PATH --calibration-source-label LABEL --ablate-funding"
+usage_new = "--calibration-store PATH --calibration-output PATH --calibration-source-label LABEL --freeze-calibration --ablate-funding"
+backtest = replace_once(backtest, usage_old, usage_new, "backtest walk-forward usage")
 
 CAL.write_text(cal, encoding="utf-8")
 RUNTIME.write_text(runtime, encoding="utf-8")

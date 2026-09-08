@@ -7,7 +7,10 @@ use anchorbell_engine::{
     simulation::{
         load_anchor_file, replay_jsonl_with_config, ReplayConfig, SimulationPolicyVariant,
     },
-    strategy::{universe::instrument_for, CalibrationSnapshot, CalibrationState},
+    strategy::{
+        universe::instrument_for, CalibrationSnapshot, CalibrationState, CALIBRATION_MODEL_VERSION,
+        CALIBRATION_SCHEMA_VERSION,
+    },
 };
 use sha2::{Digest, Sha256};
 
@@ -17,7 +20,9 @@ struct Args {
     anchors: PathBuf,
     records: Option<PathBuf>,
     calibration_store: Option<PathBuf>,
+    calibration_output: Option<PathBuf>,
     calibration_source_label: String,
+    freeze_calibration: bool,
     price_scale: u32,
     quantity_scale: u32,
     entry_threshold_bps: i64,
@@ -71,6 +76,19 @@ async fn main() {
     {
         fail("M9 replay requires --calibration-store from the training window");
     }
+    if args.freeze_calibration && calibration_seeds.is_empty() {
+        fail("--freeze-calibration requires --calibration-store from a prior training window");
+    }
+    if args.freeze_calibration && args.calibration_output.is_some() {
+        fail("--calibration-output cannot be combined with --freeze-calibration");
+    }
+    let calibration_seed_count = calibration_seeds.len();
+    let calibration_store_sha256 = args
+        .calibration_store
+        .as_deref()
+        .map(sha256_file)
+        .transpose()
+        .unwrap_or_else(|error| fail(format!("cannot hash calibration store: {error}")));
     let input_sha256 = sha256_file(&args.input)
         .unwrap_or_else(|error| fail(format!("cannot hash input: {error}")));
     let evaluation = match replay_jsonl_with_config(
@@ -104,6 +122,7 @@ async fn main() {
             live_risk_gates: args.live_risk_gates,
             funding_controller_enabled: args.funding_controller_enabled,
             capital_usdt_ticks: args.capital_usdt_ticks,
+            calibration_updates_enabled: !args.freeze_calibration,
             calibration_seeds,
         },
     ) {
@@ -126,6 +145,20 @@ async fn main() {
             evaluation.summary.current_absolute_position, evaluation.summary.working_orders
         ));
     }
+    let calibration_output_sha256 = args.calibration_output.as_deref().map(|path| {
+        write_calibration_store(
+            path,
+            &args.calibration_source_label,
+            &evaluation.calibration_snapshots,
+        )
+        .unwrap_or_else(|error| fail(error));
+        sha256_file(path).unwrap_or_else(|error| {
+            fail(format!(
+                "cannot hash calibration output {}: {error}",
+                path.display()
+            ))
+        })
+    });
     let report = serde_json::json!({
         "input": args.input,
         "input_sha256": input_sha256,
@@ -133,7 +166,13 @@ async fn main() {
         "strategy_variant": args.strategy_variant.label(),
         "funding_controller_enabled": args.funding_controller_enabled,
         "calibration_source_label": args.calibration_source_label,
-        "calibration_seed_count": args.calibration_store.as_ref().map(|_| 1).unwrap_or(0),
+        "calibration_model_version": CALIBRATION_MODEL_VERSION,
+        "calibration_updates_enabled": !args.freeze_calibration,
+        "calibration_seed_count": calibration_seed_count,
+        "calibration_snapshot_count": evaluation.calibration_snapshots.len(),
+        "calibration_store_sha256": calibration_store_sha256,
+        "calibration_output": args.calibration_output,
+        "calibration_output_sha256": calibration_output_sha256,
         "price_scale": args.price_scale,
         "quantity_scale": args.quantity_scale,
         "entry_threshold_bps": args.entry_threshold_bps,
@@ -163,6 +202,62 @@ async fn main() {
     );
 }
 
+fn write_calibration_store(
+    path: &std::path::Path,
+    source_label: &str,
+    snapshots: &BTreeMap<String, CalibrationSnapshot>,
+) -> Result<(), String> {
+    if source_label.trim().is_empty() {
+        return Err("calibration source label cannot be empty".to_owned());
+    }
+    if snapshots.is_empty() {
+        return Err("training replay produced no calibration snapshots".to_owned());
+    }
+    let keyed = snapshots
+        .iter()
+        .map(|(symbol, snapshot)| (format!("{source_label}::{symbol}"), snapshot.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let updated_at_event_time_ms = snapshots
+        .values()
+        .map(|snapshot| snapshot.window_end_event_time_ms)
+        .max()
+        .unwrap_or(0);
+    let store = serde_json::json!({
+        "schema_version": CALIBRATION_SCHEMA_VERSION,
+        "model_version": CALIBRATION_MODEL_VERSION,
+        "updated_at_event_time_ms": updated_at_event_time_ms,
+        "source_label": source_label,
+        "snapshots": keyed,
+    });
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "cannot create calibration output {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    let bytes = serde_json::to_vec_pretty(&store)
+        .map_err(|error| format!("cannot encode calibration output: {error}"))?;
+    let temporary = path.with_extension("tmp");
+    std::fs::write(&temporary, bytes).map_err(|error| {
+        format!(
+            "cannot write calibration output {}: {error}",
+            temporary.display()
+        )
+    })?;
+    std::fs::rename(&temporary, path).map_err(|error| {
+        format!(
+            "cannot install calibration output {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
 fn load_calibration_seeds(
     path: &std::path::Path,
     source_label: &str,
@@ -171,6 +266,24 @@ fn load_calibration_seeds(
         .map_err(|error| format!("cannot read calibration store {}: {error}", path.display()))?;
     let root: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|error| format!("invalid calibration store {}: {error}", path.display()))?;
+    let schema_version = root
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "calibration store is missing schema_version".to_owned())?;
+    if schema_version != u64::from(CALIBRATION_SCHEMA_VERSION) {
+        return Err(format!(
+            "unsupported calibration schema {schema_version}; expected {CALIBRATION_SCHEMA_VERSION}"
+        ));
+    }
+    let model_version = root
+        .get("model_version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "calibration store is missing model_version".to_owned())?;
+    if model_version != CALIBRATION_MODEL_VERSION {
+        return Err(format!(
+            "unsupported calibration model {model_version}; expected {CALIBRATION_MODEL_VERSION}"
+        ));
+    }
     let snapshots = root
         .get("snapshots")
         .and_then(serde_json::Value::as_object)
@@ -205,7 +318,9 @@ fn parse_args() -> Result<Args, String> {
     let mut anchors = None;
     let mut records = None;
     let mut calibration_store = None;
+    let mut calibration_output = None;
     let mut calibration_source_label = "F3_m3".to_owned();
+    let mut freeze_calibration = false;
     let mut price_scale = 8;
     let mut quantity_scale = 8;
     let mut entry_threshold_bps = 0;
@@ -240,7 +355,11 @@ fn parse_args() -> Result<Args, String> {
             "--calibration-store" => {
                 calibration_store = Some(PathBuf::from(next(&mut args, &flag)?))
             }
+            "--calibration-output" => {
+                calibration_output = Some(PathBuf::from(next(&mut args, &flag)?))
+            }
             "--calibration-source-label" => calibration_source_label = next(&mut args, &flag)?,
+            "--freeze-calibration" => freeze_calibration = true,
             "--price-scale" => price_scale = parse(&mut args, &flag)?,
             "--quantity-scale" => quantity_scale = parse(&mut args, &flag)?,
             "--entry-threshold-bps" => entry_threshold_bps = parse(&mut args, &flag)?,
@@ -279,7 +398,9 @@ fn parse_args() -> Result<Args, String> {
         anchors: anchors.ok_or("missing --anchors")?,
         records,
         calibration_store,
+        calibration_output,
         calibration_source_label,
+        freeze_calibration,
         price_scale,
         quantity_scale,
         entry_threshold_bps,
@@ -369,7 +490,7 @@ where
         .map_err(|error| format!("invalid {flag}: {error:?}"))
 }
 
-fn sha256_file(path: &PathBuf) -> Result<String, std::io::Error> {
+fn sha256_file(path: &std::path::Path) -> Result<String, std::io::Error> {
     let mut file = File::open(path)?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
@@ -380,7 +501,7 @@ fn print_usage() {
     eprintln!(
         "usage: anchorbell_backtest --input EVENTS.jsonl --anchors ANCHORS.csv [options]\n\
          options: --records PATH --strategy-variant m0..m9 --capital-usdt N\n\
-         --calibration-store PATH --calibration-source-label LABEL --ablate-funding\n\
+         --calibration-store PATH --calibration-output PATH --calibration-source-label LABEL --freeze-calibration --ablate-funding\n\
          --price-scale N --quantity-scale N --entry-threshold-bps N\n\
          --threshold-scale-ppm N --max-position N --quantity N\n\
          --max-mark-index-gap-bps N --max-anchor-age-ms N --maker-fee-ppm N\n\

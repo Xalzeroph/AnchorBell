@@ -302,6 +302,8 @@ pub enum SimulationError {
     ReplayOutOfOrder { previous_ms: u64, current_ms: u64 },
     #[error("replay event symbol is not configured: {0}")]
     ReplaySymbolNotConfigured(String),
+    #[error("calibration seed time {seed_ms} is not strictly before replay start {replay_ms}")]
+    CalibrationSeedNotPrior { seed_ms: u64, replay_ms: u64 },
 }
 
 impl From<std::io::Error> for SimulationError {
@@ -1763,6 +1765,12 @@ impl SimulationEngine {
             if let Some(state) = self.states.get_mut(symbol) {
                 state.calibration = seed.clone();
             }
+        }
+    }
+
+    pub fn set_calibration_updates_enabled(&mut self, enabled: bool) {
+        for state in self.states.values_mut() {
+            state.calibration.set_updates_enabled(enabled);
         }
     }
 
@@ -5243,6 +5251,7 @@ pub struct ReplayConfig {
     pub live_risk_gates: bool,
     pub funding_controller_enabled: bool,
     pub capital_usdt_ticks: Option<i64>,
+    pub calibration_updates_enabled: bool,
     pub calibration_seeds: BTreeMap<String, CalibrationState>,
 }
 
@@ -5251,6 +5260,25 @@ pub struct ReplayEvaluation {
     pub summary: SimulationSummary,
     pub risk_metrics: Option<RiskMetrics>,
     pub risk_samples: usize,
+    pub calibration_snapshots: BTreeMap<String, CalibrationSnapshot>,
+}
+
+fn validate_calibration_seed_horizon(
+    seeds: &BTreeMap<String, CalibrationState>,
+    replay_start_ms: u64,
+) -> Result<(), SimulationError> {
+    let seed_ms = seeds
+        .values()
+        .map(|seed| seed.last_event_time_ms)
+        .max()
+        .unwrap_or(0);
+    if seed_ms != 0 && seed_ms >= replay_start_ms {
+        return Err(SimulationError::CalibrationSeedNotPrior {
+            seed_ms,
+            replay_ms: replay_start_ms,
+        });
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5319,6 +5347,7 @@ pub fn replay_jsonl_with_realism(
             live_risk_gates: false,
             funding_controller_enabled: true,
             capital_usdt_ticks: None,
+            calibration_updates_enabled: true,
             calibration_seeds: BTreeMap::new(),
         },
     )
@@ -5371,6 +5400,7 @@ pub fn replay_jsonl_with_config(
         engine = engine.with_live_risk_gates();
     }
     engine.restore_calibration_states(&config.calibration_seeds);
+    engine.set_calibration_updates_enabled(config.calibration_updates_enabled);
     if let Some(allocations) = allocations {
         engine = engine.with_position_allocations(allocations)?;
     }
@@ -5431,6 +5461,9 @@ pub fn replay_jsonl_with_config(
         }
         let event_timestamp_ms = event_time_ms(&event);
         let timestamp_ms = received_at_ms.unwrap_or(event_timestamp_ms);
+        if previous_ms.is_none() {
+            validate_calibration_seed_horizon(&config.calibration_seeds, timestamp_ms)?;
+        }
         if previous_ms.is_some_and(|previous| timestamp_ms < previous) {
             return Err(SimulationError::ReplayOutOfOrder {
                 previous_ms: previous_ms.unwrap(),
@@ -5487,10 +5520,13 @@ pub fn replay_jsonl_with_config(
     let risk_metrics = config
         .capital_usdt_ticks
         .map(|capital| calculate_risk_metrics(&risk_points, capital));
+    let calibration_snapshots =
+        engine.calibration_snapshots(ppm_to_pico_bps(config.fee_ppm.saturating_mul(2)));
     Ok(ReplayEvaluation {
         summary,
         risk_metrics,
         risk_samples: risk_points.len(),
+        calibration_snapshots,
     })
 }
 
@@ -5857,7 +5893,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn allocator_performance_penalty_uses_stable_scale() {
         assert_eq!(
             SimulationEngine::stable_post_fee_loss_bps(-50, 10, 10_000),
@@ -6182,5 +6217,26 @@ mod tests {
             .records
             .iter()
             .any(|record| record.kind == "order_placed"));
+    }
+}
+
+#[cfg(test)]
+mod walkforward_regression_tests {
+    use super::*;
+
+    #[test]
+    fn calibration_seed_must_strictly_precede_oos_replay() {
+        let mut seed = CalibrationState::new("TEST");
+        seed.last_event_time_ms = 100;
+        let seeds = BTreeMap::from([("TEST".to_owned(), seed)]);
+        assert!(matches!(
+            validate_calibration_seed_horizon(&seeds, 100),
+            Err(SimulationError::CalibrationSeedNotPrior { .. })
+        ));
+        assert!(matches!(
+            validate_calibration_seed_horizon(&seeds, 99),
+            Err(SimulationError::CalibrationSeedNotPrior { .. })
+        ));
+        assert!(validate_calibration_seed_horizon(&seeds, 101).is_ok());
     }
 }

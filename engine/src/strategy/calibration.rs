@@ -65,6 +65,8 @@ pub struct CalibrationState {
     pub adverse_markout_pico_bps: VecDeque<i64>,
     pub last_residual_abs_pico_bps: Option<i64>,
     pub last_residual_event_time_ms: Option<u64>,
+    #[serde(skip)]
+    frozen: bool,
 }
 
 impl CalibrationState {
@@ -86,7 +88,12 @@ impl CalibrationState {
             adverse_markout_pico_bps: VecDeque::new(),
             last_residual_abs_pico_bps: None,
             last_residual_event_time_ms: None,
+            frozen: false,
         }
+    }
+
+    pub fn set_updates_enabled(&mut self, enabled: bool) {
+        self.frozen = !enabled;
     }
 
     fn touch(&mut self, time: u64) {
@@ -113,6 +120,9 @@ impl CalibrationState {
         spread: Option<i64>,
         residual: Option<i64>,
     ) {
+        if self.frozen {
+            return;
+        }
         self.touch(time);
         if let Some(value) = ret.filter(|value| *value >= 0) {
             Self::push(&mut self.return_abs_pico_bps, value);
@@ -140,11 +150,17 @@ impl CalibrationState {
     }
 
     pub fn observe_order_placed(&mut self, time: u64) {
+        if self.frozen {
+            return;
+        }
         self.touch(time);
         self.orders_placed = self.orders_placed.saturating_add(1);
     }
 
     pub fn observe_fill(&mut self, time: u64, placed_at: u64, quantity: i64, displayed_depth: i64) {
+        if self.frozen {
+            return;
+        }
         self.touch(time);
         self.fill_events = self.fill_events.saturating_add(1);
         if displayed_depth > 0 && quantity > 0 {
@@ -158,6 +174,9 @@ impl CalibrationState {
     }
 
     pub fn observe_order_terminal(&mut self, time: u64, placed_at: u64) {
+        if self.frozen {
+            return;
+        }
         self.touch(time);
         self.completed_orders = self.completed_orders.saturating_add(1);
         if time >= placed_at {
@@ -166,6 +185,9 @@ impl CalibrationState {
     }
 
     pub fn observe_markout(&mut self, time: u64, markout: i64) {
+        if self.frozen {
+            return;
+        }
         self.touch(time);
         Self::push(&mut self.adverse_markout_pico_bps, markout.max(0));
     }
@@ -580,5 +602,35 @@ mod tests {
         let snapshot = state.snapshot(2_000_000_000_000);
         assert_eq!(snapshot.status, CalibrationStatus::InsufficientHistory);
         assert!(snapshot.reason.contains("effective_sample_size"));
+    }
+}
+
+#[cfg(test)]
+mod freeze_regression_tests {
+    use super::CalibrationState;
+
+    #[test]
+    fn frozen_calibration_ignores_validation_observations() {
+        let mut state = CalibrationState::new("TEST");
+        state.observe_market(10, Some(1), Some(2), Some(3));
+        let before_time = state.last_event_time_ms;
+        let before_returns = state.return_abs_pico_bps.len();
+        let before_orders = state.orders_placed;
+        state.set_updates_enabled(false);
+        state.observe_market(20, Some(4), Some(5), Some(6));
+        state.observe_order_placed(20);
+        state.observe_fill(20, 10, 1, 10);
+        state.observe_order_terminal(20, 10);
+        state.observe_markout(20, 7);
+        assert_eq!(state.last_event_time_ms, before_time);
+        assert_eq!(state.return_abs_pico_bps.len(), before_returns);
+        assert_eq!(state.orders_placed, before_orders);
+        assert_eq!(state.fill_events, 0);
+        assert_eq!(state.completed_orders, 0);
+        assert!(state.adverse_markout_pico_bps.is_empty());
+        state.set_updates_enabled(true);
+        state.observe_order_placed(30);
+        assert_eq!(state.orders_placed, before_orders + 1);
+        assert_eq!(state.last_event_time_ms, 30);
     }
 }
