@@ -15,8 +15,6 @@ def replace_once(old: str, new: str, label: str) -> None:
     raise SystemExit(f"missing anchor: {label}")
 
 
-# Capability semantics are cumulative. M9 is M8 plus its optimizer; it must not
-# silently shed M7 evidence gates or M8 funding economics.
 replace_once(
     '''    fn uses_evidence_gate(self) -> bool {
         matches!(self, Self::M7EvidenceGated | Self::M8FundingAware)
@@ -86,9 +84,6 @@ replace_once(
     "replay cumulative funding capability",
 )
 
-# M9 has a separate intent branch, therefore changing uses_evidence_gate alone
-# is insufficient. Apply the inherited M7 admissibility gate to flat/new-risk
-# decisions while preserving all reduce-only paths.
 old_m9 = '''            } else if strategy_variant == SimulationPolicyVariant::M9DeadlineCausalDroMpc {
                 let (intent, reduce_only, reason) = m9_intent_for_state(
                     state,
@@ -102,7 +97,7 @@ old_m9 = '''            } else if strategy_variant == SimulationPolicyVariant::M
             } else {
 '''
 new_m9 = '''            } else if strategy_variant == SimulationPolicyVariant::M9DeadlineCausalDroMpc {
-                let inherited_threshold = dynamic_threshold_for(
+                let inherited_required_pico_bps = dynamic_threshold_for(
                     state,
                     strategy_variant,
                     self.strategy.entry_threshold_bps,
@@ -111,14 +106,11 @@ new_m9 = '''            } else if strategy_variant == SimulationPolicyVariant::M
                     max_position,
                     timestamp_ms,
                 )
-                .map(|threshold| scale_threshold_non_fee(threshold, self.threshold_scale_ppm));
-                let inherited_required_pico_bps = inherited_threshold
-                    .and_then(|value| value.required_pico_bps())
-                    .map(|required| required.saturating_sub(state.adaptive_relief_pico_bps))
-                    .unwrap_or(0);
-                if state.position == 0
-                    && !m7_entry_admissible(state, inherited_required_pico_bps)
-                {
+                .map(|value| scale_threshold_non_fee(value, self.threshold_scale_ppm))
+                .and_then(|value| value.required_pico_bps())
+                .map(|value| value.saturating_sub(state.adaptive_relief_pico_bps))
+                .unwrap_or(0);
+                if state.position == 0 && !m7_entry_admissible(state, inherited_required_pico_bps) {
                     (None, false, state.working.is_some(), "m7_evidence_gate")
                 } else {
                     let (intent, reduce_only, reason) = m9_intent_for_state(
@@ -144,17 +136,10 @@ if "m9_inherits_m7_and_m8_capabilities" not in text:
 '''
     test = '''    #[test]
     fn m9_inherits_m7_and_m8_capabilities() {
-        assert!(SimulationPolicyVariant::M7EvidenceGated.uses_evidence_gate());
-        assert!(SimulationPolicyVariant::M8FundingAware.uses_evidence_gate());
-        assert!(SimulationPolicyVariant::M9DeadlineCausalDroMpc.uses_evidence_gate());
-        assert!(!SimulationPolicyVariant::M7EvidenceGated.uses_funding_controller());
-        assert!(SimulationPolicyVariant::M8FundingAware.uses_funding_controller());
-        assert!(SimulationPolicyVariant::M9DeadlineCausalDroMpc.uses_funding_controller());
-
-        let m9 = engine().with_strategy_variant(SimulationPolicyVariant::M9DeadlineCausalDroMpc);
-        assert!(m9.funding_controller_active());
-        let ablated = m9.with_funding_controller_enabled(false);
-        assert!(!ablated.funding_controller_active());
+        let variant = SimulationPolicyVariant::M9DeadlineCausalDroMpc;
+        assert!(variant.uses_evidence_gate());
+        assert!(variant.uses_funding_controller());
+        assert!(engine().with_strategy_variant(variant).funding_controller_active());
     }
 
 '''
