@@ -33,7 +33,7 @@ if 'pub fn observe_optional(' not in guard:
         raise SystemExit("missing anchor: portfolio guard helpers")
     guard = guard.replace(old_guard, new_guard, 1)
 
-old_observe = '''    fn observe_portfolio_drawdown(&mut self) -> PortfolioDrawdownAction {
+verbose_observe = '''    fn observe_portfolio_drawdown(&mut self) -> PortfolioDrawdownAction {
         let summary = self.summary();
         self.portfolio_drawdown_guard
             .as_mut()
@@ -46,7 +46,7 @@ old_observe = '''    fn observe_portfolio_drawdown(&mut self) -> PortfolioDrawdo
             })
     }
 '''
-new_observe = '''    fn observe_portfolio_drawdown(&mut self) -> PortfolioDrawdownAction {
+double_count_observe = '''    fn observe_portfolio_drawdown(&mut self) -> PortfolioDrawdownAction {
         let s = self.summary();
         PortfolioDrawdownGuard::observe_optional(
             self.portfolio_drawdown_guard.as_mut(),
@@ -55,10 +55,21 @@ new_observe = '''    fn observe_portfolio_drawdown(&mut self) -> PortfolioDrawdo
         )
     }
 '''
-if new_observe not in runtime:
-    if old_observe not in runtime:
-        raise SystemExit("missing anchor: compact portfolio observe")
-    runtime = runtime.replace(old_observe, new_observe, 1)
+canonical_observe = '''    fn observe_portfolio_drawdown(&mut self) -> PortfolioDrawdownAction {
+        let s = self.summary();
+        PortfolioDrawdownGuard::observe_optional(
+            self.portfolio_drawdown_guard.as_mut(),
+            s.unrealized_valuation_complete.then_some(s.net_pnl_ticks),
+        )
+    }
+'''
+if canonical_observe not in runtime:
+    if double_count_observe in runtime:
+        runtime = runtime.replace(double_count_observe, canonical_observe, 1)
+    elif verbose_observe in runtime:
+        runtime = runtime.replace(verbose_observe, canonical_observe, 1)
+    else:
+        raise SystemExit("missing anchor: canonical portfolio PnL observe")
 
 old_fields = '''                    risk_state: risk_state.label().to_owned(),
                     entry_block_reason: entry_block_reason.to_owned(),
