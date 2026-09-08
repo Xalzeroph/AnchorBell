@@ -8,6 +8,38 @@ execution = ROOT / "engine" / "src" / "execution"
 # communicates through typed intents and snapshots only.
 production_roots = [strategy]
 
+# Runtime internals are crate-private implementation details. External
+# binaries must consume the root facade so module extraction cannot silently
+# expand the public API.
+runtime_mod = ROOT / "engine" / "src" / "runtime" / "mod.rs"
+runtime_text = runtime_mod.read_text(encoding="utf-8")
+for module_name in (
+    "audit",
+    "channels",
+    "control_plane",
+    "event_envelope",
+    "event_loop",
+    "health_reporter",
+    "io",
+    "reference_authority",
+    "run_registry",
+    "supervisor",
+):
+    if re.search(rf"^pub\s+mod\s+{module_name}\s*;", runtime_text, re.MULTILINE):
+        raise SystemExit(f"runtime implementation module leaked publicly: {runtime_mod}:{module_name}")
+for facade_name in (
+    "AuditSink",
+    "RuntimeControlPlane",
+    "EventEnvelope",
+    "RuntimeHealthReporter",
+    "load_index_anchor_set",
+    "RunRegistry",
+    "RuntimeHandles",
+):
+    if not re.search(rf"pub\s+use[\s\S]*\b{facade_name}\b", runtime_text):
+        raise SystemExit(f"runtime facade export missing: {runtime_mod}:{facade_name}")
+
+
 forbidden_exchange_io = re.compile(
     r"tokio_tungstenite|reqwest|TcpStream|BinanceRestClient|"
     r"BinanceOrderWebSocket|std::net"

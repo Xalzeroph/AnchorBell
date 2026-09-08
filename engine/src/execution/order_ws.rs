@@ -2,7 +2,10 @@ use futures_util::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use thiserror::Error;
-use tokio::net::TcpStream;
+use tokio::{
+    net::TcpStream,
+    time::{timeout, Duration},
+};
 use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 use crate::network::connect_websocket;
@@ -91,6 +94,8 @@ pub enum OrderTransportError {
     Network(String),
     #[error("response stream closed")]
     Closed,
+    #[error("exchange response timed out; execution state is unknown; reconcile before retrying")]
+    UnknownExecution,
     #[error("response was not valid text")]
     NonTextResponse,
     #[error("response could not be decoded into the requested type: {0}")]
@@ -150,74 +155,79 @@ impl BinanceOrderWebSocket {
             .await
             .map_err(|error| OrderTransportError::WebSocket(Box::new(error)))?;
 
-        while let Some(message) = self.socket.next().await {
-            match message.map_err(|error| OrderTransportError::WebSocket(Box::new(error)))? {
-                Message::Text(text) => {
-                    let response: Value = serde_json::from_str(&text)
-                        .map_err(|_| OrderTransportError::NonTextResponse)?;
-                    if response.get("id").and_then(Value::as_str) != Some(request_id.as_str()) {
-                        continue;
+        let response = timeout(Duration::from_secs(10), async {
+            while let Some(message) = self.socket.next().await {
+                match message.map_err(|error| OrderTransportError::WebSocket(Box::new(error)))? {
+                    Message::Text(text) => {
+                        let response: Value = serde_json::from_str(&text)
+                            .map_err(|_| OrderTransportError::NonTextResponse)?;
+                        if response.get("id").and_then(Value::as_str) != Some(request_id.as_str()) {
+                            continue;
+                        }
+                        let status =
+                            response
+                                .get("status")
+                                .and_then(Value::as_u64)
+                                .ok_or_else(|| {
+                                    OrderTransportError::InvalidResponse(
+                                        "response is missing numeric status".into(),
+                                    )
+                                })?;
+                        if status >= 400 {
+                            let code = response
+                                .get("error")
+                                .and_then(|error| error.get("code"))
+                                .and_then(Value::as_i64)
+                                .unwrap_or(-1);
+                            let message = response
+                                .get("error")
+                                .and_then(|error| error.get("msg"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown exchange error")
+                                .to_string();
+                            return Err(OrderTransportError::Exchange { code, message });
+                        }
+                        if status != 200 {
+                            return Err(OrderTransportError::InvalidResponse(
+                                "successful response status is not 200".into(),
+                            ));
+                        }
+                        if payload.get("method").and_then(Value::as_str) == Some("order.place") {
+                            let params = payload
+                                .get("params")
+                                .and_then(Value::as_object)
+                                .ok_or(OrderTransportError::NonMakerOrder)?;
+                            let expected_symbol = params
+                                .get("symbol")
+                                .and_then(Value::as_str)
+                                .ok_or(OrderTransportError::NonMakerOrder)?;
+                            let expected_client_order_id = params
+                                .get("newClientOrderId")
+                                .and_then(Value::as_str)
+                                .ok_or(OrderTransportError::NonMakerOrder)?;
+                            validate_order_place_response(
+                                &response,
+                                expected_symbol,
+                                expected_client_order_id,
+                            )?;
+                        }
+                        return Ok(response);
                     }
-                    let status =
-                        response
-                            .get("status")
-                            .and_then(Value::as_u64)
-                            .ok_or_else(|| {
-                                OrderTransportError::InvalidResponse(
-                                    "response is missing numeric status".into(),
-                                )
-                            })?;
-                    if status >= 400 {
-                        let code = response
-                            .get("error")
-                            .and_then(|error| error.get("code"))
-                            .and_then(Value::as_i64)
-                            .unwrap_or(-1);
-                        let message = response
-                            .get("error")
-                            .and_then(|error| error.get("msg"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown exchange error")
-                            .to_string();
-                        return Err(OrderTransportError::Exchange { code, message });
+                    Message::Ping(payload) => {
+                        self.socket
+                            .send(Message::Pong(payload))
+                            .await
+                            .map_err(|error| OrderTransportError::WebSocket(Box::new(error)))?;
                     }
-                    if status != 200 {
-                        return Err(OrderTransportError::InvalidResponse(
-                            "successful response status is not 200".into(),
-                        ));
-                    }
-                    if payload.get("method").and_then(Value::as_str) == Some("order.place") {
-                        let params = payload
-                            .get("params")
-                            .and_then(Value::as_object)
-                            .ok_or(OrderTransportError::NonMakerOrder)?;
-                        let expected_symbol = params
-                            .get("symbol")
-                            .and_then(Value::as_str)
-                            .ok_or(OrderTransportError::NonMakerOrder)?;
-                        let expected_client_order_id = params
-                            .get("newClientOrderId")
-                            .and_then(Value::as_str)
-                            .ok_or(OrderTransportError::NonMakerOrder)?;
-                        validate_order_place_response(
-                            &response,
-                            expected_symbol,
-                            expected_client_order_id,
-                        )?;
-                    }
-                    return Ok(response);
+                    Message::Close(_) => return Err(OrderTransportError::Closed),
+                    _ => {}
                 }
-                Message::Ping(payload) => {
-                    self.socket
-                        .send(Message::Pong(payload))
-                        .await
-                        .map_err(|error| OrderTransportError::WebSocket(Box::new(error)))?;
-                }
-                Message::Close(_) => return Err(OrderTransportError::Closed),
-                _ => {}
             }
-        }
-        Err(OrderTransportError::Closed)
+            Err(OrderTransportError::Closed)
+        })
+        .await
+        .map_err(|_| OrderTransportError::UnknownExecution)??;
+        Ok(response)
     }
 
     pub async fn request_typed<T: DeserializeOwned>(

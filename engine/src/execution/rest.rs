@@ -662,12 +662,14 @@ impl BinanceRestClient {
                 RequestClass::Account
             })
             .await;
-        let response = request
-            .send()
-            .await
-            .map_err(|error| BinanceRestError::Transport {
-                message: error.to_string(),
-            })?;
+        let response = request.send().await.map_err(|error| {
+            let message = error.to_string();
+            if require_order_permission {
+                BinanceRestError::UnknownExecution { status: 0, message }
+            } else {
+                BinanceRestError::Transport { message }
+            }
+        })?;
         let status = response.status().as_u16();
         self.coordinator
             .observe_status(
@@ -680,12 +682,14 @@ impl BinanceRestClient {
                 None,
             )
             .await;
-        let body = response
-            .bytes()
-            .await
-            .map_err(|error| BinanceRestError::Transport {
-                message: error.to_string(),
-            })?;
+        let body = response.bytes().await.map_err(|error| {
+            let message = error.to_string();
+            if require_order_permission {
+                BinanceRestError::UnknownExecution { status, message }
+            } else {
+                BinanceRestError::Transport { message }
+            }
+        })?;
         if status >= 400 {
             return Err(exchange_error(status, &body));
         }

@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
         with:
-          toolchain: stable
+          toolchain: 1.98.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - run: cargo fmt --all -- --check
@@ -62,7 +62,7 @@ jobs:
       - run: cargo test --workspace --locked
       - name: Release integration tests
         run: cargo test --workspace --release --locked
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo run -p anchorbell-engine --bin market_throughput_smoke --release --locked
       - name: Generate dependency SBOM input
         run: |

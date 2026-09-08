@@ -23,12 +23,10 @@ use anchorbell_engine::{
         quote_event, BinanceC2cFxClient, BinanceC2cFxPoller, BinanceMarketConfig,
         BinanceMarketFeed, BinanceMarketStream, FxPollerConfig, FxUpdate, MarketTruthState,
     },
-    runtime::reference_authority::fetch as load_index_anchor_set,
+    runtime::load_index_anchor_set,
     runtime::{
-        audit::AuditSink,
-        control_plane::RuntimeControlPlane,
-        run_registry::{RunMode, RunRegistry, RunSpec, RunStatus, RUN_REGISTRY_SCHEMA_VERSION},
-        DataQuality, EventEnvelope, EventSource,
+        AuditSink, DataQuality, EventEnvelope, EventSource, RunMode, RunRegistry, RunSpec,
+        RunStatus, RuntimeControlPlane, RUN_REGISTRY_SCHEMA_VERSION,
     },
     simulation::{AnchorSnapshot, SimulationEngine, SimulationPolicyVariant, SimulationRecord},
     strategy::{

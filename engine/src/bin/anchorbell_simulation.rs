@@ -4,7 +4,7 @@ use anchorbell_engine::{
     execution::BinanceEnvironment,
     market::FxPollerConfig,
     platform::RuntimeProfile,
-    runtime::health_reporter::{timestamp_ms, RuntimeHealthReporter},
+    runtime::{timestamp_ms, RuntimeHealthReporter},
     simulation::{
         allocate_positions, load_anchor_file, load_index_anchor_set, run_simulation,
         BinanceIndexAnchorSet, PositionMode, SimulationConfig, SimulationPolicyVariant,

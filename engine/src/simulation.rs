@@ -22,7 +22,7 @@ pub mod batch {
     pub use crate::simulation_batch::*;
 }
 
-pub use crate::runtime::reference_authority::fetch as load_index_anchor_set;
+pub use crate::runtime::load_index_anchor_set;
 pub use crate::simulation_batch::{
     run, SimulationBatchConfig, SimulationBatchResult, SimulationBatchSpec,
 };

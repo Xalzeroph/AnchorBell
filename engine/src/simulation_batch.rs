@@ -30,8 +30,7 @@ use crate::{
     orderbook::{LocalOrderBook, OrderBookError},
     runtime::{
         io::{send_line, spawn_line_writer, write_json_atomic, AsyncLineWriter},
-        reference_authority::fetch as load_index_anchor_set,
-        DataQuality, EventEnvelope, EventSource,
+        load_index_anchor_set, DataQuality, EventEnvelope, EventSource,
     },
     simulation::engine::{
         AnchorSnapshot, PerformancePoint, PositionAllocation, SimulationEngine, SimulationError,
@@ -45,6 +44,7 @@ use crate::{
 
 const MIN_SIMULATION_FREE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const STORAGE_SAFETY_SCHEMA_VERSION: u16 = 1;
+const RUN_STATUS_SCHEMA_VERSION: u16 = 1;
 const DISPLAY_HISTORY_CAPACITY: usize = 900;
 const RISK_HISTORY_CAPACITY: usize = 7_201;
 const MARKET_EVENT_CHANNEL_CAPACITY: usize = 65_536;
@@ -206,16 +206,21 @@ async fn enforce_storage_safety(
     observed_at_ms: u64,
 ) -> Result<(), SimulationError> {
     let available_bytes = available_storage_bytes(output_root).await?;
-    if available_bytes < MIN_SIMULATION_FREE_BYTES {
-        let status = serde_json::json!({
-            "schema_version": STORAGE_SAFETY_SCHEMA_VERSION,
-            "status": "risk_stopped",
-            "reason": "simulation_storage_free_space_below_floor",
-            "observed_at_ms": observed_at_ms,
-            "available_bytes": available_bytes,
-            "minimum_free_bytes": MIN_SIMULATION_FREE_BYTES,
-        });
-        write_json_atomic(&output_root.join("storage-safety.json"), &status).await?;
+    let below_floor = available_bytes < MIN_SIMULATION_FREE_BYTES;
+    let status = serde_json::json!({
+        "schema_version": STORAGE_SAFETY_SCHEMA_VERSION,
+        "status": if below_floor { "risk_stopped" } else { "healthy" },
+        "reason": if below_floor {
+            "simulation_storage_free_space_below_floor"
+        } else {
+            "simulation_storage_free_space_above_floor"
+        },
+        "observed_at_ms": observed_at_ms,
+        "available_bytes": available_bytes,
+        "minimum_free_bytes": MIN_SIMULATION_FREE_BYTES,
+    });
+    write_json_atomic(&output_root.join("storage-safety.json"), &status).await?;
+    if below_floor {
         return Err(SimulationError::Io(format!(
             "simulation storage safety stop: {available_bytes} bytes available"
         )));
@@ -486,9 +491,10 @@ pub async fn run(
     let data_bytes = serde_json::to_vec(&data_material)
         .map_err(|_| SimulationError::InvalidConfig("cannot encode data digest"))?;
     let data_digest = format!("sha256:{}", hex::encode(Sha256::digest(data_bytes)));
+    let manifest_run_id = format!("{}-{}", config.policy_id, manifest_created_at_ms);
     let manifest = serde_json::json!({
         "simulation": crate::simulation::SimulationRunManifest::new(
-            format!("{}-{}", config.policy_id, manifest_created_at_ms),
+            manifest_run_id.clone(),
             "batch",
             config.policy_id.clone(),
             manifest_created_at_ms,
@@ -533,6 +539,19 @@ pub async fn run(
         "evidence": config.evidence.clone(),
     });
     write_json_atomic(&config.output_root.join("run-manifest.json"), &manifest).await?;
+    let run_status_path = config.output_root.join("run-status.json");
+    write_json_atomic(
+        &run_status_path,
+        &serde_json::json!({
+            "schema_version": RUN_STATUS_SCHEMA_VERSION,
+            "status": "running",
+            "run_id": manifest_run_id,
+            "policy_id": config.policy_id,
+            "started_at_ms": manifest_created_at_ms,
+            "build_identity": crate::simulation::SimulationRunManifest::compiled_build_identity(),
+        }),
+    )
+    .await?;
     let shared_market_path = config.output_root.join("shared-market.jsonl");
     let shared_fx_path = config.output_root.join("shared-fx.jsonl");
     let AsyncLineWriter {
@@ -1113,6 +1132,16 @@ pub async fn run(
         });
     }
     if let Some(error) = run_error {
+        write_json_atomic(
+            &run_status_path,
+            &serde_json::json!({
+                "schema_version": RUN_STATUS_SCHEMA_VERSION,
+                "status": "failed",
+                "finished_at_ms": now_ms(),
+                "reason": error.to_string(),
+            }),
+        )
+        .await?;
         return Err(error);
     }
     if event_dropped.load(Ordering::Relaxed) != 0
@@ -1120,9 +1149,19 @@ pub async fn run(
         || fx_dropped.load(Ordering::Relaxed) != 0
         || evidence_dropped.load(Ordering::Relaxed) != 0
     {
-        return Err(SimulationError::Market(
-            "batch execution dropped shared feed records".to_owned(),
-        ));
+        let error =
+            SimulationError::Market("batch execution dropped shared feed records".to_owned());
+        write_json_atomic(
+            &run_status_path,
+            &serde_json::json!({
+                "schema_version": RUN_STATUS_SCHEMA_VERSION,
+                "status": "failed",
+                "finished_at_ms": now_ms(),
+                "reason": error.to_string(),
+            }),
+        )
+        .await?;
+        return Err(error);
     }
     let promotion_input = SimulationPromotionInput {
         ledger_count: ledger_results.len() as u64,
@@ -1155,6 +1194,17 @@ pub async fn run(
     write_json_atomic(
         &config.output_root.join("promotion-gate.json"),
         &promotion_gate,
+    )
+    .await?;
+    write_json_atomic(
+        &run_status_path,
+        &serde_json::json!({
+            "schema_version": RUN_STATUS_SCHEMA_VERSION,
+            "status": "completed",
+            "finished_at_ms": now_ms(),
+            "evidence_class": promotion_gate.evidence_class.clone(),
+            "verdict": format!("{:?}", promotion_gate.verdict),
+        }),
     )
     .await?;
     Ok(SimulationBatchResult {
