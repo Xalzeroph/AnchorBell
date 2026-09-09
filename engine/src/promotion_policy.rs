@@ -94,14 +94,12 @@ impl RiskAdjustedPromotionPolicy {
 
     pub fn digest(&self) -> Result<String, String> {
         self.validate()?;
-        let bytes = serde_json::to_vec(self).map_err(|_| "policy serialization failed".to_owned())?;
+        let bytes =
+            serde_json::to_vec(self).map_err(|_| "policy serialization failed".to_owned())?;
         Ok(format!("sha256:{}", hex::encode(Sha256::digest(bytes))))
     }
 
-    pub fn evaluate(
-        &self,
-        folds: &[OosFoldMetrics],
-    ) -> RiskAdjustedCandidateEvaluation {
+    pub fn evaluate(&self, folds: &[OosFoldMetrics]) -> RiskAdjustedCandidateEvaluation {
         if let Err(reason) = self.validate() {
             return RiskAdjustedCandidateEvaluation::rejected(reason);
         }
@@ -122,8 +120,7 @@ impl RiskAdjustedPromotionPolicy {
             .iter()
             .map(|fold| fold.net_return_bps)
             .fold(f64::INFINITY, f64::min);
-        let score = robust.lower_quartile_net_return_bps
-            / robust.worst_max_drawdown_pct.max(1.0);
+        let score = robust.lower_quartile_net_return_bps / robust.worst_max_drawdown_pct.max(1.0);
 
         let reason = if worst_oos_return < self.min_oos_return_bps {
             "oos_return_floor_not_met"
@@ -245,7 +242,12 @@ pub fn compare_risk_adjusted_candidates(
                 .worst_max_drawdown_pct
                 .total_cmp(&left.robust.worst_max_drawdown_pct)
         })
-        .then_with(|| right.robust.return_mad_bps.total_cmp(&left.robust.return_mad_bps))
+        .then_with(|| {
+            right
+                .robust
+                .return_mad_bps
+                .total_cmp(&left.robust.return_mad_bps)
+        })
 }
 
 fn empty_robust_evaluation() -> RobustCandidateEvaluation {
