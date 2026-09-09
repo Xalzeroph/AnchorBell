@@ -24,6 +24,14 @@ jobs:
           toolchain: 1.98.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - name: Reject unresolved merge markers
+        run: |
+          if git grep -n -E '^(<<<<<<<|=======|>>>>>>>)' -- .; then
+            echo "unresolved merge markers found"
+            exit 1
+          fi
+      - name: Check patch whitespace
+        run: git diff --check
       - run: cargo fmt --all -- --check
       - name: Enforce architecture boundaries
         run: python3 scripts/architecture_gate.py
