@@ -1015,10 +1015,7 @@ async fn runs_response() -> (u16, &'static str, Vec<u8>) {
                     .and_then(|v| v.get("symbols"))
                     .cloned()
                     .unwrap_or_else(|| json!([]));
-                let history = metrics.as_ref()
-                    .and_then(|v| v.get("history"))
-                    .cloned()
-                    .unwrap_or_else(|| json!([]));
+                let history = downsample_history(metrics.as_ref().and_then(|v| v.get("history")));
                 methods.push(json!({
                     "id": id,
                     "method": definition.get("method").cloned().unwrap_or(Value::Null),
@@ -1030,7 +1027,7 @@ async fn runs_response() -> (u16, &'static str, Vec<u8>) {
                     "history": history,
                     "summary": metrics.as_ref().and_then(|v| v.get("summary")).cloned().unwrap_or_else(|| json!({})),
                     "risk_metrics": metrics.as_ref().and_then(|v| v.get("risk_metrics")).cloned().unwrap_or_else(|| json!({})),
-                    "metrics": metrics.unwrap_or_else(|| json!({})),
+                    "raw_available": metrics.is_some(),
                 }));
             }
         }
@@ -1060,6 +1057,23 @@ async fn runs_response() -> (u16, &'static str, Vec<u8>) {
         "run_count": runs.len(),
         "runs": runs,
     }))
+}
+
+fn downsample_history(value: Option<&Value>) -> Value {
+    let Some(Value::Array(points)) = value else {
+        return json!([]);
+    };
+    const MAX_POINTS: usize = 120;
+    if points.len() <= MAX_POINTS {
+        return Value::Array(points.clone());
+    }
+    let mut sampled = Vec::with_capacity(MAX_POINTS);
+    let last = points.len() - 1;
+    for index in 0..MAX_POINTS {
+        let source = index * last / (MAX_POINTS - 1);
+        sampled.push(points[source].clone());
+    }
+    Value::Array(sampled)
 }
 
 fn external_batch_runtime_snapshot(observation: &Value) -> Value {
