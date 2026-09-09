@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "policy_id": "anchorbell-risk-adjusted-promotion-v1",
+  "min_oos_folds": 3,
+  "min_stress_folds": 3,
+  "min_trades_per_oos_fold": 10,
+  "max_oos_drawdown_pct": 5.0,
+  "max_stress_drawdown_pct": 10.0,
+  "max_stress_loss_bps": 50.0,
+  "min_stress_survival_ppm": 666667,
+  "min_oos_return_bps": 0.0,
+  "min_oos_positive_return_ppm": 666667,
+  "min_lower_quartile_net_return_bps": 0.0,
+  "min_median_sharpe_ratio": 0.5,
+  "min_median_sortino_ratio": 0.5,
+  "max_return_mad_bps": 25.0,
+  "max_median_fee_drag_bps": 25.0
+}

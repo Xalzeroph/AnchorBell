@@ -36,20 +36,13 @@ pub struct RobustSelectionConstraints {
     pub max_stress_drawdown_pct: f64,
     pub max_stress_loss_bps: f64,
     pub min_stress_survival_ppm: u32,
-}
-
-impl Default for RobustSelectionConstraints {
-    fn default() -> Self {
-        Self {
-            min_oos_folds: 3,
-            min_stress_folds: 3,
-            min_trades_per_oos_fold: 10,
-            max_oos_drawdown_pct: 5.0,
-            max_stress_drawdown_pct: 10.0,
-            max_stress_loss_bps: 50.0,
-            min_stress_survival_ppm: 666_667,
-        }
-    }
+    pub min_oos_return_bps: f64,
+    pub min_oos_positive_return_ppm: u32,
+    pub min_lower_quartile_net_return_bps: f64,
+    pub min_median_sharpe_ratio: f64,
+    pub min_median_sortino_ratio: f64,
+    pub max_return_mad_bps: f64,
+    pub max_median_fee_drag_bps: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -99,10 +92,24 @@ pub fn evaluate_robust_candidate(
     constraints: RobustSelectionConstraints,
 ) -> RobustCandidateEvaluation {
     let invalid_constraints = constraints.min_oos_folds == 0
+        || constraints.min_stress_folds == 0
+        || constraints.min_trades_per_oos_fold == 0
+        || !constraints.max_oos_drawdown_pct.is_finite()
+        || !constraints.max_stress_drawdown_pct.is_finite()
+        || !constraints.max_stress_loss_bps.is_finite()
+        || !constraints.min_oos_return_bps.is_finite()
+        || !constraints.min_lower_quartile_net_return_bps.is_finite()
+        || !constraints.min_median_sharpe_ratio.is_finite()
+        || !constraints.min_median_sortino_ratio.is_finite()
+        || !constraints.max_return_mad_bps.is_finite()
+        || !constraints.max_median_fee_drag_bps.is_finite()
+        || constraints.min_oos_positive_return_ppm > 1_000_000
         || constraints.max_oos_drawdown_pct <= 0.0
         || constraints.max_stress_drawdown_pct <= 0.0
         || constraints.max_stress_loss_bps < 0.0
-        || constraints.min_stress_survival_ppm > 1_000_000;
+        || constraints.min_stress_survival_ppm > 1_000_000
+        || constraints.max_return_mad_bps < 0.0
+        || constraints.max_median_fee_drag_bps < 0.0;
     let base = |reason: &str| RobustCandidateEvaluation {
         eligible: false,
         reason: reason.to_owned(),
@@ -177,6 +184,13 @@ pub fn evaluate_robust_candidate(
     let median_sortino = median(&sortinos);
     let median_fee = median(&fees);
     let return_mad = mad(&returns);
+    let worst_oos_return = returns.iter().copied().fold(f64::INFINITY, f64::min);
+    let positive_oos = returns
+        .iter()
+        .filter(|value| **value >= constraints.min_oos_return_bps)
+        .count();
+    let positive_oos_survival_ppm =
+        (positive_oos as u128 * 1_000_000 / oos.len().max(1) as u128) as u32;
 
     let mut evaluation = RobustCandidateEvaluation {
         eligible: false,
@@ -196,10 +210,20 @@ pub fn evaluate_robust_candidate(
         "oos_drawdown_limit_exceeded"
     } else if stress_survival_ppm < constraints.min_stress_survival_ppm {
         "stress_survival_below_floor"
-    } else if lower_quartile <= 0.0 {
-        "lower_quartile_return_not_positive"
-    } else if median_sharpe <= 0.0 || median_sortino <= 0.0 {
-        "risk_adjusted_return_not_positive"
+    } else if worst_oos_return < constraints.min_oos_return_bps {
+        "oos_return_floor_not_met"
+    } else if positive_oos_survival_ppm < constraints.min_oos_positive_return_ppm {
+        "oos_positive_return_survival_below_floor"
+    } else if lower_quartile < constraints.min_lower_quartile_net_return_bps {
+        "lower_quartile_return_floor_not_met"
+    } else if median_sharpe < constraints.min_median_sharpe_ratio {
+        "median_sharpe_floor_not_met"
+    } else if median_sortino < constraints.min_median_sortino_ratio {
+        "median_sortino_floor_not_met"
+    } else if return_mad > constraints.max_return_mad_bps {
+        "return_instability_limit_exceeded"
+    } else if median_fee > constraints.max_median_fee_drag_bps {
+        "median_fee_drag_limit_exceeded"
     } else {
         evaluation.eligible = true;
         "eligible"
@@ -322,7 +346,25 @@ mod tests {
             fold("s2", true, 1.0, 0.3, 2.5),
             fold("s3", true, -8.0, 0.1, 4.0),
         ];
-        let result = evaluate_robust_candidate(&folds, RobustSelectionConstraints::default());
+        let result = evaluate_robust_candidate(
+            &folds,
+            RobustSelectionConstraints {
+                min_oos_folds: 3,
+                min_stress_folds: 3,
+                min_trades_per_oos_fold: 10,
+                max_oos_drawdown_pct: 5.0,
+                max_stress_drawdown_pct: 10.0,
+                max_stress_loss_bps: 50.0,
+                min_stress_survival_ppm: 666_667,
+                min_oos_return_bps: 0.0,
+                min_oos_positive_return_ppm: 666_667,
+                min_lower_quartile_net_return_bps: 0.0,
+                min_median_sharpe_ratio: 0.0,
+                min_median_sortino_ratio: 0.0,
+                max_return_mad_bps: 25.0,
+                max_median_fee_drag_bps: 25.0,
+            },
+        );
         assert!(result.eligible);
         assert_eq!(result.reason, "eligible");
         assert_eq!(result.stress_survival_ppm, 1_000_000);
@@ -338,9 +380,27 @@ mod tests {
             fold("s2", true, 0.0, 0.1, 2.0),
             fold("s3", true, 0.0, 0.1, 2.0),
         ];
-        let result = evaluate_robust_candidate(&folds, RobustSelectionConstraints::default());
+        let result = evaluate_robust_candidate(
+            &folds,
+            RobustSelectionConstraints {
+                min_oos_folds: 3,
+                min_stress_folds: 3,
+                min_trades_per_oos_fold: 10,
+                max_oos_drawdown_pct: 5.0,
+                max_stress_drawdown_pct: 10.0,
+                max_stress_loss_bps: 50.0,
+                min_stress_survival_ppm: 666_667,
+                min_oos_return_bps: 0.0,
+                min_oos_positive_return_ppm: 666_667,
+                min_lower_quartile_net_return_bps: 0.0,
+                min_median_sharpe_ratio: 0.0,
+                min_median_sortino_ratio: 0.0,
+                max_return_mad_bps: 25.0,
+                max_median_fee_drag_bps: 25.0,
+            },
+        );
         assert!(!result.eligible);
-        assert_eq!(result.reason, "lower_quartile_return_not_positive");
+        assert_eq!(result.reason, "oos_return_floor_not_met");
     }
 
     #[test]

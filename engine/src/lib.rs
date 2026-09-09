@@ -14,6 +14,7 @@ pub mod observability;
 pub mod oos_validation;
 pub mod orderbook;
 pub mod platform;
+pub mod promotion_policy;
 pub mod replay;
 pub mod risk;
 pub mod runtime;
