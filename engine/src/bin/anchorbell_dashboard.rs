@@ -1160,12 +1160,7 @@ async fn update_session(body: Vec<u8>, state: &DashboardState) -> (u16, &'static
     };
     let (credentials, loaded_from_store) = match (request.api_key.trim(), request.api_secret.trim())
     {
-        ("", "") => match state.credential_store.load(environment) {
-            Ok(credentials) => (credentials, true),
-            Err(error) => {
-                return json_response(500, json!({"ok": false, "message": error.to_string()}))
-            }
-        },
+        ("", "") => (None, false),
         (api_key, api_secret) => {
             match BinanceCredentials::from_values(api_key.to_owned(), api_secret.to_owned()) {
                 Ok(credentials) => (Some(credentials), false),
