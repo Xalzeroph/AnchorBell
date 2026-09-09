@@ -158,9 +158,15 @@ impl LocalOrderBook {
             return Ok(DepthApplyResult::Duplicate);
         }
         let expected = last.saturating_add(1);
-        let sequence_ok = update.first_update_id <= expected
-            && update.final_update_id >= expected
-            && (self.awaiting_first_diff || update.previous_final_update_id == Some(last));
+        // Binance's bridge rule applies only to the first diff after the
+        // snapshot. For later diffs, pu is the authoritative continuity
+        // check; U may legitimately jump because one event can cover a
+        // range of update IDs that were not emitted as separate messages.
+        let sequence_ok = if self.awaiting_first_diff {
+            update.first_update_id <= expected && update.final_update_id >= expected
+        } else {
+            update.previous_final_update_id == Some(last)
+        };
         if !sequence_ok {
             self.valid = false;
             return Err(OrderBookError::SequenceGap {
@@ -277,6 +283,33 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_replay_uses_last_update_plus_one_bridge_rule() {
+        let mut book = LocalOrderBook::default();
+        let buffered = [update(11, 12, None), update(13, 14, Some(12))];
+        assert_eq!(
+            book.load_snapshot_and_replay(10, &[(99, 3)], &[(101, 4)], &buffered),
+            Ok(2)
+        );
+        assert_eq!(book.last_update_id(), Some(14));
+    }
+
+    #[test]
+    fn snapshot_replay_reports_missing_bridge_at_next_sequence() {
+        let mut book = LocalOrderBook::default();
+        let error = book
+            .load_snapshot_and_replay(10, &[(99, 3)], &[(101, 4)], &[update(12, 12, None)])
+            .unwrap_err();
+        assert_eq!(
+            error,
+            OrderBookError::SequenceGap {
+                expected: 11,
+                first: 12,
+                previous: None
+            }
+        );
+    }
+
+    #[test]
     fn snapshot_and_contiguous_diff_update_the_book() {
         let mut book = LocalOrderBook::default();
         book.load_snapshot(10, &[(99, 3)], &[(101, 4)]).unwrap();
@@ -287,6 +320,17 @@ mod tests {
         assert_eq!(book.last_update_id(), Some(12));
         assert_eq!(book.best_bid(), Some((99, 4)));
         assert_eq!(book.best_ask(), Some((101, 5)));
+    }
+
+    #[test]
+    fn later_diff_uses_pu_continuity_even_when_u_jumps() {
+        let mut book = LocalOrderBook::default();
+        let buffered = [update(11, 12, None), update(20, 21, Some(12))];
+        assert_eq!(
+            book.load_snapshot_and_replay(10, &[(99, 3)], &[(101, 4)], &buffered),
+            Ok(2)
+        );
+        assert_eq!(book.last_update_id(), Some(21));
     }
 
     #[test]
