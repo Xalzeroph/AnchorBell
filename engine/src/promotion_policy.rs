@@ -89,6 +89,13 @@ impl RiskAdjustedPromotionPolicy {
             max_stress_drawdown_pct: self.max_stress_drawdown_pct,
             max_stress_loss_bps: self.max_stress_loss_bps,
             min_stress_survival_ppm: self.min_stress_survival_ppm,
+            min_oos_return_bps: self.min_oos_return_bps,
+            min_oos_positive_return_ppm: self.min_oos_positive_return_ppm,
+            min_lower_quartile_net_return_bps: self.min_lower_quartile_net_return_bps,
+            min_median_sharpe_ratio: self.min_median_sharpe_ratio,
+            min_median_sortino_ratio: self.min_median_sortino_ratio,
+            max_return_mad_bps: self.max_return_mad_bps,
+            max_median_fee_drag_bps: self.max_median_fee_drag_bps,
         }
     }
 
@@ -122,32 +129,17 @@ impl RiskAdjustedPromotionPolicy {
             .fold(f64::INFINITY, f64::min);
         let score = robust.lower_quartile_net_return_bps / robust.worst_max_drawdown_pct.max(1.0);
 
-        let reason = if worst_oos_return < self.min_oos_return_bps {
-            "oos_return_floor_not_met"
-        } else if positive_oos_survival_ppm < self.min_oos_positive_return_ppm {
-            "oos_positive_return_survival_below_floor"
-        } else if robust.lower_quartile_net_return_bps < self.min_lower_quartile_net_return_bps {
-            "lower_quartile_return_floor_not_met"
-        } else if robust.median_sharpe_ratio < self.min_median_sharpe_ratio {
-            "median_sharpe_floor_not_met"
-        } else if robust.median_sortino_ratio < self.min_median_sortino_ratio {
-            "median_sortino_floor_not_met"
-        } else if robust.return_mad_bps > self.max_return_mad_bps {
-            "return_instability_limit_exceeded"
-        } else if robust.median_fee_drag_bps > self.max_median_fee_drag_bps {
-            "median_fee_drag_limit_exceeded"
-        } else {
-            "eligible"
-        };
+        let eligible = robust.eligible;
+        let reason = robust.reason.clone();
 
         RiskAdjustedCandidateEvaluation {
-            eligible: reason == "eligible",
-            stage: if reason == "eligible" {
+            eligible,
+            stage: if eligible {
                 PromotionStage::PaperCandidate
             } else {
                 PromotionStage::Rejected
             },
-            reason: reason.to_owned(),
+            reason,
             robust,
             positive_oos_survival_ppm,
             worst_oos_return_bps: worst_oos_return,
