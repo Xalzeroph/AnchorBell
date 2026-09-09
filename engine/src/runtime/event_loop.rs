@@ -105,7 +105,7 @@ impl TradingRuntime {
             let Some(intent) = handler.on_event(event) else {
                 continue;
             };
-            validate_intent(&intent).map_err(|error| {
+            validate_intent(&intent).inspect_err(|error| {
                 self.halted = true;
                 self.running = false;
                 error
