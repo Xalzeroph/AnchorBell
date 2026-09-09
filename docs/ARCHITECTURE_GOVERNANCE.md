@@ -84,3 +84,112 @@ Every behavioral change needs focused tests and documentation. Before merge:
 
 This contract does not authorize Production order submission. Production remains
 disabled until its independent operational gates are satisfied.
+
+
+## 6. Target architecture and design patterns
+
+The repository is intentionally moving toward a hexagonal, event-driven
+architecture. The following patterns are mandatory boundaries, not decorative
+terminology:
+
+| Pattern | AnchorBell use | Constraint |
+| --- | --- | --- |
+| Hexagonal architecture | domain decisions depend on typed ports; Binance, files, and clocks are adapters | strategy and risk cannot import transport clients |
+| Event-driven pipeline | normalized market, reference, decision, order, and lifecycle events | event time and receipt time remain separate |
+| CQRS | decision queries/read models are separate from order/lifecycle commands | reports cannot mutate execution state |
+| State machine | order lifecycle, recovery, readiness, and residual exposure use explicit states | unknown transitions fail closed |
+| Policy object | fees, deadlines, maker/taker permissions, and risk limits are resolved policy values | policies are versioned inputs, not hidden constants |
+| Registry/factory | method catalog, experiment plans, gateways, and adapters are registered once | no duplicated string-based dispatch |
+| Anti-corruption layer | Binance wire payloads are normalized before entering the domain | exchange-specific fields do not leak through the core |
+| Event-sourced audit | decisions and exchange acknowledgements are append-only evidence | a metric cannot rewrite an order fact |
+
+The intended dependency direction is:
+
+```mermaid
+flowchart TD
+    A["Binance / files / clock adapters"] --> B["Normalized event ports"]
+    B --> C["Reference + strategy + risk"]
+    C --> D["Typed order intents"]
+    D --> E["Execution state machine"]
+    E --> F["Exchange gateway + append-only audit"]
+```
+
+### Current structural pressure points
+
+The main branch at the time of this review has approximately:
+
+- 1,611 lines in platform.rs;
+- 137 Rust source files under engine/src;
+- multiple standalone binaries under engine/src/bin;
+- dozens of historical repair scripts under .github/scripts.
+
+These are not immediate correctness failures, but they increase change coupling,
+review size, and the probability that a new method bypasses the common contracts.
+
+### Refactoring sequence
+
+1. Split platform.rs behind a stable facade into catalog, topology, health,
+   readiness, manifest, and policy modules. Preserve public types and tests
+   during each extraction.
+2. Introduce one typed application runner with subcommands for simulation,
+   replay, backtest, metadata smoke, and controlled Testnet checks. Keep old
+   binaries as thin compatibility wrappers until the runner is proven.
+3. Move reusable repair scripts into a versioned tools/migrations area with
+   manifests, idempotence checks, and tests. Delete only after their result is
+   represented by a permanent invariant or migration.
+4. Make configuration resolution a boot-time pipeline:
+   source discovery -> schema validation -> exchange enrichment -> merge policy
+   -> digest -> immutable runtime snapshot.
+5. Make every runtime capability depend on a readiness token issued by the
+   platform registry. Readiness must be capability-specific; data readiness
+   cannot imply order permission.
+6. Keep analytics and validation downstream of immutable run artifacts. They may
+   consume evidence, but cannot become an authority for live execution.
+
+The safe migration rule is one bounded extraction per change, with unchanged
+serialized manifests and deterministic replay results. A refactor that changes
+behavior and structure in the same commit is rejected unless both differences
+are explicitly evidenced.
+
+## 7. Runtime snapshot and capability model
+
+At startup, the runtime should resolve one immutable snapshot containing:
+
+- configuration sources and digests;
+- Binance exchange metadata and filter versions;
+- fee and funding schedules;
+- strategy/method and execution overlay;
+- clock, data, queue, latency, and fill-model capabilities;
+- risk and production permission state.
+
+Components receive only the slice they own. They do not re-read mutable global
+configuration during a decision. A capability token should distinguish at
+least:
+
+| Capability | Allows | Does not imply |
+| --- | --- | --- |
+| MarketDataReady | parse and record market events | valid anchor or order permission |
+| StrategyReady | calculate a decision | order submission |
+| SimulationReady | run deterministic simulation | Testnet or Production access |
+| TestnetReady | use the Testnet adapter | Production access |
+| ReduceOnlyRecovery | lower existing exposure | create new exposure |
+| ProductionOrder | submit authorized orders | permission to bypass risk gates |
+
+This prevents the common architectural error where one boolean such as
+`ready=true` accidentally authorizes unrelated capabilities.
+
+## 8. Long-term quality bar
+
+A high-star repository should make the safe path the easy path:
+
+- one documented command per lifecycle phase;
+- one manifest schema for every run;
+- one source of truth for each business policy;
+- one typed boundary for each external system;
+- one review checklist that matches the actual gates;
+- one reproducible release procedure;
+- no dead compatibility path without an owner and removal condition.
+
+The repository should prefer a small number of strong concepts over a large
+number of clever modules. New abstractions are accepted only when they remove
+coupling, encode an invariant, or make evidence reproducible.
