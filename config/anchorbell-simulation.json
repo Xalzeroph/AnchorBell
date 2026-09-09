@@ -30,6 +30,8 @@
   "metrics_refresh_ms": 1000,
   "index_anchor_refresh_ms": 60000,
   "anchor_kline_interval": "1m",
+  "anchor_kline_lookback_ms": 86400000,
+  "anchor_kline_limit": 1500,
   "fx_refresh_ms": 30000,
   "fx_max_age_ms": 120000,
   "queue_ahead": 0,

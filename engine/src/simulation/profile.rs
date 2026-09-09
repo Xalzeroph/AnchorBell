@@ -27,6 +27,8 @@ pub struct SimulationExecutionConfig {
     pub metrics_refresh_ms: u64,
     pub index_anchor_refresh_ms: u64,
     pub anchor_kline_interval: String,
+    pub anchor_kline_lookback_ms: u64,
+    pub anchor_kline_limit: usize,
     pub fx_refresh_ms: u64,
     pub fx_max_age_ms: u64,
     pub queue_ahead: i64,
@@ -63,6 +65,8 @@ impl SimulationExecutionConfig {
             || self.metrics_refresh_ms < 250
             || self.index_anchor_refresh_ms == 0
             || self.anchor_kline_interval.trim().is_empty()
+            || self.anchor_kline_lookback_ms == 0
+            || self.anchor_kline_limit == 0
             || self.fx_refresh_ms == 0
             || self.fx_max_age_ms == 0
             || self.depth_snapshot_limit == 0
@@ -253,6 +257,8 @@ mod tests {
                 metrics_refresh_ms: 1_000,
                 index_anchor_refresh_ms: 60_000,
                 anchor_kline_interval: "1m".into(),
+                anchor_kline_lookback_ms: 86_400_000,
+                anchor_kline_limit: 1_500,
                 fx_refresh_ms: 30_000,
                 fx_max_age_ms: 120_000,
                 queue_ahead: 0,

@@ -455,6 +455,8 @@ async fn run(args: Args) -> Result<i32, String> {
         &symbols,
         args.price_scale,
         &strategy_profile.anchor_kline_interval,
+        strategy_profile.anchor_kline_lookback_ms,
+        strategy_profile.anchor_kline_limit,
         args.proxy.as_deref(),
     )
     .await

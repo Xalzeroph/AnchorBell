@@ -150,6 +150,8 @@ fn main() {
                     &symbols,
                     profile.price_scale,
                     &profile.anchor_kline_interval,
+                    profile.anchor_kline_lookback_ms,
+                    profile.anchor_kline_limit,
                     None,
                 ),
             )
@@ -236,6 +238,8 @@ fn main() {
                 0
             },
             anchor_kline_interval: profile.anchor_kline_interval.clone(),
+            anchor_kline_lookback_ms: profile.anchor_kline_lookback_ms,
+            anchor_kline_limit: profile.anchor_kline_limit,
             fx_refresh_ms: profile.fx_refresh_ms,
             fx_max_age_ms: profile.fx_max_age_ms,
             queue_ahead: profile.queue_ahead,

@@ -13,6 +13,8 @@ pub async fn fetch(
     symbols: &[String],
     price_scale: u32,
     anchor_kline_interval: &str,
+    anchor_kline_lookback_ms: u64,
+    anchor_kline_limit: usize,
     http_proxy: Option<&str>,
 ) -> Result<BinanceIndexAnchorSet, SimulationError> {
     crate::simulation::engine::load_index_anchor_set_internal(
@@ -20,6 +22,8 @@ pub async fn fetch(
         symbols,
         price_scale,
         anchor_kline_interval,
+        anchor_kline_lookback_ms,
+        anchor_kline_limit,
         http_proxy,
     )
     .await

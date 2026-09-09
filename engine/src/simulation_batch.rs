@@ -93,6 +93,8 @@ pub struct SimulationBatchConfig {
     pub metrics_refresh_ms: u64,
     pub index_anchor_refresh_ms: u64,
     pub anchor_kline_interval: String,
+    pub anchor_kline_lookback_ms: u64,
+    pub anchor_kline_limit: usize,
     pub fx_refresh_ms: u64,
     pub fx_max_age_ms: u64,
     pub queue_ahead: i64,
@@ -547,6 +549,8 @@ pub async fn run(
         "fee_schedule": config.fee_schedule,
         "anchor_source": crate::simulation::engine::INDEX_ANCHOR_SOURCE,
         "anchor_kline_interval": config.anchor_kline_interval,
+        "anchor_kline_lookback_ms": config.anchor_kline_lookback_ms,
+        "anchor_kline_limit": config.anchor_kline_limit,
         "index_anchor_conversions": config.index_anchor_conversions,
         "queue_ahead": config.queue_ahead,
         "trade_through": config.trade_through,
@@ -568,6 +572,8 @@ pub async fn run(
         }).collect::<BTreeMap<_, _>>(),
         "anchor_source": crate::simulation::engine::INDEX_ANCHOR_SOURCE,
         "anchor_kline_interval": config.anchor_kline_interval,
+        "anchor_kline_lookback_ms": config.anchor_kline_lookback_ms,
+        "anchor_kline_limit": config.anchor_kline_limit,
         "index_anchor_conversions": config.index_anchor_conversions,
         "environment": config.environment.as_str(),
     });
@@ -614,6 +620,8 @@ pub async fn run(
         "fee_schedule": config.fee_schedule,
         "anchor_source": crate::simulation::engine::INDEX_ANCHOR_SOURCE,
         "anchor_kline_interval": config.anchor_kline_interval,
+        "anchor_kline_lookback_ms": config.anchor_kline_lookback_ms,
+        "anchor_kline_limit": config.anchor_kline_limit,
         "index_anchor_conversions": config.index_anchor_conversions,
         "queue_ahead": config.queue_ahead,
         "trade_through": config.trade_through,
@@ -745,6 +753,8 @@ pub async fn run(
         let symbols = config.symbols.clone();
         let price_scale = config.price_scale;
         let anchor_kline_interval = config.anchor_kline_interval.clone();
+        let anchor_kline_lookback_ms = config.anchor_kline_lookback_ms;
+        let anchor_kline_limit = config.anchor_kline_limit;
         let refresh_ms = config.index_anchor_refresh_ms;
         Some(tokio::spawn(async move {
             loop {
@@ -754,6 +764,8 @@ pub async fn run(
                     &symbols,
                     price_scale,
                     &anchor_kline_interval,
+                    anchor_kline_lookback_ms,
+                    anchor_kline_limit,
                     None,
                 )
                 .await

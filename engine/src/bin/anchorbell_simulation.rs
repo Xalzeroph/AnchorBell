@@ -52,6 +52,8 @@ async fn load_index_anchors_with_retry(
     symbols: &[String],
     price_scale: u32,
     anchor_kline_interval: &str,
+    anchor_kline_lookback_ms: u64,
+    anchor_kline_limit: usize,
     proxy: Option<&str>,
 ) -> Result<BinanceIndexAnchorSet, String> {
     let mut last_error = String::from("unknown index anchor error");
@@ -61,6 +63,8 @@ async fn load_index_anchors_with_retry(
             symbols,
             price_scale,
             anchor_kline_interval,
+            anchor_kline_lookback_ms,
+            anchor_kline_limit,
             proxy,
         )
         .await
@@ -109,6 +113,8 @@ async fn main() {
             symbols,
             args.price_scale,
             &strategy_profile.anchor_kline_interval,
+            strategy_profile.anchor_kline_lookback_ms,
+            strategy_profile.anchor_kline_limit,
             args.proxy.as_deref(),
         )
         .await
@@ -233,6 +239,8 @@ async fn main() {
                 0
             },
             anchor_kline_interval: strategy_profile.anchor_kline_interval.clone(),
+            anchor_kline_lookback_ms: strategy_profile.anchor_kline_lookback_ms,
+            anchor_kline_limit: strategy_profile.anchor_kline_limit,
             http_proxy: args.proxy,
             market_output_path: args.market_records,
             fx_output_path: fx_records.clone(),

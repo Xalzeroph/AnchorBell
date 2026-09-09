@@ -64,6 +64,8 @@ pub struct StrategyProfile {
     pub metrics_refresh_ms: u64,
     pub index_anchor_refresh_ms: u64,
     pub anchor_kline_interval: String,
+    pub anchor_kline_lookback_ms: u64,
+    pub anchor_kline_limit: usize,
     pub fx_refresh_ms: u64,
     pub fx_max_age_ms: u64,
     pub queue_ahead: i64,
@@ -136,6 +138,8 @@ impl StrategyProfile {
             || self.run_registry_heartbeat_ms == 0
             || self.runtime_audit_path.trim().is_empty()
             || self.anchor_kline_interval.trim().is_empty()
+            || self.anchor_kline_lookback_ms == 0
+            || self.anchor_kline_limit == 0
         {
             return Err("strategy profile contains invalid numeric or experiment values".into());
         }
@@ -241,6 +245,8 @@ mod tests {
             metrics_refresh_ms: 1,
             index_anchor_refresh_ms: 1,
             anchor_kline_interval: "1m".into(),
+            anchor_kline_lookback_ms: 86_400_000,
+            anchor_kline_limit: 1_500,
             fx_refresh_ms: 1,
             fx_max_age_ms: 1,
             queue_ahead: 0,

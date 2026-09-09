@@ -435,6 +435,8 @@ pub(crate) async fn load_index_anchor_set_internal(
     symbols: &[String],
     price_scale: u32,
     anchor_kline_interval: &str,
+    anchor_kline_lookback_ms: u64,
+    anchor_kline_limit: usize,
     http_proxy: Option<&str>,
 ) -> Result<BinanceIndexAnchorSet, SimulationError> {
     if symbols.is_empty() {
@@ -499,9 +501,9 @@ pub(crate) async fn load_index_anchor_set_internal(
             .index_price_klines(
                 &symbol,
                 anchor_kline_interval,
-                close_at_ms.saturating_sub(86_400_000),
+                close_at_ms.saturating_sub(anchor_kline_lookback_ms),
                 close_at_ms,
-                1_500,
+                anchor_kline_limit,
             )
             .await
             .map_err(|error| {
@@ -627,6 +629,8 @@ pub async fn load_binance_index_anchors(
     symbols: &[String],
     price_scale: u32,
     anchor_kline_interval: &str,
+    anchor_kline_lookback_ms: u64,
+    anchor_kline_limit: usize,
     http_proxy: Option<&str>,
 ) -> Result<BTreeMap<String, AnchorSnapshot>, SimulationError> {
     Ok(load_index_anchor_set_internal(
@@ -634,6 +638,8 @@ pub async fn load_binance_index_anchors(
         symbols,
         price_scale,
         anchor_kline_interval,
+        anchor_kline_lookback_ms,
+        anchor_kline_limit,
         http_proxy,
     )
     .await?
@@ -5017,6 +5023,8 @@ pub struct SimulationConfig {
     pub duration_secs: u64,
     pub index_anchor_refresh_ms: u64,
     pub anchor_kline_interval: String,
+    pub anchor_kline_lookback_ms: u64,
+    pub anchor_kline_limit: usize,
     pub http_proxy: Option<String>,
     pub market_output_path: Option<PathBuf>,
     pub fx_output_path: Option<PathBuf>,
@@ -5180,6 +5188,8 @@ pub async fn run_simulation(
         let symbols = config.symbols.clone();
         let price_scale = config.price_scale;
         let anchor_kline_interval = config.anchor_kline_interval.clone();
+        let anchor_kline_lookback_ms = config.anchor_kline_lookback_ms;
+        let anchor_kline_limit = config.anchor_kline_limit;
         let http_proxy = config.http_proxy.clone();
         let refresh_ms = config.index_anchor_refresh_ms;
         Some(tokio::spawn(async move {
@@ -5190,6 +5200,8 @@ pub async fn run_simulation(
                     &symbols,
                     price_scale,
                     &anchor_kline_interval,
+                    anchor_kline_lookback_ms,
+                    anchor_kline_limit,
                     http_proxy.as_deref(),
                 )
                 .await
