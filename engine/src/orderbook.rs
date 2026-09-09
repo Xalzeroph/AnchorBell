@@ -85,7 +85,9 @@ impl LocalOrderBook {
                 // Some Binance TradFi depth streams use non-contiguous U/u
                 // ranges. If pu directly names the snapshot ID, it is still
                 // an unambiguous first-event bridge.
-                || (update.previous_final_update_id == Some(last_update_id)
+                || (update
+                    .previous_final_update_id
+                    .is_some_and(|previous| previous <= last_update_id)
                     && update.final_update_id > last_update_id)
         }) else {
             self.valid = false;
@@ -111,8 +113,10 @@ impl LocalOrderBook {
         let expected = last.saturating_add(1);
         let strict_bridge =
             update.first_update_id <= expected && update.final_update_id >= expected;
-        let pu_bridge =
-            update.previous_final_update_id == Some(last) && update.final_update_id > last;
+        let pu_bridge = update
+            .previous_final_update_id
+            .is_some_and(|previous| previous <= last)
+            && update.final_update_id > last;
         if !strict_bridge && !pu_bridge {
             self.valid = false;
             return Err(OrderBookError::SequenceGap {
@@ -306,6 +310,17 @@ mod tests {
     fn snapshot_replay_accepts_pu_bridge_when_u_range_jumps() {
         let mut book = LocalOrderBook::default();
         let buffered = [update(20, 21, Some(10)), update(30, 31, Some(21))];
+        assert_eq!(
+            book.load_snapshot_and_replay(10, &[(99, 3)], &[(101, 4)], &buffered),
+            Ok(2)
+        );
+        assert_eq!(book.last_update_id(), Some(31));
+    }
+
+    #[test]
+    fn snapshot_replay_accepts_pu_range_bridge_when_snapshot_id_is_inside_gap() {
+        let mut book = LocalOrderBook::default();
+        let buffered = [update(20, 21, Some(5)), update(30, 31, Some(21))];
         assert_eq!(
             book.load_snapshot_and_replay(10, &[(99, 3)], &[(101, 4)], &buffered),
             Ok(2)

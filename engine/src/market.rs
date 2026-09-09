@@ -18,17 +18,16 @@ pub mod live;
 pub mod metadata;
 #[path = "market/recorder.rs"]
 pub mod recorder;
-#[path = "market/subscription.rs"]
-pub mod subscription;
 #[path = "market/shared.rs"]
 pub mod shared;
+#[path = "market/subscription.rs"]
+pub mod subscription;
 #[path = "market/truth.rs"]
 pub mod truth;
 pub use binance_adapter::BinanceMarketDataAdapter;
 pub use capability::{CapabilityGateError, MarketCapabilityGate};
 pub use connection::{ConnectionAction, ConnectionState, ConnectionSupervisor, ReconnectPolicy};
 pub use freshness::{FreshnessClass, FreshnessPolicy, FreshnessState};
-pub use shared::{MarketSnapshot, SharedMarketDataPlane};
 pub use fx::{BinanceC2cFxClient, BinanceC2cFxPoller, FxError, FxPollerConfig, FxQuote, FxUpdate};
 pub use instrument_registry::{
     AssetClass, InstrumentClassification, InstrumentRegistryConfig, InstrumentRegistryError,
@@ -43,6 +42,7 @@ pub use metadata::{
     PublicMarketMetadataClient, PublicMetadataError, PUBLIC_SNAPSHOT_MAX_AGE_MS,
     PUBLIC_SNAPSHOT_POLICY,
 };
+pub use shared::{MarketSnapshot, SharedMarketDataPlane};
 pub use subscription::{
     BinanceSubscription, SubscriptionError, SubscriptionPlan, SubscriptionPlanError,
 };
