@@ -12,6 +12,7 @@ use std::{
 use anchorbell_engine::{
     analytics_evidence::EvidenceConfig,
     execution::{BinanceEnvironment, SessionCheckpoint},
+    market::{AssetClass, InstrumentRegistryConfig},
     platform::RuntimeProfile,
     runtime::{
         timestamp_ms, RunMode, RunRegistry, RunSpec, RunStatus, RuntimeHealthReporter,
@@ -36,6 +37,38 @@ struct Args {
     output_root: Option<PathBuf>,
     capital_usdt: Option<String>,
     duration_secs: Option<u64>,
+}
+
+fn validate_simulation_instruments(
+    profile: &StrategyProfile,
+    symbols: &[String],
+) -> Result<(), String> {
+    let registry = InstrumentRegistryConfig::embedded()
+        .map_err(|error| format!("cannot load instrument registry: {error}"))?;
+    let classifications = registry.by_symbol();
+    for symbol in symbols {
+        let normalized = symbol.trim().to_ascii_uppercase();
+        let classification = classifications.get(&normalized).ok_or_else(|| {
+            format!("simulation symbol {normalized} is missing external classification")
+        })?;
+        if classification.asset_class != profile.asset_class {
+            return Err(format!(
+                "simulation asset class mismatch for {normalized}: profile={:?}, symbol={:?}",
+                profile.asset_class, classification.asset_class
+            ));
+        }
+        if classification.asset_class == AssetClass::Unknown {
+            return Err(format!(
+                "simulation symbol {normalized} has unknown asset class"
+            ));
+        }
+        if !classification.simulation_enabled {
+            return Err(format!(
+                "simulation symbol {normalized} is not enabled by the instrument registry"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn main() {
@@ -67,6 +100,8 @@ fn main() {
                 .unwrap_or_else(|error| fail(error))
         });
     let duration_secs = args.duration_secs.unwrap_or(profile.duration_secs);
+    validate_simulation_instruments(&profile, &symbols)
+        .unwrap_or_else(|error| fail(format!("instrument registry gate failed: {error}")));
     if !index_anchors {
         fail("batch execution requires live --index-anchors");
     }

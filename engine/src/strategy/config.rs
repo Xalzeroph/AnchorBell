@@ -1,5 +1,6 @@
 //! Versioned, typed strategy/runtime configuration.
 use crate::execution::{BinanceEnvironment, EmergencyExecutionPolicy};
+use crate::market::AssetClass;
 use crate::simulation::experiment_plan::ExperimentSpec;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, fs, path::Path};
@@ -41,6 +42,7 @@ pub struct StrategyProfile {
     pub default_strategy_variant: String,
     pub experiment_plan_id: String,
     pub universe_id: String,
+    pub asset_class: AssetClass,
     pub environment: BinanceEnvironment,
     pub index_anchors: bool,
     pub symbols: Vec<String>,
@@ -107,6 +109,7 @@ impl StrategyProfile {
             || self.experiment_plan_id.trim().is_empty()
             || self.default_strategy_variant.trim().is_empty()
             || self.universe_id.trim().is_empty()
+            || self.asset_class == AssetClass::Unknown
             || self.symbols.is_empty()
             || self.output_root.trim().is_empty()
             || self.capital_usdt.trim().is_empty()
@@ -214,6 +217,7 @@ mod tests {
             default_strategy_variant: "m4".into(),
             experiment_plan_id: "test".into(),
             universe_id: "test".into(),
+            asset_class: AssetClass::OrdinaryEquity,
             environment: BinanceEnvironment::Production,
             index_anchors: true,
             symbols: vec!["CXMTUSDT".into(), "cxmtusdt".into()],

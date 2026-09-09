@@ -149,6 +149,7 @@
   ],
   "experiment_plan_id": "m1-m9-single-ledger-ablation-matrix",
   "universe_id": "frozen-close-ah",
+  "asset_class": "ordinary_equity",
   "max_stale_ms": 5000,
   "run_registry_heartbeat_ms": 5000,
   "runtime_audit_path": "target/batch-runtime-audit.jsonl",
