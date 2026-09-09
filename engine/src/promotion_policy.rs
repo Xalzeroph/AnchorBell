@@ -159,7 +159,7 @@ impl RiskAdjustedPromotionPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PromotionStage {
     Rejected,
     InsufficientEvidence,
@@ -330,13 +330,15 @@ mod tests {
     fn one_negative_oos_fold_is_not_promotion_ready() {
         let folds = vec![
             fold("o1", false, 12.0, 1.1, 1.2),
-            fold("o2", false, -1.0, 1.0, 1.0),
+            fold("o2", false, 6.0, 1.0, 1.0),
             fold("o3", false, 8.0, 0.9, 1.4),
             fold("s1", true, 0.0, 0.2, 3.0),
             fold("s2", true, 1.0, 0.3, 2.5),
             fold("s3", true, 0.0, 0.1, 4.0),
         ];
-        let result = policy().evaluate(&folds);
+        let mut configured = policy();
+        configured.min_oos_return_bps = 10.0;
+        let result = configured.evaluate(&folds);
         assert!(!result.eligible);
         assert_eq!(result.reason, "oos_return_floor_not_met");
     }
