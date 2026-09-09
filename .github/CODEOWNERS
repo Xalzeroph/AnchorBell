@@ -1,0 +1,13 @@
+# AnchorBell ownership boundaries
+# Changes touching a boundary require the repository owner review.
+* @Xalzeroph
+
+/engine/src/strategy/ @Xalzeroph
+/engine/src/execution/ @Xalzeroph
+/engine/src/market/ @Xalzeroph
+/engine/src/simulation/ @Xalzeroph
+/engine/src/runtime/ @Xalzeroph
+/config/ @Xalzeroph
+/deploy/ @Xalzeroph
+/.github/workflows/ @Xalzeroph
+/docs/ @Xalzeroph

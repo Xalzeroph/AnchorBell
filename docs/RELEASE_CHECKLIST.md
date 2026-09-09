@@ -18,7 +18,7 @@ environment are recorded together.
 - [ ] /health, /live, and /ready return the expected state
 - [ ] checkpoint restore enters RiskStopped before reconciliation
 - [ ] invalid, stale, contradictory, and unknown state fails closed
-- [ ] no taker intent can be produced
+- [ ] no risk-increasing taker intent can be produced; any emergency taker intent is reduce-only, policy-registered, and fully audited
 - [ ] production remains disabled by default
 
 ## Evidence gates
