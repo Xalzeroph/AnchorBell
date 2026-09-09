@@ -38,20 +38,6 @@ pub struct RobustSelectionConstraints {
     pub min_stress_survival_ppm: u32,
 }
 
-impl Default for RobustSelectionConstraints {
-    fn default() -> Self {
-        Self {
-            min_oos_folds: 3,
-            min_stress_folds: 3,
-            min_trades_per_oos_fold: 10,
-            max_oos_drawdown_pct: 5.0,
-            max_stress_drawdown_pct: 10.0,
-            max_stress_loss_bps: 50.0,
-            min_stress_survival_ppm: 666_667,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RobustCandidateEvaluation {
     pub eligible: bool,
@@ -99,6 +85,11 @@ pub fn evaluate_robust_candidate(
     constraints: RobustSelectionConstraints,
 ) -> RobustCandidateEvaluation {
     let invalid_constraints = constraints.min_oos_folds == 0
+        || constraints.min_stress_folds == 0
+        || constraints.min_trades_per_oos_fold == 0
+        || !constraints.max_oos_drawdown_pct.is_finite()
+        || !constraints.max_stress_drawdown_pct.is_finite()
+        || !constraints.max_stress_loss_bps.is_finite()
         || constraints.max_oos_drawdown_pct <= 0.0
         || constraints.max_stress_drawdown_pct <= 0.0
         || constraints.max_stress_loss_bps < 0.0
@@ -322,7 +313,15 @@ mod tests {
             fold("s2", true, 1.0, 0.3, 2.5),
             fold("s3", true, -8.0, 0.1, 4.0),
         ];
-        let result = evaluate_robust_candidate(&folds, RobustSelectionConstraints::default());
+        let result = evaluate_robust_candidate(&folds, RobustSelectionConstraints {
+            min_oos_folds: 3,
+            min_stress_folds: 3,
+            min_trades_per_oos_fold: 10,
+            max_oos_drawdown_pct: 5.0,
+            max_stress_drawdown_pct: 10.0,
+            max_stress_loss_bps: 50.0,
+            min_stress_survival_ppm: 666_667,
+        });
         assert!(result.eligible);
         assert_eq!(result.reason, "eligible");
         assert_eq!(result.stress_survival_ppm, 1_000_000);
@@ -338,7 +337,15 @@ mod tests {
             fold("s2", true, 0.0, 0.1, 2.0),
             fold("s3", true, 0.0, 0.1, 2.0),
         ];
-        let result = evaluate_robust_candidate(&folds, RobustSelectionConstraints::default());
+        let result = evaluate_robust_candidate(&folds, RobustSelectionConstraints {
+            min_oos_folds: 3,
+            min_stress_folds: 3,
+            min_trades_per_oos_fold: 10,
+            max_oos_drawdown_pct: 5.0,
+            max_stress_drawdown_pct: 10.0,
+            max_stress_loss_bps: 50.0,
+            min_stress_survival_ppm: 666_667,
+        });
         assert!(!result.eligible);
         assert_eq!(result.reason, "lower_quartile_return_not_positive");
     }
