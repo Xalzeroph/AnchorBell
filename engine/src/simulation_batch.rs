@@ -1116,6 +1116,16 @@ pub async fn run(
                             "depth resync supervisor stopped".to_owned(),
                         ));
                     };
+                    // A retry may already be queued when an earlier snapshot
+                    // succeeds. Ignore that stale result once the book is
+                    // valid again; otherwise one bootstrap race can cause a
+                    // burst of redundant REST snapshots.
+                    if depth_books
+                        .get(&symbol)
+                        .is_some_and(|book| book.is_valid())
+                    {
+                        continue;
+                    }
                     match result {
                         Ok(snapshot) => {
                             let (last_update_id, bids, asks) = parse_depth_snapshot(
@@ -1142,6 +1152,54 @@ pub async fn run(
                                 ) {
                                 Ok(consumed) => consumed,
                                 Err(OrderBookError::SequenceGap { expected, first, .. }) => {
+                                    let buffered_last_final =
+                                        buffered.last().map(|update| update.final_update_id);
+                                    if buffered_last_final
+                                        .is_some_and(|final_id| final_id <= last_update_id)
+                                    {
+                                        depth_books
+                                            .get_mut(&symbol)
+                                            .ok_or_else(|| {
+                                                SimulationError::Market(format!(
+                                                    "depth resync book disappeared for {symbol}"
+                                                ))
+                                            })?
+                                            .load_snapshot(last_update_id, &bids, &asks)
+                                            .map_err(|error| {
+                                                SimulationError::Market(format!(
+                                                    "depth snapshot invalid for {symbol}: {error:?}"
+                                                ))
+                                            })?;
+                                        for ledger in &mut ledgers {
+                                            ledger.engine.load_depth_snapshot(
+                                                &symbol,
+                                                last_update_id,
+                                                &bids,
+                                                &asks,
+                                            )?;
+                                        }
+                                        if let Some(buffer) = depth_buffers.get_mut(&symbol) {
+                                            buffer.clear();
+                                        }
+                                        next_depth_resync_at_ms.remove(&symbol);
+                                        eprintln!(
+                                            "depth snapshot installed for {symbol}: snapshot_last={last_update_id}, buffered_last={buffered_last_final:?}; waiting for first bridge diff"
+                                        );
+                                        continue;
+                                    }
+                                    let buffer_state = buffered.first().zip(buffered.last()).map(
+                                        |(first, last)| {
+                                            (
+                                                buffered.len(),
+                                                first.first_update_id,
+                                                first.final_update_id,
+                                                first.previous_final_update_id,
+                                                last.first_update_id,
+                                                last.final_update_id,
+                                                last.previous_final_update_id,
+                                            )
+                                        },
+                                    );
                                     if let Some(buffer) = depth_buffers.get_mut(&symbol) {
                                         // A gap anywhere in the buffered interval
                                         // means the interval cannot be repaired.
@@ -1152,7 +1210,7 @@ pub async fn run(
                                     let retry_at = now_ms().saturating_add(5_000);
                                     next_depth_resync_at_ms.insert(symbol.clone(), retry_at);
                                     eprintln!(
-                                        "depth resync sequence gap for {symbol}: expected={expected}, first_buffered={first}; buffer discarded, retrying after {retry_at}"
+                                        "depth resync sequence gap for {symbol}: snapshot_last={last_update_id} expected={expected}, first_buffered={first}, buffered_state={buffer_state:?}; buffer discarded, retrying after {retry_at}"
                                     );
                                     continue;
                                 }
