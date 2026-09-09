@@ -3,7 +3,7 @@ const state={page:"dashboard",data:{},series:{health:[],metrics:[]},session:loca
 localStorage.setItem("anchorbell-session",state.session);
 const $=s=>document.querySelector(s);
 const esc=v=>String(v??"—").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-const pretty=v=>"<pre class="json">"+esc(JSON.stringify(v,null,2))+"</pre>";
+const pretty=v=>'<pre class="json">'+esc(JSON.stringify(v,null,2))+"</pre>";
 const titles={dashboard:["系统总览","实时观察市场、策略与风险状态"],markets:["市场与标的","自动发现的合约、分类与交易资格"],runtimes:["运行实例","模拟、回测与实盘进程控制"],checks:["安全检查","在执行任何操作前验证环境与账户"],raw:["原始数据","完整数据仅在需要时展开查看"]};
 async function api(path,options={}){const headers={"x-anchorbell-session":state.session,...(options.headers||{})};const r=await fetch("/api/"+path,{...options,headers,cache:"no-store"});if(!r.ok)throw Error(r.status);return r.json()}
 function metric(label,value,note,kind=""){return `<article class="metric"><div class="metric-label">${esc(label)}</div><div class="metric-value ${kind}">${esc(value)}</div><div class="metric-note">${esc(note)}</div></article>`}
