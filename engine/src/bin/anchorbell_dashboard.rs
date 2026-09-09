@@ -268,6 +268,19 @@ async fn route(request: HttpRequest, state: DashboardState) -> (u16, &'static st
             "application/javascript; charset=utf-8",
             include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/web/app.js")),
         ),
+        ("GET", "/manifest.webmanifest") => text_response(
+            200,
+            "application/manifest+json; charset=utf-8",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/web/manifest.webmanifest"
+            )),
+        ),
+        ("GET", "/sw.js") => text_response(
+            200,
+            "application/javascript; charset=utf-8",
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/web/sw.js")),
+        ),
         ("GET", "/api/status") => json_response(200, status_response(&state).await),
         ("GET", "/api/instruments") => instruments_response(&state).await,
         ("GET", "/api/platform") => platform_response(&state).await,
