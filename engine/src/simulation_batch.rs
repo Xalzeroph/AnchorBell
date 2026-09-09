@@ -1127,7 +1127,7 @@ pub async fn run(
                                 .get(&symbol)
                                 .map(|events| events.iter().cloned().collect::<Vec<_>>())
                                 .unwrap_or_default();
-                            let consumed = depth_books
+                            let consumed = match depth_books
                                 .get_mut(&symbol)
                                 .ok_or_else(|| {
                                     SimulationError::Market(format!(
@@ -1139,12 +1139,22 @@ pub async fn run(
                                     &bids,
                                     &asks,
                                     &buffered,
-                                )
-                                .map_err(|error| {
-                                    SimulationError::Market(format!(
-                                        "depth resync bridge invalid for {symbol}: {error:?}"
-                                    ))
-                                })?;
+                                ) {
+                                Ok(consumed) => consumed,
+                                Err(OrderBookError::SequenceGap { expected, first, .. }) => {
+                                    let retry_at = now_ms().saturating_add(5_000);
+                                    next_depth_resync_at_ms.insert(symbol.clone(), retry_at);
+                                    eprintln!(
+                                        "depth resync waiting for bridge for {symbol}: expected={expected}, first_buffered={first}; retrying after {retry_at}"
+                                    );
+                                    continue;
+                                }
+                                Err(error) => {
+                                    return Err(SimulationError::Market(format!(
+                                        "depth resync snapshot invalid for {symbol}: {error:?}"
+                                    )));
+                                }
+                            };
                             for ledger in &mut ledgers {
                                 ledger.engine.load_depth_snapshot(
                                     &symbol,

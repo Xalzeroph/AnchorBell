@@ -79,12 +79,13 @@ impl LocalOrderBook {
         buffered: &[DepthUpdate],
     ) -> Result<usize, OrderBookError> {
         self.load_snapshot(last_update_id, bids, asks)?;
+        let expected = last_update_id.saturating_add(1);
         let Some(first_index) = buffered.iter().position(|update| {
-            update.first_update_id <= last_update_id && update.final_update_id >= last_update_id
+            update.first_update_id <= expected && update.final_update_id >= expected
         }) else {
             self.valid = false;
             return Err(OrderBookError::SequenceGap {
-                expected: last_update_id,
+                expected,
                 first: buffered.first().map_or(0, |u| u.first_update_id),
                 previous: buffered.first().and_then(|u| u.previous_final_update_id),
             });
@@ -102,10 +103,11 @@ impl LocalOrderBook {
         let last = self
             .last_update_id
             .ok_or(OrderBookError::SnapshotRequired)?;
-        if update.first_update_id > last || update.final_update_id < last {
+        let expected = last.saturating_add(1);
+        if update.first_update_id > expected || update.final_update_id < expected {
             self.valid = false;
             return Err(OrderBookError::SequenceGap {
-                expected: last,
+                expected,
                 first: update.first_update_id,
                 previous: update.previous_final_update_id,
             });
@@ -118,6 +120,7 @@ impl LocalOrderBook {
         }
         validate_crossed(&self.bids, &self.asks)?;
         self.last_update_id = Some(update.final_update_id);
+        self.awaiting_first_diff = false;
         Ok(())
     }
 
