@@ -344,6 +344,7 @@ async fn route(request: HttpRequest, state: DashboardState) -> (u16, &'static st
         ("GET", "/api/metrics/live") => runtime_metrics("live", &state).await,
         ("GET", "/api/metrics/backtest") => runtime_metrics("backtest", &state).await,
         ("GET", "/api/runtimes") => runtimes_response(&state).await,
+        ("GET", "/api/runs") => runs_response().await,
         ("GET", "/api/logs/live") => runtime_logs("live", &state).await,
         ("GET", "/api/logs/simulation") => runtime_logs("simulation", &state).await,
         ("GET", "/api/logs/backtest") => runtime_logs("backtest", &state).await,
@@ -956,6 +957,109 @@ fn external_batch_observation() -> Option<Value> {
     object.insert("build_identity".to_owned(), json!(build_identity));
     object.insert("observed_at_ms".to_owned(), json!(now_ms()));
     Some(metrics)
+}
+
+async fn runs_response() -> (u16, &'static str, Vec<u8>) {
+    let Some(root) = external_batch_root() else {
+        return json_response(200, json!({
+            "ok": true,
+            "observed_at_ms": now_ms(),
+            "run_count": 0,
+            "runs": [],
+        }));
+    };
+    let mut runs = Vec::new();
+    let Ok(entries) = fs::read_dir(&root) else {
+        return json_response(200, json!({
+            "ok": true,
+            "observed_at_ms": now_ms(),
+            "run_count": 0,
+            "runs": [],
+        }));
+    };
+    for entry in entries.flatten() {
+        let run_dir = entry.path();
+        if !run_dir.is_dir() {
+            continue;
+        }
+        let manifest = read_json_file(&run_dir.join("run-manifest.json"));
+        let index = read_json_file(&run_dir.join("experiment-index.json"));
+        let status = read_json_file(&run_dir.join("run-status.json"));
+        if manifest.is_none() && index.is_none() {
+            continue;
+        }
+        let created_at_ms = manifest.as_ref()
+            .and_then(|v| v.get("created_at_ms").and_then(Value::as_u64))
+            .or_else(|| index.as_ref().and_then(|v| v.get("created_at_ms").and_then(Value::as_u64)))
+            .unwrap_or_default();
+        let run_id = status.as_ref()
+            .and_then(|v| v.get("run_id").and_then(Value::as_str))
+            .or_else(|| index.as_ref().and_then(|v| v.get("run_id").and_then(Value::as_str)))
+            .unwrap_or_default();
+        let run_status = status.as_ref()
+            .and_then(|v| v.get("status").and_then(Value::as_str))
+            .or_else(|| index.as_ref().and_then(|v| v.get("status").and_then(Value::as_str)))
+            .unwrap_or("unknown");
+        let definitions = index.as_ref()
+            .and_then(|v| v.get("experiments"))
+            .or_else(|| manifest.as_ref().and_then(|v| v.get("experiment_definitions")));
+        let mut methods = Vec::new();
+        if let Some(definitions) = definitions.and_then(Value::as_array) {
+            for definition in definitions {
+                let id = definition.get("experiment_id").and_then(Value::as_str).unwrap_or_default();
+                if id.is_empty() {
+                    continue;
+                }
+                let metrics = read_json_file(&run_dir.join(id).join("metrics.json"));
+                let symbols = metrics.as_ref()
+                    .and_then(|v| v.get("symbols"))
+                    .cloned()
+                    .unwrap_or_else(|| json!([]));
+                let history = metrics.as_ref()
+                    .and_then(|v| v.get("history"))
+                    .cloned()
+                    .unwrap_or_else(|| json!([]));
+                methods.push(json!({
+                    "id": id,
+                    "method": definition.get("method").cloned().unwrap_or(Value::Null),
+                    "method_key": definition.get("method_key").cloned().unwrap_or(Value::Null),
+                    "role": definition.get("role").cloned().unwrap_or(Value::Null),
+                    "ablations": definition.get("ablations").cloned().unwrap_or_else(|| json!([])),
+                    "available": metrics.is_some(),
+                    "symbols": symbols,
+                    "history": history,
+                    "summary": metrics.as_ref().and_then(|v| v.get("summary")).cloned().unwrap_or_else(|| json!({})),
+                    "risk_metrics": metrics.as_ref().and_then(|v| v.get("risk_metrics")).cloned().unwrap_or_else(|| json!({})),
+                    "metrics": metrics.unwrap_or_else(|| json!({})),
+                }));
+            }
+        }
+        runs.push(json!({
+            "name": run_dir.file_name().and_then(|v| v.to_str()).unwrap_or_default(),
+            "run_id": run_id,
+            "status": run_status,
+            "created_at_ms": created_at_ms,
+            "started_at_ms": status.as_ref().and_then(|v| v.get("started_at_ms")).cloned().unwrap_or(Value::Null),
+            "finished_at_ms": status.as_ref().and_then(|v| v.get("finished_at_ms")).cloned().unwrap_or(Value::Null),
+            "policy_id": index.as_ref().and_then(|v| v.get("policy_id")).cloned().unwrap_or(Value::Null),
+            "build_identity": status.as_ref().and_then(|v| v.get("build_identity")).cloned()
+                .or_else(|| index.as_ref().and_then(|v| v.get("build_identity")).cloned())
+                .unwrap_or(Value::Null),
+            "methods": methods,
+            "market_data": manifest.as_ref().and_then(|v| v.get("index_anchor_conversions")).cloned().unwrap_or_else(|| json!({})),
+            "manifest": manifest.unwrap_or_else(|| json!({})),
+            "index": index.unwrap_or_else(|| json!({})),
+        }));
+    }
+    runs.sort_by_key(|run| run.get("created_at_ms").and_then(Value::as_u64).unwrap_or_default());
+    runs.reverse();
+    json_response(200, json!({
+        "ok": true,
+        "observed_at_ms": now_ms(),
+        "root": root.display().to_string(),
+        "run_count": runs.len(),
+        "runs": runs,
+    }))
 }
 
 fn external_batch_runtime_snapshot(observation: &Value) -> Value {
