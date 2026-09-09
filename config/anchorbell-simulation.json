@@ -159,5 +159,16 @@
     "urgency_cost_bps_per_second": 2,
     "deadline_penalty_bps": 100,
     "cost_margin_bps": 1
-  }
+  },
+  "fee_schedule": {
+    "maker_fee_ppm": 0,
+    "taker_fee_ppm": 400,
+    "source": "https://www.binance.com/en/support/announcement/detail/a4c3f1957f2b4e69902985154235c3b1",
+    "account_tier": "Regular/VIP1",
+    "bnb_discount": false,
+    "effective_from_ms": 1774922400000,
+    "effective_until_ms": null
+  },
+  "default_strategy_variant": "m4",
+  "funding_lead_ms": 300000
 }

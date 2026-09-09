@@ -1,16 +1,21 @@
 //! The AnchorBell TradFi catalog and anchor-stability eligibility boundary.
+
+use serde::Deserialize;
+use std::sync::LazyLock;
 //!
 //! ADR/ADS presence is recorded as issuer evidence. It is not, by itself, a
 //! veto: the FrozenClose strategy is blocked only when the ADR market provides
 //! active price discovery during the Hong Kong close-to-open interval.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum EquityRegion {
     AShare,
     HongKong,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum AdrStatus {
     /// The issuer has an active or historical ADR/ADS program.
     ConfirmedPresent,
@@ -20,7 +25,8 @@ pub enum AdrStatus {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum AdrPriceDiscovery {
     /// A sufficiently active external market can reprice the issuer after the
     /// Hong Kong close; this contaminates a frozen-close signal.
@@ -63,89 +69,45 @@ impl TradFiInstrument {
     }
 }
 
-pub const A_SHARE_INSTRUMENTS: &[TradFiInstrument] = &[
-    TradFiInstrument {
-        symbol: "CXMTUSDT",
-        region: EquityRegion::AShare,
-        adr_status: AdrStatus::ConfirmedAbsent,
-        adr_price_discovery: AdrPriceDiscovery::NotApplicable,
-    },
-    TradFiInstrument {
-        symbol: "UNITREEUSDT",
-        region: EquityRegion::AShare,
-        adr_status: AdrStatus::ConfirmedAbsent,
-        adr_price_discovery: AdrPriceDiscovery::NotApplicable,
-    },
-];
+#[derive(Debug, Deserialize)]
+struct UniverseConfig {
+    schema_version: u16,
+    instruments: Vec<UniverseInstrumentConfig>,
+}
 
-pub const HONG_KONG_INSTRUMENTS: &[TradFiInstrument] = &[
-    TradFiInstrument {
-        symbol: "GIGADEVUSDT",
-        region: EquityRegion::HongKong,
-        adr_status: AdrStatus::ConfirmedPresent,
-        adr_price_discovery: AdrPriceDiscovery::NoEffectiveMarket,
-    },
-    TradFiInstrument {
-        symbol: "HK0625USDT",
-        region: EquityRegion::HongKong,
-        adr_status: AdrStatus::ConfirmedPresent,
-        adr_price_discovery: AdrPriceDiscovery::NoEffectiveMarket,
-    },
-    TradFiInstrument {
-        symbol: "HK0700USDT",
-        region: EquityRegion::HongKong,
-        adr_status: AdrStatus::ConfirmedPresent,
-        adr_price_discovery: AdrPriceDiscovery::Active,
-    },
-    TradFiInstrument {
-        symbol: "HK1810USDT",
-        region: EquityRegion::HongKong,
-        adr_status: AdrStatus::ConfirmedPresent,
-        adr_price_discovery: AdrPriceDiscovery::Active,
-    },
-    TradFiInstrument {
-        symbol: "KUAISHOUUSDT",
-        region: EquityRegion::HongKong,
-        adr_status: AdrStatus::ConfirmedPresent,
-        adr_price_discovery: AdrPriceDiscovery::Active,
-    },
-    TradFiInstrument {
-        symbol: "MEITUANUSDT",
-        region: EquityRegion::HongKong,
-        adr_status: AdrStatus::ConfirmedPresent,
-        adr_price_discovery: AdrPriceDiscovery::Active,
-    },
-    TradFiInstrument {
-        symbol: "MINIMAXUSDT",
-        region: EquityRegion::HongKong,
-        adr_status: AdrStatus::ConfirmedPresent,
-        adr_price_discovery: AdrPriceDiscovery::InactiveOrStale,
-    },
-    TradFiInstrument {
-        symbol: "POPMARTUSDT",
-        region: EquityRegion::HongKong,
-        adr_status: AdrStatus::ConfirmedPresent,
-        adr_price_discovery: AdrPriceDiscovery::Active,
-    },
-    TradFiInstrument {
-        symbol: "TENCENTUSDT",
-        region: EquityRegion::HongKong,
-        adr_status: AdrStatus::ConfirmedPresent,
-        adr_price_discovery: AdrPriceDiscovery::Active,
-    },
-    TradFiInstrument {
-        symbol: "ZHIPUUSDT",
-        region: EquityRegion::HongKong,
-        adr_status: AdrStatus::ConfirmedPresent,
-        adr_price_discovery: AdrPriceDiscovery::NoEffectiveMarket,
-    },
-    TradFiInstrument {
-        symbol: "ZHONGJIUSDT",
-        region: EquityRegion::HongKong,
-        adr_status: AdrStatus::ConfirmedPresent,
-        adr_price_discovery: AdrPriceDiscovery::InactiveOrStale,
-    },
-];
+#[derive(Debug, Deserialize)]
+struct UniverseInstrumentConfig {
+    symbol: String,
+    region: EquityRegion,
+    adr_status: AdrStatus,
+    adr_price_discovery: AdrPriceDiscovery,
+}
+
+fn load_instruments(region: EquityRegion) -> Vec<TradFiInstrument> {
+    let config: UniverseConfig = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../config/anchorbell-universe.json"
+    )))
+    .expect("anchorbell universe config must be valid JSON");
+    assert_eq!(config.schema_version, 1, "unsupported universe config schema");
+    config
+        .instruments
+        .into_iter()
+        .filter(|instrument| instrument.region == region)
+        .map(|instrument| TradFiInstrument {
+            symbol: Box::leak(instrument.symbol.into_boxed_str()),
+            region: instrument.region,
+            adr_status: instrument.adr_status,
+            adr_price_discovery: instrument.adr_price_discovery,
+        })
+        .collect()
+}
+
+pub static A_SHARE_INSTRUMENTS: LazyLock<Vec<TradFiInstrument>> =
+    LazyLock::new(|| load_instruments(EquityRegion::AShare));
+
+pub static HONG_KONG_INSTRUMENTS: LazyLock<Vec<TradFiInstrument>> =
+    LazyLock::new(|| load_instruments(EquityRegion::HongKong));
 
 /// Returns the complete reviewed catalog, including hard-excluded instruments.
 pub fn catalog_instruments() -> impl Iterator<Item = &'static TradFiInstrument> {

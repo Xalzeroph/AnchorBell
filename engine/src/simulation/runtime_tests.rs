@@ -31,9 +31,19 @@ fn anchors() -> BTreeMap<String, AnchorSnapshot> {
 }
 
 fn engine() -> SimulationEngine {
-    SimulationEngine::new(anchors(), 100, 100, 10, 20, 0, 0, 0)
-        .unwrap()
-        .with_strategy_variant(SimulationPolicyVariant::M0Fixed)
+    SimulationEngine::new(
+        anchors(),
+        100,
+        100,
+        10,
+        20,
+        0,
+        0,
+        0,
+        EmergencyExecutionPolicy::default(),
+    )
+    .unwrap()
+    .with_strategy_variant(SimulationPolicyVariant::M0Fixed)
 }
 
 fn feed(engine: &mut SimulationEngine, raw: &[u8]) -> Vec<SimulationRecord> {
@@ -295,9 +305,19 @@ fn summary_includes_mark_to_market_for_open_position() {
 
 #[test]
 fn quantity_precision_is_applied_to_mark_to_market_pnl() {
-    let mut engine = SimulationEngine::new(anchors(), 100, 1_000, 300, 20, 0, 0, 2)
-        .unwrap()
-        .with_strategy_variant(SimulationPolicyVariant::M0Fixed);
+    let mut engine = SimulationEngine::new(
+        anchors(),
+        100,
+        1_000,
+        300,
+        20,
+        0,
+        0,
+        2,
+        EmergencyExecutionPolicy::default(),
+    )
+    .unwrap()
+    .with_strategy_variant(SimulationPolicyVariant::M0Fixed);
     let feed_scaled = |engine: &mut SimulationEngine, raw: &[u8]| {
         let event = parse_market_message(raw, 0, 2).unwrap();
         engine.on_event(event)
@@ -327,7 +347,21 @@ fn replay_cancels_working_quotes_at_window_end_without_faking_a_fill() {
             "{\"e\":\"markPriceUpdate\",\"E\":1,\"s\":\"CXMTUSDT\",\"p\":\"100\",\"i\":\"100\",\"T\":1000,\"r\":\"0\"}\n{\"e\":\"bookTicker\",\"u\":1,\"E\":2,\"T\":2,\"s\":\"CXMTUSDT\",\"b\":\"98\",\"B\":\"10\",\"a\":\"99\",\"A\":\"10\"}\n",
         )
         .unwrap();
-    let result = replay_jsonl(&path, None, anchors(), 0, 0, 100, 100, 10, 20, 0, 0).unwrap();
+    let result = replay_jsonl(
+        &path,
+        None,
+        anchors(),
+        0,
+        0,
+        100,
+        100,
+        10,
+        20,
+        0,
+        0,
+        EmergencyExecutionPolicy::default(),
+    )
+    .unwrap();
     assert_eq!(result.order_count, 1);
     assert_eq!(result.fill_count, 0);
     assert_eq!(result.working_orders, 0);
@@ -343,7 +377,20 @@ fn simulation_replay_rejects_symbols_without_configured_state() {
             "{\"e\":\"markPriceUpdate\",\"E\":1,\"s\":\"XYZUSDT\",\"p\":\"100\",\"i\":\"100\",\"T\":1000,\"r\":\"0\"}\n",
         )
         .unwrap();
-    let result = replay_jsonl(&path, None, anchors(), 0, 0, 100, 100, 10, 20, 0, 0);
+    let result = replay_jsonl(
+        &path,
+        None,
+        anchors(),
+        0,
+        0,
+        100,
+        100,
+        10,
+        20,
+        0,
+        0,
+        EmergencyExecutionPolicy::default(),
+    );
     assert!(matches!(
         result,
         Err(SimulationError::ReplaySymbolNotConfigured(symbol)) if symbol == "XYZUSDT"
@@ -413,7 +460,20 @@ fn simulation_replay_rejects_out_of_order_events() {
             "{\"e\":\"markPriceUpdate\",\"E\":2,\"s\":\"CXMTUSDT\",\"p\":\"100\",\"i\":\"100\",\"T\":2,\"r\":\"0\"}\n{\"e\":\"markPriceUpdate\",\"E\":1,\"s\":\"CXMTUSDT\",\"p\":\"100\",\"i\":\"100\",\"T\":1,\"r\":\"0\"}\n",
         )
         .unwrap();
-    let result = replay_jsonl(&path, None, anchors(), 0, 0, 100, 100, 10, 20, 0, 0);
+    let result = replay_jsonl(
+        &path,
+        None,
+        anchors(),
+        0,
+        0,
+        100,
+        100,
+        10,
+        20,
+        0,
+        0,
+        EmergencyExecutionPolicy::default(),
+    );
     assert!(matches!(
         result,
         Err(SimulationError::ReplayOutOfOrder { .. })

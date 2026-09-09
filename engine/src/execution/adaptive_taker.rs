@@ -15,6 +15,7 @@ pub struct EmergencyExecutionPolicy {
     pub cost_margin_bps: i64,
 }
 
+#[cfg(test)]
 impl Default for EmergencyExecutionPolicy {
     fn default() -> Self {
         Self {

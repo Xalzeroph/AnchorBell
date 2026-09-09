@@ -1042,6 +1042,7 @@ pub struct SimulationEngine {
     max_mark_index_gap_bps: i64,
     max_anchor_age_ms: u64,
     fee_ppm: i64,
+    fee_schedule_source: String,
     price_scale: u32,
     quantity_scale: u32,
     realism: crate::backtest::realism::RealisticFillModel,
@@ -1081,6 +1082,7 @@ impl SimulationEngine {
         max_anchor_age_ms: u64,
         fee_ppm: i64,
         quantity_scale: u32,
+        emergency_policy: EmergencyExecutionPolicy,
     ) -> Result<Self, SimulationError> {
         if anchors.is_empty()
             || entry_threshold_bps < 0
@@ -1089,6 +1091,7 @@ impl SimulationEngine {
             || max_mark_index_gap_bps < 0
             || fee_ppm < 0
             || quantity_scale > 18
+            || emergency_policy.validate().is_err()
         {
             return Err(SimulationError::InvalidConfig(
                 "anchors, position, quantity, thresholds, and fee must be valid",
@@ -1169,7 +1172,8 @@ impl SimulationEngine {
             max_mark_index_gap_bps,
             max_anchor_age_ms,
             fee_ppm,
-            price_scale: 8,
+            fee_schedule_source: String::new(),
+            price_scale: 0,
             quantity_scale,
             realism: crate::backtest::realism::RealisticFillModel::default(),
             quote_reprice_min_interval_ms: 0,
@@ -1194,12 +1198,17 @@ impl SimulationEngine {
             dynamic_capital_refresh_ms: 60_000,
             last_dynamic_capital_update_ms: 0,
             causal_ledger: CausalLedger::default(),
-            emergency_policy: EmergencyExecutionPolicy::default(),
+            emergency_policy,
         })
     }
 
     pub fn with_realism(mut self, realism: crate::backtest::realism::RealisticFillModel) -> Self {
         self.realism = realism;
+        self
+    }
+
+    pub fn with_fee_schedule_source(mut self, source: String) -> Self {
+        self.fee_schedule_source = source;
         self
     }
 
@@ -2164,9 +2173,8 @@ impl SimulationEngine {
                 .as_ref()
                 .map(PortfolioDrawdownGuard::snapshot),
             calendar_snapshot: "sse-hkex-2026".to_owned(),
-            maker_fee_source: "binance_tradfi_perps_promo_regular_vip1_maker_0bps".to_owned(),
-            taker_fee_source: "binance_tradfi_perps_promo_regular_vip1_taker_40bps_no_bnb"
-                .to_owned(),
+            maker_fee_source: self.fee_schedule_source.clone(),
+            taker_fee_source: self.fee_schedule_source.clone(),
             funding_model: "m8_exact_mark_settlement_plus_strategy_funding_controller".to_owned(),
             capital_usdt_ticks: self.capital_usdt_ticks,
             capital_usdt: self.capital_usdt_ticks.map(|capital| {
@@ -4984,6 +4992,8 @@ pub struct SimulationConfig {
     pub fx_refresh_ms: u64,
     pub fx_max_age_ms: u64,
     pub quote_reprice_min_interval_ms: u64,
+    pub emergency_execution: EmergencyExecutionPolicy,
+    pub fee_schedule_source: String,
 }
 
 #[derive(Debug, Clone)]
@@ -5094,7 +5104,9 @@ pub async fn run_simulation(
         max_anchor_age_ms,
         fee_ppm,
         config.quantity_scale,
+        config.emergency_execution,
     )?
+    .with_fee_schedule_source(config.fee_schedule_source.clone())
     .with_price_scale(config.price_scale)
     .with_live_risk_gates()
     .with_strategy_variant(config.strategy_variant)
@@ -5540,6 +5552,7 @@ pub fn replay_jsonl(
     max_mark_index_gap_bps: i64,
     max_anchor_age_ms: u64,
     fee_ppm: i64,
+    emergency_execution: EmergencyExecutionPolicy,
 ) -> Result<SimulationSummary, SimulationError> {
     replay_jsonl_with_realism(
         input_path,
@@ -5553,6 +5566,7 @@ pub fn replay_jsonl(
         max_mark_index_gap_bps,
         max_anchor_age_ms,
         fee_ppm,
+        emergency_execution,
         crate::backtest::realism::RealisticFillModel::default(),
     )
 }
@@ -5570,6 +5584,7 @@ pub fn replay_jsonl_with_realism(
     max_mark_index_gap_bps: i64,
     max_anchor_age_ms: u64,
     fee_ppm: i64,
+    emergency_execution: EmergencyExecutionPolicy,
     realism: crate::backtest::realism::RealisticFillModel,
 ) -> Result<SimulationSummary, SimulationError> {
     replay_jsonl_with_config(
@@ -5585,6 +5600,8 @@ pub fn replay_jsonl_with_realism(
             max_mark_index_gap_bps,
             max_anchor_age_ms,
             fee_ppm,
+            emergency_execution,
+            fee_schedule_source: String::new(),
             realism,
             strategy_variant: SimulationPolicyVariant::M0Fixed,
             threshold_scale_ppm: 1_000_000,
@@ -5635,7 +5652,9 @@ pub fn replay_jsonl_with_config(
         config.max_anchor_age_ms,
         config.fee_ppm,
         config.quantity_scale,
+        config.emergency_execution,
     )?
+    .with_fee_schedule_source(config.fee_schedule_source.clone())
     .with_price_scale(config.price_scale)
     .with_strategy_variant(config.strategy_variant)
     .with_funding_controller_enabled(config.funding_controller_enabled)

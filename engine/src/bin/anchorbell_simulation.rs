@@ -2,13 +2,13 @@ use std::{collections::BTreeMap, env, fs, path::PathBuf, process, str::FromStr, 
 
 use anchorbell_engine::{
     execution::BinanceEnvironment,
-    market::FxPollerConfig,
     platform::RuntimeProfile,
     runtime::{timestamp_ms, RuntimeHealthReporter},
     simulation::{
         allocate_positions, load_anchor_file, load_index_anchor_set, run_simulation,
         BinanceIndexAnchorSet, PositionMode, SimulationConfig, SimulationPolicyVariant,
     },
+    strategy::StrategyProfile,
 };
 
 #[derive(Debug)]
@@ -79,6 +79,8 @@ async fn main() {
         Ok(args) => args,
         Err(message) => fail(message),
     };
+    let strategy_profile = StrategyProfile::load("config/anchorbell-simulation.json")
+        .unwrap_or_else(|error| fail(format!("cannot load strategy profile: {error}")));
     let mut health = RuntimeHealthReporter::new("target/simulation-runtime-audit.jsonl");
     health
         .start(RuntimeProfile::Simulation, timestamp_ms())
@@ -228,6 +230,8 @@ async fn main() {
             fx_refresh_ms: args.fx_refresh_ms,
             fx_max_age_ms: args.fx_max_age_ms,
             quote_reprice_min_interval_ms: args.quote_reprice_min_interval_ms,
+            emergency_execution: strategy_profile.emergency_execution,
+            fee_schedule_source: strategy_profile.fee_schedule.source.clone(),
         },
         anchors,
         args.entry_threshold_bps,
@@ -289,45 +293,47 @@ async fn main() {
 }
 
 fn parse_args() -> Result<Args, String> {
+    let profile = StrategyProfile::load("config/anchorbell-simulation.json")
+        .map_err(|error| format!("cannot load strategy profile: {error}"))?;
     let mut anchors = None;
     let mut index_anchors = false;
     let mut symbols = None;
-    let mut environment = BinanceEnvironment::Testnet;
-    let mut strategy_variant = SimulationPolicyVariant::M4Statistical;
-    let mut threshold_scale_ppm = 1_000_000;
+    let mut environment = profile.environment;
+    let mut strategy_variant = parse_strategy_variant(&profile.default_strategy_variant)?;
+    let mut threshold_scale_ppm = profile.threshold_scale_ppm;
     let mut records = None;
     let mut market_records = None;
     let mut anchor_report = None;
     let mut fx_records = None;
     let mut metrics = Some(PathBuf::from("target\\simulation-metrics.json"));
-    let mut metrics_refresh_ms = 1_000;
-    let fx_defaults = FxPollerConfig::high_frequency();
-    let mut fx_refresh_ms = fx_defaults.refresh_interval_ms;
-    let mut fx_max_age_ms = fx_defaults.max_stale_ms;
+    let mut metrics_refresh_ms = profile.metrics_refresh_ms;
+
+    let mut fx_refresh_ms = profile.fx_refresh_ms;
+    let mut fx_max_age_ms = profile.fx_max_age_ms;
     let mut proxy = None;
     // Zero means continuous simulation mode; stop only on operator action or a
     // supervised feed failure.
-    let mut duration_secs = 0;
-    let mut index_anchor_refresh_ms = 60_000;
-    let mut price_scale = 8;
-    let mut quantity_scale = 8;
-    let mut max_subscriptions_per_shard = 64;
-    let mut connect_timeout_ms = 5_000;
-    let mut read_timeout_ms = 15_000;
+    let mut duration_secs = profile.duration_secs;
+    let mut index_anchor_refresh_ms = profile.index_anchor_refresh_ms;
+    let mut price_scale = profile.price_scale;
+    let mut quantity_scale = profile.quantity_scale;
+    let mut max_subscriptions_per_shard = profile.max_subscriptions_per_shard;
+    let mut connect_timeout_ms = profile.connect_timeout_ms;
+    let mut read_timeout_ms = profile.read_timeout_ms;
     // This is only the adaptive model's hard floor, not a fixed entry
     // threshold. The runtime adds cost, volatility, uncertainty, liquidity,
     // and inventory components.
-    let mut entry_threshold_bps = 0;
-    let mut max_position = 1;
-    let mut requested_quantity = 1;
+    let mut entry_threshold_bps = profile.entry_threshold_bps;
+    let mut max_position = profile.max_position;
+    let mut requested_quantity = profile.requested_quantity;
     let mut capital_usdt = None;
     let mut capital_cny = None;
     let mut position_modes = None;
-    let mut max_mark_index_gap_bps = 50;
-    let mut max_anchor_age_ms = 0;
+    let mut max_mark_index_gap_bps = profile.max_mark_index_gap_bps;
+    let mut max_anchor_age_ms = profile.max_anchor_age_ms;
     // Binance USDⓈ-M base maker fee: 0.02% = 200 ppm. Override explicitly when needed.
-    let mut fee_ppm = 200;
-    let mut quote_reprice_min_interval_ms = 750;
+    let mut fee_ppm = profile.fee_schedule.maker_fee_ppm;
+    let mut quote_reprice_min_interval_ms = profile.quote_reprice_min_interval_ms;
     let mut args = env::args().skip(1);
     while let Some(flag) = args.next() {
         match flag.as_str() {

@@ -15,7 +15,7 @@ use anchorbell_engine::{
         binance::{BinanceMarketEvent, BookTicker, MarkPrice},
         BinanceMarketConfig, BinanceMarketStream, BinanceSubscription, ReconnectPolicy,
     },
-    strategy::adaptive_intent_from_market,
+    strategy::{adaptive_intent_from_market, StrategyProfile},
 };
 
 #[derive(Debug)]
@@ -813,18 +813,20 @@ fn validate_args(args: &Args) -> Result<(), String> {
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut symbol = "BTCUSDT".to_owned();
+    let profile = StrategyProfile::load("config/anchorbell-simulation.json")
+        .map_err(|error| format!("cannot load strategy profile: {error}"))?;
+    let mut symbol = None;
     let mut anchor_ticks = None;
-    let mut price_scale = 8;
-    let mut quantity_scale = 8;
-    let mut requested_quantity = 1;
-    let mut max_position = 1;
-    let mut entry_threshold_bps = 100;
-    let mut max_mark_index_gap_bps = 50;
-    let mut duration_secs = 60;
-    let mut poll_ms = 2_000;
-    let mut min_replace_ms = 1_000;
-    let mut recv_window_ms = 5_000;
+    let mut price_scale = profile.price_scale;
+    let mut quantity_scale = profile.quantity_scale;
+    let mut requested_quantity = profile.requested_quantity;
+    let mut max_position = profile.max_position;
+    let mut entry_threshold_bps = profile.entry_threshold_bps;
+    let mut max_mark_index_gap_bps = profile.max_mark_index_gap_bps;
+    let mut duration_secs = profile.duration_secs;
+    let mut poll_ms = profile.metrics_refresh_ms;
+    let mut min_replace_ms = profile.quote_reprice_min_interval_ms;
+    let mut recv_window_ms = profile.max_stale_ms;
     let mut environment = BinanceEnvironment::Testnet;
     let mut proxy = env::var("ANCHORBELL_HTTP_PROXY").ok();
     let mut checkpoint_path = None;
@@ -836,7 +838,7 @@ fn parse_args() -> Result<Args, String> {
                 print_usage();
                 process::exit(0);
             }
-            "--symbol" => symbol = next(&mut args, &flag)?.to_ascii_uppercase(),
+            "--symbol" => symbol = Some(next(&mut args, &flag)?.to_ascii_uppercase()),
             "--anchor-ticks" => anchor_ticks = Some(parse(&mut args, &flag)?),
             "--price-scale" => price_scale = parse(&mut args, &flag)?,
             "--quantity-scale" => quantity_scale = parse(&mut args, &flag)?,
@@ -856,7 +858,7 @@ fn parse_args() -> Result<Args, String> {
         }
     }
     Ok(Args {
-        symbol,
+        symbol: symbol.ok_or("missing --symbol")?,
         anchor_ticks: anchor_ticks.ok_or("missing --anchor-ticks")?,
         price_scale,
         quantity_scale,

@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "source": "reviewed_external_market_evidence",
+  "instruments": [
+    {
+      "symbol": "CXMTUSDT",
+      "region": "a_share",
+      "adr_status": "confirmed_absent",
+      "adr_price_discovery": "not_applicable"
+    },
+    {
+      "symbol": "UNITREEUSDT",
+      "region": "a_share",
+      "adr_status": "confirmed_absent",
+      "adr_price_discovery": "not_applicable"
+    },
+    {
+      "symbol": "GIGADEVUSDT",
+      "region": "hong_kong",
+      "adr_status": "confirmed_present",
+      "adr_price_discovery": "no_effective_market"
+    },
+    {
+      "symbol": "HK0625USDT",
+      "region": "hong_kong",
+      "adr_status": "confirmed_present",
+      "adr_price_discovery": "no_effective_market"
+    },
+    {
+      "symbol": "HK0700USDT",
+      "region": "hong_kong",
+      "adr_status": "confirmed_present",
+      "adr_price_discovery": "active"
+    },
+    {
+      "symbol": "HK1810USDT",
+      "region": "hong_kong",
+      "adr_status": "confirmed_present",
+      "adr_price_discovery": "active"
+    },
+    {
+      "symbol": "KUAISHOUUSDT",
+      "region": "hong_kong",
+      "adr_status": "confirmed_present",
+      "adr_price_discovery": "active"
+    },
+    {
+      "symbol": "MEITUANUSDT",
+      "region": "hong_kong",
+      "adr_status": "confirmed_present",
+      "adr_price_discovery": "active"
+    },
+    {
+      "symbol": "MINIMAXUSDT",
+      "region": "hong_kong",
+      "adr_status": "confirmed_present",
+      "adr_price_discovery": "inactive_or_stale"
+    },
+    {
+      "symbol": "POPMARTUSDT",
+      "region": "hong_kong",
+      "adr_status": "confirmed_present",
+      "adr_price_discovery": "active"
+    },
+    {
+      "symbol": "TENCENTUSDT",
+      "region": "hong_kong",
+      "adr_status": "confirmed_present",
+      "adr_price_discovery": "active"
+    },
+    {
+      "symbol": "ZHIPUUSDT",
+      "region": "hong_kong",
+      "adr_status": "confirmed_present",
+      "adr_price_discovery": "no_effective_market"
+    },
+    {
+      "symbol": "ZHONGJIUSDT",
+      "region": "hong_kong",
+      "adr_status": "confirmed_present",
+      "adr_price_discovery": "inactive_or_stale"
+    }
+  ]
+}

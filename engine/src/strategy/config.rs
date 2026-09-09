@@ -7,9 +7,38 @@ use std::{collections::BTreeSet, fs, path::Path};
 pub const STRATEGY_PROFILE_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FeeScheduleConfig {
+    pub maker_fee_ppm: i64,
+    pub taker_fee_ppm: i64,
+    pub source: String,
+    pub account_tier: String,
+    pub bnb_discount: bool,
+    pub effective_from_ms: u64,
+    pub effective_until_ms: Option<u64>,
+}
+
+impl FeeScheduleConfig {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.maker_fee_ppm < 0
+            || self.taker_fee_ppm < 0
+            || self.source.trim().is_empty()
+            || self.account_tier.trim().is_empty()
+            || self.effective_from_ms == 0
+            || self
+                .effective_until_ms
+                .is_some_and(|until| until <= self.effective_from_ms)
+        {
+            return Err("invalid fee schedule configuration");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StrategyProfile {
     pub schema_version: u16,
     pub policy_id: String,
+    pub default_strategy_variant: String,
     pub experiment_plan_id: String,
     pub universe_id: String,
     pub environment: BinanceEnvironment,
@@ -24,7 +53,9 @@ pub struct StrategyProfile {
     pub requested_quantity: i64,
     pub max_mark_index_gap_bps: i64,
     pub max_anchor_age_ms: u64,
+    pub funding_lead_ms: u64,
     pub fee_ppm: i64,
+    pub fee_schedule: FeeScheduleConfig,
     pub quantity_scale: u32,
     pub price_scale: u32,
     pub max_subscriptions_per_shard: usize,
@@ -40,7 +71,6 @@ pub struct StrategyProfile {
     pub decision_to_exchange_ms: u64,
     pub cancel_to_exchange_ms: u64,
     pub quote_reprice_min_interval_ms: u64,
-    #[serde(default)]
     pub emergency_execution: EmergencyExecutionPolicy,
     pub dynamic_capital_refresh_ms: u64,
     pub depth_snapshot_limit: usize,
@@ -72,6 +102,7 @@ impl StrategyProfile {
         }
         if self.policy_id.trim().is_empty()
             || self.experiment_plan_id.trim().is_empty()
+            || self.default_strategy_variant.trim().is_empty()
             || self.universe_id.trim().is_empty()
             || self.symbols.is_empty()
             || self.output_root.trim().is_empty()
@@ -107,6 +138,12 @@ impl StrategyProfile {
             return Err("strategy profile contains invalid numeric or experiment values".into());
         }
         self.emergency_execution.validate().map_err(str::to_owned)?;
+        self.fee_schedule.validate().map_err(str::to_owned)?;
+        if self.fee_ppm != self.fee_schedule.maker_fee_ppm
+            || self.emergency_execution.taker_fee_ppm != self.fee_schedule.taker_fee_ppm
+        {
+            return Err("fee_ppm and emergency taker fee must match fee_schedule".into());
+        }
         self.experiment_plan()
             .map_err(|error| format!("invalid experiment plan: {error}"))?;
         Ok(())
@@ -168,6 +205,7 @@ mod tests {
         let profile = StrategyProfile {
             schema_version: STRATEGY_PROFILE_SCHEMA_VERSION,
             policy_id: "test".into(),
+            default_strategy_variant: "m4".into(),
             experiment_plan_id: "test".into(),
             universe_id: "test".into(),
             environment: BinanceEnvironment::Production,
@@ -182,7 +220,17 @@ mod tests {
             requested_quantity: 1,
             max_mark_index_gap_bps: 1,
             max_anchor_age_ms: 1,
+            funding_lead_ms: 1,
             fee_ppm: 1,
+            fee_schedule: FeeScheduleConfig {
+                maker_fee_ppm: 1,
+                taker_fee_ppm: 400,
+                source: "test".into(),
+                account_tier: "test".into(),
+                bnb_discount: false,
+                effective_from_ms: 1,
+                effective_until_ms: None,
+            },
             quantity_scale: 1,
             price_scale: 1,
             max_subscriptions_per_shard: 1,

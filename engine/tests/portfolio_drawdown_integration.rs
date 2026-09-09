@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use anchorbell_engine::{
+    execution::EmergencyExecutionPolicy,
     market::binance::parse_market_message,
     simulation::{AnchorSnapshot, SimulationEngine, SimulationPolicyVariant},
 };
@@ -27,11 +28,31 @@ fn anchors() -> BTreeMap<String, AnchorSnapshot> {
 
 #[test]
 fn portfolio_drawdown_uses_canonical_net_pnl_and_propagates_cross_symbol() {
-    let mut engine = SimulationEngine::new(anchors(), 100, 100, 10, 20, 0, 0, 0)
-        .unwrap()
-        .with_strategy_variant(SimulationPolicyVariant::M0Fixed)
-        .with_portfolio_drawdown_limits_bps(100, 1_000, 9_000)
-        .unwrap();
+    let mut engine = SimulationEngine::new(
+        anchors(),
+        100,
+        100,
+        10,
+        20,
+        0,
+        0,
+        0,
+        EmergencyExecutionPolicy {
+            max_slippage_bps: 25,
+            max_participation_bps: 5_000,
+            minimum_maker_confidence_bps: 7_000,
+            cooldown_ms: 1_000,
+            safety_buffer_ms: 1_000,
+            taker_fee_ppm: 400,
+            urgency_cost_bps_per_second: 2,
+            deadline_penalty_bps: 100,
+            cost_margin_bps: 1,
+        },
+    )
+    .unwrap()
+    .with_strategy_variant(SimulationPolicyVariant::M0Fixed)
+    .with_portfolio_drawdown_limits_bps(100, 1_000, 9_000)
+    .unwrap();
 
     for symbol in ["CXMTUSDT", "UNITREEUSDT"] {
         let mark = format!(

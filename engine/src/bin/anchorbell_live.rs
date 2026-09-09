@@ -84,7 +84,6 @@ struct WorkingOrder {
 }
 
 const SHADOW_SCHEMA_VERSION: u32 = 1;
-const SHADOW_FEE_PPM: i64 = 0;
 
 #[derive(Debug, serde::Serialize)]
 struct ShadowRecordLine<'a> {
@@ -127,6 +126,7 @@ impl ShadowSimulation {
         shadow_dir: &Path,
         anchors: BTreeMap<String, AnchorSnapshot>,
         args: &Args,
+        profile: &StrategyProfile,
     ) -> Result<Self, String> {
         fs::create_dir_all(shadow_dir)
             .map_err(|error| format!("shadow simulation directory failed: {error}"))?;
@@ -137,12 +137,14 @@ impl ShadowSimulation {
             args.quantity,
             args.max_mark_index_gap_bps,
             args.max_anchor_age_ms,
-            SHADOW_FEE_PPM,
+            profile.fee_schedule.maker_fee_ppm,
             args.quantity_scale,
+            profile.emergency_execution,
         )
         .map_err(|error| format!("shadow simulation config rejected: {error}"))?
         .with_live_risk_gates()
         .with_strategy_variant(SimulationPolicyVariant::M4Statistical)
+        .with_fee_schedule_source(profile.fee_schedule.source.clone())
         .with_price_scale(args.price_scale);
         let manifest = serde_json::json!({
             "schema_version": SHADOW_SCHEMA_VERSION,
@@ -151,7 +153,8 @@ impl ShadowSimulation {
             "strategy_variant": SimulationPolicyVariant::M4Statistical.label(),
             "market_event_source": "live_binance_public",
             "execution": "simulation_only",
-            "fee_ppm": SHADOW_FEE_PPM,
+            "fee_ppm": profile.fee_schedule.maker_fee_ppm,
+            "fee_schedule": profile.fee_schedule,
             "entry_threshold_bps": args.entry_threshold_bps,
             "max_position": args.max_position,
             "requested_quantity": args.quantity,
@@ -463,7 +466,13 @@ async fn run(args: Args) -> Result<i32, String> {
         .parent()
         .ok_or_else(|| "live checkpoint has no parent directory".to_owned())?
         .join("shadow-simulation");
-    let mut shadow = ShadowSimulation::new(&run_id, &shadow_dir, anchors.clone(), &args)?;
+    let mut shadow = ShadowSimulation::new(
+        &run_id,
+        &shadow_dir,
+        anchors.clone(),
+        &args,
+        &strategy_profile,
+    )?;
     println!(
         "{}",
         serde_json::json!({
@@ -1601,19 +1610,21 @@ fn side_name(side: Side) -> &'static str {
 }
 
 fn parse_args() -> Result<Args, String> {
+    let profile = StrategyProfile::load("config/anchorbell-simulation.json")
+        .map_err(|error| format!("cannot load strategy profile: {error}"))?;
     let mut args = Args {
-        environment: BinanceEnvironment::Testnet,
-        duration_secs: 60,
+        environment: profile.environment,
+        duration_secs: profile.duration_secs,
         proxy: None,
-        price_scale: 8,
-        quantity_scale: 8,
-        max_position: 1,
-        quantity: 1,
-        entry_threshold_bps: 100,
-        max_mark_index_gap_bps: 50,
+        price_scale: profile.price_scale,
+        quantity_scale: profile.quantity_scale,
+        max_position: profile.max_position,
+        quantity: profile.requested_quantity,
+        entry_threshold_bps: profile.entry_threshold_bps,
+        max_mark_index_gap_bps: profile.max_mark_index_gap_bps,
         max_anchor_age_ms: 0,
-        funding_lead_ms: 300_000,
-        max_subscriptions_per_shard: 64,
+        funding_lead_ms: profile.funding_lead_ms,
+        max_subscriptions_per_shard: profile.max_subscriptions_per_shard,
         send_orders: false,
     };
     let mut values = env::args().skip(1);

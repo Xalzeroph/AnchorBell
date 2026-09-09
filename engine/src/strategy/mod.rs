@@ -31,7 +31,7 @@ pub use calibration::{
     CalibrationParameter, CalibrationSnapshot, CalibrationState, CalibrationStatus,
     CALIBRATION_MODEL_VERSION, CALIBRATION_SCHEMA_VERSION,
 };
-pub use config::{StrategyProfile, STRATEGY_PROFILE_SCHEMA_VERSION};
+pub use config::{FeeScheduleConfig, StrategyProfile, STRATEGY_PROFILE_SCHEMA_VERSION};
 pub use flatten::{DualFlattenPlan, FlattenPhase, FlattenReason};
 pub use instrument_profile::{profile_for, AnchorCurrency, InstrumentKind, InstrumentProfile};
 pub use inventory::InventoryState;

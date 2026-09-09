@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::strategy::CalibrationState;
+use crate::{execution::EmergencyExecutionPolicy, strategy::CalibrationState};
 
 use super::runtime::SimulationPolicyVariant;
 
@@ -16,6 +16,8 @@ pub struct ReplayConfig {
     pub max_mark_index_gap_bps: i64,
     pub max_anchor_age_ms: u64,
     pub fee_ppm: i64,
+    pub emergency_execution: EmergencyExecutionPolicy,
+    pub fee_schedule_source: String,
     pub realism: crate::backtest::realism::RealisticFillModel,
     pub strategy_variant: SimulationPolicyVariant,
     pub threshold_scale_ppm: i64,

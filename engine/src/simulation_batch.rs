@@ -38,7 +38,7 @@ use crate::{
         SimulationPolicyVariant, SimulationSummary,
     },
     strategy::{
-        CalibrationSnapshot, CalibrationState, CALIBRATION_MODEL_VERSION,
+        CalibrationSnapshot, CalibrationState, FeeScheduleConfig, CALIBRATION_MODEL_VERSION,
         CALIBRATION_SCHEMA_VERSION,
     },
 };
@@ -80,6 +80,7 @@ pub struct SimulationBatchConfig {
     pub max_mark_index_gap_bps: i64,
     pub max_anchor_age_ms: u64,
     pub fee_ppm: i64,
+    pub fee_schedule: FeeScheduleConfig,
     pub quantity_scale: u32,
     pub price_scale: u32,
     pub position_allocations: Option<BTreeMap<String, PositionAllocation>>,
@@ -418,11 +419,13 @@ fn build_engine(
         config.max_anchor_age_ms,
         config.fee_ppm,
         config.quantity_scale,
+        config.emergency_execution,
     )?
     .with_price_scale(config.price_scale)
     .with_realism(realism)
     .with_live_risk_gates()
     .with_strategy_variant(spec.variant)
+    .with_fee_schedule_source(config.fee_schedule.source.clone())
     .with_quote_reprice_min_interval_ms(config.quote_reprice_min_interval_ms)
     .with_emergency_execution_policy(config.emergency_execution)?
     .with_dynamic_capital_refresh_ms(config.dynamic_capital_refresh_ms)
@@ -539,16 +542,7 @@ pub async fn run(
         "entry_threshold_bps": config.entry_threshold_bps,
         "threshold_scale_ppm": config.threshold_scale_ppm,
         "fee_ppm": config.fee_ppm,
-        "fee_schedule": {
-            "product": "TradFi Perps",
-            "account_tier": "Regular/VIP1",
-            "bnb_discount": false,
-            "maker_fee_ppm": config.fee_ppm,
-            "taker_fee_ppm": config.emergency_execution.taker_fee_ppm,
-            "source": "https://www.binance.com/en/support/announcement/detail/a4c3f1957f2b4e69902985154235c3b1",
-            "effective_from": "2026-03-31T02:00:00Z",
-            "effective_until": "further_notice"
-        },
+        "fee_schedule": config.fee_schedule,
         "queue_ahead": config.queue_ahead,
         "trade_through": config.trade_through,
         "market_to_decision_ms": config.market_to_decision_ms,
@@ -609,16 +603,7 @@ pub async fn run(
         "entry_threshold_bps": config.entry_threshold_bps,
         "threshold_scale_ppm": config.threshold_scale_ppm,
         "fee_ppm": config.fee_ppm,
-        "fee_schedule": {
-            "product": "TradFi Perps",
-            "account_tier": "Regular/VIP1",
-            "bnb_discount": false,
-            "maker_fee_ppm": config.fee_ppm,
-            "taker_fee_ppm": config.emergency_execution.taker_fee_ppm,
-            "source": "https://www.binance.com/en/support/announcement/detail/a4c3f1957f2b4e69902985154235c3b1",
-            "effective_from": "2026-03-31T02:00:00Z",
-            "effective_until": "further_notice"
-        },
+        "fee_schedule": config.fee_schedule,
         "queue_ahead": config.queue_ahead,
         "trade_through": config.trade_through,
         "market_to_decision_ms": config.market_to_decision_ms,

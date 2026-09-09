@@ -8,8 +8,8 @@ use anchorbell_engine::{
         load_anchor_file, replay_jsonl_with_config, ReplayConfig, SimulationPolicyVariant,
     },
     strategy::{
-        universe::instrument_for, CalibrationSnapshot, CalibrationState, CALIBRATION_MODEL_VERSION,
-        CALIBRATION_SCHEMA_VERSION,
+        universe::instrument_for, CalibrationSnapshot, CalibrationState, StrategyProfile,
+        CALIBRATION_MODEL_VERSION, CALIBRATION_SCHEMA_VERSION,
     },
 };
 use sha2::{Digest, Sha256};
@@ -56,6 +56,8 @@ async fn main() {
         .await
         .unwrap_or_else(|error| fail(format!("backtest health bootstrap failed: {error}")));
     let args = parse_args().unwrap_or_else(|message| fail(message));
+    let strategy_profile = StrategyProfile::load("config/anchorbell-simulation.json")
+        .unwrap_or_else(|error| fail(format!("cannot load strategy profile: {error}")));
     let anchors = load_anchor_file(&args.anchors)
         .unwrap_or_else(|error| fail(format!("cannot load anchors: {error}")));
     if let Some(symbol) = anchors
@@ -106,6 +108,8 @@ async fn main() {
             max_mark_index_gap_bps: args.max_mark_index_gap_bps,
             max_anchor_age_ms: args.max_anchor_age_ms,
             fee_ppm: args.fee_ppm,
+            emergency_execution: strategy_profile.emergency_execution,
+            fee_schedule_source: strategy_profile.fee_schedule.source.clone(),
             realism: RealisticFillModel {
                 queue: QueueModel {
                     visible_ahead: args.queue_ahead,
@@ -322,6 +326,8 @@ fn load_calibration_seeds(
 }
 
 fn parse_args() -> Result<Args, String> {
+    let profile = StrategyProfile::load("config/anchorbell-simulation.json")
+        .map_err(|error| format!("cannot load strategy profile: {error}"))?;
     let mut input = None;
     let mut anchors = None;
     let mut records = None;
@@ -329,23 +335,23 @@ fn parse_args() -> Result<Args, String> {
     let mut calibration_output = None;
     let mut calibration_source_label = "F3_m3".to_owned();
     let mut freeze_calibration = false;
-    let mut price_scale = 8;
-    let mut quantity_scale = 8;
-    let mut entry_threshold_bps = 0;
-    let mut max_position = 1;
-    let mut requested_quantity = 1;
-    let mut max_mark_index_gap_bps = 50;
-    let mut max_anchor_age_ms = 0;
-    let mut fee_ppm = 0;
-    let mut queue_ahead = 0;
-    let mut trade_through = 0;
-    let mut market_to_decision_ms = 0;
-    let mut decision_to_exchange_ms = 0;
-    let mut cancel_to_exchange_ms = 0;
-    let mut strategy_variant = SimulationPolicyVariant::M0Fixed;
-    let mut threshold_scale_ppm = 1_000_000;
-    let mut quote_reprice_min_interval_ms = 0;
-    let mut dynamic_capital_refresh_ms = 60_000;
+    let mut price_scale = profile.price_scale;
+    let mut quantity_scale = profile.quantity_scale;
+    let mut entry_threshold_bps = profile.entry_threshold_bps;
+    let mut max_position = profile.max_position;
+    let mut requested_quantity = profile.requested_quantity;
+    let mut max_mark_index_gap_bps = profile.max_mark_index_gap_bps;
+    let mut max_anchor_age_ms = profile.max_anchor_age_ms;
+    let mut fee_ppm = profile.fee_schedule.maker_fee_ppm;
+    let mut queue_ahead = profile.queue_ahead;
+    let mut trade_through = profile.trade_through;
+    let mut market_to_decision_ms = profile.market_to_decision_ms;
+    let mut decision_to_exchange_ms = profile.decision_to_exchange_ms;
+    let mut cancel_to_exchange_ms = profile.cancel_to_exchange_ms;
+    let mut strategy_variant = parse_strategy_variant(&profile.default_strategy_variant)?;
+    let mut threshold_scale_ppm = profile.threshold_scale_ppm;
+    let mut quote_reprice_min_interval_ms = profile.quote_reprice_min_interval_ms;
+    let mut dynamic_capital_refresh_ms = profile.dynamic_capital_refresh_ms;
     let mut live_risk_gates = false;
     let mut funding_controller_enabled = true;
     let mut capital_usdt_ticks = None;

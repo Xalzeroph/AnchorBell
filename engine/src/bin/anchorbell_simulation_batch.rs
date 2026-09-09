@@ -211,6 +211,7 @@ fn main() {
             max_mark_index_gap_bps: profile.max_mark_index_gap_bps,
             max_anchor_age_ms: profile.max_anchor_age_ms,
             fee_ppm: profile.fee_ppm,
+            fee_schedule: profile.fee_schedule.clone(),
             quantity_scale: profile.quantity_scale,
             price_scale: profile.price_scale,
             position_allocations: Some(allocations),
