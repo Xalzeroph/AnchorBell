@@ -986,6 +986,41 @@ fn compact_value(value: &Value, depth: usize) -> Value {
     }
 }
 
+fn manifest_view(value: Option<&Value>) -> Value {
+    let Some(manifest) = value else {
+        return json!({});
+    };
+    json!({
+        "anchor_source": manifest.get("anchor_source"),
+        "anchor_kline_interval": manifest.get("anchor_kline_interval"),
+        "duration_secs": manifest.get("duration_secs"),
+        "entry_threshold_bps": manifest.get("entry_threshold_bps"),
+        "fee_ppm": manifest.get("fee_ppm"),
+        "fee_schedule": manifest.get("fee_schedule"),
+        "market_to_decision_ms": manifest.get("market_to_decision_ms"),
+        "decision_to_exchange_ms": manifest.get("decision_to_exchange_ms"),
+        "cancel_to_exchange_ms": manifest.get("cancel_to_exchange_ms"),
+        "queue_ahead": manifest.get("queue_ahead"),
+        "strategy_variants": manifest.get("strategy_variants"),
+        "spec_labels": manifest.get("spec_labels"),
+    })
+}
+
+fn index_view(value: Option<&Value>) -> Value {
+    let Some(index) = value else {
+        return json!({});
+    };
+    json!({
+        "schema_version": index.get("schema_version"),
+        "run_id": index.get("run_id"),
+        "status": index.get("status"),
+        "evidence_class": index.get("evidence_class"),
+        "promotion_verdict": index.get("promotion_verdict"),
+        "experiment_plan_id": index.get("experiment_plan_id"),
+        "experiments": index.get("experiments"),
+    })
+}
+
 async fn runs_response() -> (u16, &'static str, Vec<u8>) {
     let Some(root) = external_batch_root() else {
         return json_response(200, json!({
@@ -1071,8 +1106,8 @@ async fn runs_response() -> (u16, &'static str, Vec<u8>) {
                 .unwrap_or(Value::Null),
             "methods": methods,
             "market_data": manifest.as_ref().and_then(|v| v.get("index_anchor_conversions")).cloned().unwrap_or_else(|| json!({})),
-            "manifest": compact_value(manifest.as_ref().unwrap_or(&Value::Null), 0),
-            "index": compact_value(index.as_ref().unwrap_or(&Value::Null), 0),
+            "manifest": manifest_view(manifest.as_ref()),
+            "index": index_view(index.as_ref()),
         }));
     }
     runs.sort_by_key(|run| run.get("created_at_ms").and_then(Value::as_u64).unwrap_or_default());
