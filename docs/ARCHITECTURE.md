@@ -3,7 +3,7 @@
 ## 1. Scope and decision authority
 
 AnchorBell is a Rust-first, event-driven industrial quantitative platform for
-short-horizon, maker-only trading of Binance equity-related perpetual futures
+short-horizon, maker-first trading of Binance equity-related perpetual futures
 during periods when the related equity market is closed.
 
 The system seeks temporary, risk-adjusted relative-value opportunities between
@@ -15,7 +15,7 @@ only. Final decisions always follow AnchorBell's confirmed requirements:
 
 - Rust owns the live core and all latency-sensitive paths.
 - Strategy, market data, risk, execution, replay, and persistence are decoupled.
-- New risk may only be created by an explicit maker-only policy.
+- New risk may only be created by an explicit maker-first policy.
 - Invalid, stale, unknown, or unreconciled state fails closed.
 - Production is disabled by default and requires explicit authorization.
 - Simulation, replay, backtest, and live use the same typed domain contracts.
@@ -27,14 +27,14 @@ This document is the architectural authority for the design described here.
 ## 2. Non-negotiable invariants
 1. No taker order can be produced by the normal strategy path.
 2. Every opening order passes anchor, session, pricing-mode, signal, inventory,
-   portfolio, exchange-filter, and maker-only gates.
+   portfolio, exchange-filter, and maker-first gates.
 3. No new risk is allowed when market data or the external anchor is stale.
 4. Unknown order, position, account, or connection state cannot increase risk.
 5. Equity-market opening and funding settlement are independent risk clocks.
 6. The earlier effective flatten deadline always wins.
-7. Flattening remains maker-only unless a separately approved emergency policy
+7. Flattening remains maker-first unless a separately approved emergency policy
    explicitly changes that invariant.
-8. The system must expose residual exposure when maker-only flattening cannot
+8. The system must expose residual exposure when maker-first flattening cannot
    guarantee completion before a deadline.
 9. Hot paths never synchronously write SQLite, JSONL, Parquet, or other media.
 10. Credentials never enter source code, logs, commits, reports, or replay data.
@@ -488,7 +488,7 @@ During flattening, risk reduction takes priority over queue preservation.
 ## 11. Execution architecture
 The strategy emits an immutable `OrderIntent`. The execution layer performs:
 
-1. maker-only capability validation;
+1. maker-first capability validation;
 2. reduce-only and position-side validation;
 3. price and quantity filter validation;
 4. notional and rate-limit validation;
@@ -666,7 +666,7 @@ models may estimate:
 - quote size and distance.
 
 They may not bypass:
-- maker-only validation;
+- maker-first validation;
 - anchor validity;
 - session flatten;
 - funding flatten;
@@ -715,7 +715,7 @@ Normal operation is enabled only when all gates pass:
 - funding schedule is known or explicitly irrelevant;
 - position and order state are reconciled;
 - account and portfolio budgets are available;
-- maker-only capability is confirmed;
+- maker-first capability is confirmed;
 - no flatten deadline is active;
 - no recovery or kill-switch state is active.
 
@@ -767,7 +767,7 @@ These references do not authorize importing:
 - Python into the live hot path;
 - a simple touch-equals-fill assumption;
 - unrestricted grids or martingale;
-- taker execution;
+- unrestricted taker execution;
 - generic abstractions that weaken AnchorBell's gates;
 - weekday-based funding assumptions.
 
@@ -909,7 +909,7 @@ zero latency is not evidence.
 
 ## 25. Flatten feasibility, not only flatten deadlines
 
-A deadline alone is insufficient for maker-only execution. Every live position
+A deadline alone is insufficient for maker-first execution. Every live position
 must expose:
 
 ```
@@ -940,7 +940,7 @@ rate, queue uncertainty, volatility, and connection health. It must not use a
 constant assumption for every contract.
 
 This rule is especially important for low-liquidity equity perpetuals and for
-the funding deadline, where maker-only execution cannot guarantee completion.
+the funding deadline, where maker-first execution cannot guarantee completion.
 
 ## 26. Lower-confidence-bound decision policy
 
@@ -1023,7 +1023,7 @@ The following practices are adopted selectively:
 The architectural test for every imported practice is:
 
 1. Does it solve a defined AnchorBell problem?
-2. Does it preserve maker-only behavior?
+2. Does it preserve maker-first behavior?
 3. Does it preserve fail-closed risk?
 4. Does it preserve live/replay contract parity?
 5. Can its result be reproduced and independently audited?
