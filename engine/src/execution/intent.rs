@@ -93,7 +93,6 @@ impl OrderIntent {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
