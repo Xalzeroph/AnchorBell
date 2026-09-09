@@ -81,7 +81,12 @@ impl LocalOrderBook {
         self.load_snapshot(last_update_id, bids, asks)?;
         let expected = last_update_id.saturating_add(1);
         let Some(first_index) = buffered.iter().position(|update| {
-            update.first_update_id <= expected && update.final_update_id >= expected
+            (update.first_update_id <= expected && update.final_update_id >= expected)
+                // Some Binance TradFi depth streams use non-contiguous U/u
+                // ranges. If pu directly names the snapshot ID, it is still
+                // an unambiguous first-event bridge.
+                || (update.previous_final_update_id == Some(last_update_id)
+                    && update.final_update_id > last_update_id)
         }) else {
             self.valid = false;
             return Err(OrderBookError::SequenceGap {
@@ -104,7 +109,11 @@ impl LocalOrderBook {
             .last_update_id
             .ok_or(OrderBookError::SnapshotRequired)?;
         let expected = last.saturating_add(1);
-        if update.first_update_id > expected || update.final_update_id < expected {
+        let strict_bridge =
+            update.first_update_id <= expected && update.final_update_id >= expected;
+        let pu_bridge =
+            update.previous_final_update_id == Some(last) && update.final_update_id > last;
+        if !strict_bridge && !pu_bridge {
             self.valid = false;
             return Err(OrderBookError::SequenceGap {
                 expected,
@@ -291,6 +300,17 @@ mod tests {
             Ok(2)
         );
         assert_eq!(book.last_update_id(), Some(14));
+    }
+
+    #[test]
+    fn snapshot_replay_accepts_pu_bridge_when_u_range_jumps() {
+        let mut book = LocalOrderBook::default();
+        let buffered = [update(20, 21, Some(10)), update(30, 31, Some(21))];
+        assert_eq!(
+            book.load_snapshot_and_replay(10, &[(99, 3)], &[(101, 4)], &buffered),
+            Ok(2)
+        );
+        assert_eq!(book.last_update_id(), Some(31));
     }
 
     #[test]
