@@ -398,6 +398,8 @@ pub fn load_anchor_file(path: &Path) -> Result<BTreeMap<String, AnchorSnapshot>,
     Ok(anchors)
 }
 
+pub const INDEX_ANCHOR_SOURCE: &str = "binance_index_price_klines";
+
 /// Fetches the official Binance TradFi index price for every selected symbol
 /// and materializes a run-local static anchor. No credentials or order API are
 /// involved. The caller controls the run lifetime; the anchor itself has no
@@ -602,7 +604,7 @@ pub(crate) async fn load_index_anchor_set_internal(
                 fx_sell_local_per_usdt_ppm: fx_quote.sell_local_per_usdt_ppm,
                 fx_observed_at_ms: fx_quote.observed_at_ms,
                 fx_source: fx_quote.source.to_owned(),
-                index_source: "binance_index_price_klines".to_owned(),
+                index_source: INDEX_ANCHOR_SOURCE.to_owned(),
                 index_open_time_ms: kline.open_time_ms,
                 index_close_time_ms: kline.close_time_ms,
                 index_observed_at_ms: kline.close_time_ms,

@@ -182,7 +182,7 @@ async fn main() {
         "strategy_variant": args.strategy_variant.label(),
         "threshold_scale_ppm": args.threshold_scale_ppm,
         "anchor_source": if args.index_anchors {
-            "binance_index_price_klines"
+            anchorbell_engine::simulation::INDEX_ANCHOR_SOURCE
         } else {
             "csv"
         },
@@ -273,7 +273,7 @@ async fn main() {
         "strategy_variant": args.strategy_variant.label(),
         "threshold_scale_ppm": args.threshold_scale_ppm,
         "anchor_source": if args.index_anchors {
-            "binance_index_price_klines"
+            anchorbell_engine::simulation::INDEX_ANCHOR_SOURCE
         } else {
             "csv"
         },

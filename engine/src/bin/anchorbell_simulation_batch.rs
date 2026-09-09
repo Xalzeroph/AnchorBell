@@ -142,7 +142,7 @@ fn main() {
         // Never reuse a local anchor for a live simulation run. Bootstrap must obtain
         // the current Binance index/FX-derived anchor set before any market
         // event is admitted; transient REST failures wait and retry.
-        let anchors = loop {
+        let anchor_set = loop {
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(15),
                 load_index_anchor_set(
@@ -155,7 +155,7 @@ fn main() {
             )
             .await;
             match result {
-                Ok(Ok(set)) => break set.anchors,
+                Ok(Ok(set)) => break set,
                 Ok(Err(error)) => {
                     eprintln!("index anchor bootstrap unavailable: {error}; retrying in 5s");
                 }
@@ -165,7 +165,9 @@ fn main() {
             }
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         };
-        let anchors = anchors
+        let index_anchor_conversions = anchor_set.conversions;
+        let anchors = anchor_set
+            .anchors
             .into_iter()
             .filter(|(symbol, _)| {
                 symbols
@@ -210,6 +212,7 @@ fn main() {
             environment,
             symbols,
             anchors,
+            index_anchor_conversions,
             entry_threshold_bps: profile.entry_threshold_bps,
             threshold_scale_ppm: profile.threshold_scale_ppm,
             max_position: profile.max_position,

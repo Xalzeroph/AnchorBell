@@ -34,8 +34,8 @@ use crate::{
         load_index_anchor_set, DataQuality, EventEnvelope, EventSource,
     },
     simulation::engine::{
-        AnchorSnapshot, PerformancePoint, PositionAllocation, SimulationEngine, SimulationError,
-        SimulationPolicyVariant, SimulationSummary,
+        AnchorSnapshot, IndexAnchorConversion, PerformancePoint, PositionAllocation,
+        SimulationEngine, SimulationError, SimulationPolicyVariant, SimulationSummary,
     },
     strategy::{
         CalibrationSnapshot, CalibrationState, FeeScheduleConfig, CALIBRATION_MODEL_VERSION,
@@ -73,6 +73,7 @@ pub struct SimulationBatchConfig {
     pub environment: BinanceEnvironment,
     pub symbols: Vec<String>,
     pub anchors: BTreeMap<String, AnchorSnapshot>,
+    pub index_anchor_conversions: BTreeMap<String, IndexAnchorConversion>,
     pub entry_threshold_bps: i64,
     pub threshold_scale_ppm: i64,
     pub max_position: i64,
@@ -544,6 +545,9 @@ pub async fn run(
         "threshold_scale_ppm": config.threshold_scale_ppm,
         "fee_ppm": config.fee_ppm,
         "fee_schedule": config.fee_schedule,
+        "anchor_source": crate::simulation::engine::INDEX_ANCHOR_SOURCE,
+        "anchor_kline_interval": config.anchor_kline_interval,
+        "index_anchor_conversions": config.index_anchor_conversions,
         "queue_ahead": config.queue_ahead,
         "trade_through": config.trade_through,
         "market_to_decision_ms": config.market_to_decision_ms,
@@ -562,6 +566,9 @@ pub async fn run(
         "anchors": config.anchors.iter().map(|(symbol, anchor)| {
             (symbol, (anchor.close_price_ticks, anchor.observed_at_ms, anchor.valid_until_ms))
         }).collect::<BTreeMap<_, _>>(),
+        "anchor_source": crate::simulation::engine::INDEX_ANCHOR_SOURCE,
+        "anchor_kline_interval": config.anchor_kline_interval,
+        "index_anchor_conversions": config.index_anchor_conversions,
         "environment": config.environment.as_str(),
     });
     let data_bytes = serde_json::to_vec(&data_material)
@@ -605,6 +612,9 @@ pub async fn run(
         "threshold_scale_ppm": config.threshold_scale_ppm,
         "fee_ppm": config.fee_ppm,
         "fee_schedule": config.fee_schedule,
+        "anchor_source": crate::simulation::engine::INDEX_ANCHOR_SOURCE,
+        "anchor_kline_interval": config.anchor_kline_interval,
+        "index_anchor_conversions": config.index_anchor_conversions,
         "queue_ahead": config.queue_ahead,
         "trade_through": config.trade_through,
         "market_to_decision_ms": config.market_to_decision_ms,
