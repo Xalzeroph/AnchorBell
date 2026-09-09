@@ -46,6 +46,9 @@ pub struct LocalOrderBook {
     asks: BTreeMap<i64, i64>,
     last_update_id: Option<u64>,
     valid: bool,
+    /// The first diff after a REST snapshot uses Binance's bridge rule
+    /// (U <= lastUpdateId + 1 <= u); pu continuity applies thereafter.
+    awaiting_first_diff: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +70,73 @@ pub enum OrderBookError {
 }
 
 impl LocalOrderBook {
+    /// Applies Binance's REST/WebSocket bridge rule to buffered depth events.
+    pub fn load_snapshot_and_replay(
+        &mut self,
+        last_update_id: u64,
+        bids: &[(i64, i64)],
+        asks: &[(i64, i64)],
+        buffered: &[DepthUpdate],
+    ) -> Result<usize, OrderBookError> {
+        self.load_snapshot(last_update_id, bids, asks)?;
+        let expected = last_update_id.saturating_add(1);
+        let Some(first_index) = buffered.iter().position(|update| {
+            (update.first_update_id <= expected && update.final_update_id >= expected)
+                // Some Binance TradFi depth streams use non-contiguous U/u
+                // ranges. If pu directly names the snapshot ID, it is still
+                // an unambiguous first-event bridge.
+                || (update
+                    .previous_final_update_id
+                    .is_some_and(|previous| previous <= last_update_id)
+                    && update.final_update_id > last_update_id)
+        }) else {
+            self.valid = false;
+            return Err(OrderBookError::SequenceGap {
+                expected,
+                first: buffered.first().map_or(0, |u| u.first_update_id),
+                previous: buffered.first().and_then(|u| u.previous_final_update_id),
+            });
+        };
+        self.apply_bridge(&buffered[first_index])?;
+        let mut consumed = first_index + 1;
+        for update in buffered.iter().skip(consumed) {
+            self.apply_diff(update)?;
+            consumed += 1;
+        }
+        Ok(consumed)
+    }
+
+    fn apply_bridge(&mut self, update: &DepthUpdate) -> Result<(), OrderBookError> {
+        let last = self
+            .last_update_id
+            .ok_or(OrderBookError::SnapshotRequired)?;
+        let expected = last.saturating_add(1);
+        let strict_bridge =
+            update.first_update_id <= expected && update.final_update_id >= expected;
+        let pu_bridge = update
+            .previous_final_update_id
+            .is_some_and(|previous| previous <= last)
+            && update.final_update_id > last;
+        if !strict_bridge && !pu_bridge {
+            self.valid = false;
+            return Err(OrderBookError::SequenceGap {
+                expected,
+                first: update.first_update_id,
+                previous: update.previous_final_update_id,
+            });
+        }
+        for level in &update.bids {
+            insert_level(&mut self.bids, level.price.0, level.quantity.0)?;
+        }
+        for level in &update.asks {
+            insert_level(&mut self.asks, level.price.0, level.quantity.0)?;
+        }
+        validate_crossed(&self.bids, &self.asks)?;
+        self.last_update_id = Some(update.final_update_id);
+        self.awaiting_first_diff = false;
+        Ok(())
+    }
+
     pub fn load_snapshot(
         &mut self,
         last_update_id: u64,
@@ -86,6 +156,7 @@ impl LocalOrderBook {
         self.asks = next_asks;
         self.last_update_id = Some(last_update_id);
         self.valid = true;
+        self.awaiting_first_diff = true;
         Ok(())
     }
 
@@ -100,11 +171,15 @@ impl LocalOrderBook {
             return Ok(DepthApplyResult::Duplicate);
         }
         let expected = last.saturating_add(1);
-        let sequence_ok = update.first_update_id <= expected
-            && update.final_update_id >= expected
-            && update
-                .previous_final_update_id
-                .is_none_or(|previous| previous == last);
+        // Binance's bridge rule applies only to the first diff after the
+        // snapshot. For later diffs, pu is the authoritative continuity
+        // check; U may legitimately jump because one event can cover a
+        // range of update IDs that were not emitted as separate messages.
+        let sequence_ok = if self.awaiting_first_diff {
+            update.first_update_id <= expected && update.final_update_id >= expected
+        } else {
+            update.previous_final_update_id == Some(last)
+        };
         if !sequence_ok {
             self.valid = false;
             return Err(OrderBookError::SequenceGap {
@@ -124,6 +199,7 @@ impl LocalOrderBook {
             return Err(error);
         }
         self.last_update_id = Some(update.final_update_id);
+        self.awaiting_first_diff = false;
         Ok(DepthApplyResult::Applied)
     }
 
@@ -220,6 +296,55 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_replay_uses_last_update_plus_one_bridge_rule() {
+        let mut book = LocalOrderBook::default();
+        let buffered = [update(11, 12, None), update(13, 14, Some(12))];
+        assert_eq!(
+            book.load_snapshot_and_replay(10, &[(99, 3)], &[(101, 4)], &buffered),
+            Ok(2)
+        );
+        assert_eq!(book.last_update_id(), Some(14));
+    }
+
+    #[test]
+    fn snapshot_replay_accepts_pu_bridge_when_u_range_jumps() {
+        let mut book = LocalOrderBook::default();
+        let buffered = [update(20, 21, Some(10)), update(30, 31, Some(21))];
+        assert_eq!(
+            book.load_snapshot_and_replay(10, &[(99, 3)], &[(101, 4)], &buffered),
+            Ok(2)
+        );
+        assert_eq!(book.last_update_id(), Some(31));
+    }
+
+    #[test]
+    fn snapshot_replay_accepts_pu_range_bridge_when_snapshot_id_is_inside_gap() {
+        let mut book = LocalOrderBook::default();
+        let buffered = [update(20, 21, Some(5)), update(30, 31, Some(21))];
+        assert_eq!(
+            book.load_snapshot_and_replay(10, &[(99, 3)], &[(101, 4)], &buffered),
+            Ok(2)
+        );
+        assert_eq!(book.last_update_id(), Some(31));
+    }
+
+    #[test]
+    fn snapshot_replay_reports_missing_bridge_at_next_sequence() {
+        let mut book = LocalOrderBook::default();
+        let error = book
+            .load_snapshot_and_replay(10, &[(99, 3)], &[(101, 4)], &[update(12, 12, None)])
+            .unwrap_err();
+        assert_eq!(
+            error,
+            OrderBookError::SequenceGap {
+                expected: 11,
+                first: 12,
+                previous: None
+            }
+        );
+    }
+
+    #[test]
     fn snapshot_and_contiguous_diff_update_the_book() {
         let mut book = LocalOrderBook::default();
         book.load_snapshot(10, &[(99, 3)], &[(101, 4)]).unwrap();
@@ -230,6 +355,17 @@ mod tests {
         assert_eq!(book.last_update_id(), Some(12));
         assert_eq!(book.best_bid(), Some((99, 4)));
         assert_eq!(book.best_ask(), Some((101, 5)));
+    }
+
+    #[test]
+    fn later_diff_uses_pu_continuity_even_when_u_jumps() {
+        let mut book = LocalOrderBook::default();
+        let buffered = [update(11, 12, None), update(20, 21, Some(12))];
+        assert_eq!(
+            book.load_snapshot_and_replay(10, &[(99, 3)], &[(101, 4)], &buffered),
+            Ok(2)
+        );
+        assert_eq!(book.last_update_id(), Some(21));
     }
 
     #[test]

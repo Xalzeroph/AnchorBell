@@ -12,7 +12,10 @@ use std::{
 use anchorbell_engine::{
     analytics_evidence::EvidenceConfig,
     execution::{BinanceEnvironment, SessionCheckpoint},
-    market::{AssetClass, InstrumentRegistryConfig},
+    market::{
+        AssetClass, BinanceScaledExecutionFilters, InstrumentRegistryConfig,
+        PublicMarketMetadataClient,
+    },
     platform::RuntimeProfile,
     runtime::{
         timestamp_ms, RunMode, RunRegistry, RunSpec, RunStatus, RuntimeHealthReporter,
@@ -71,6 +74,70 @@ fn validate_simulation_instruments(
     Ok(())
 }
 
+async fn load_execution_filters(
+    environment: BinanceEnvironment,
+    symbols: &[String],
+    price_scale: u32,
+    quantity_scale: u32,
+) -> Result<BTreeMap<String, BinanceScaledExecutionFilters>, String> {
+    let client = PublicMarketMetadataClient::new(environment.endpoints().rest_base, None)
+        .map_err(|error| format!("metadata client construction failed: {error}"))?;
+    let metadata = client
+        .exchange_info()
+        .await
+        .map_err(|error| format!("exchangeInfo unavailable: {error}"))?;
+    let by_symbol = metadata
+        .into_iter()
+        .map(|value| (value.symbol.clone(), value))
+        .collect::<BTreeMap<_, _>>();
+    let mut result = BTreeMap::new();
+    for symbol in symbols {
+        let normalized = symbol.trim().to_ascii_uppercase();
+        let value = by_symbol
+            .get(&normalized)
+            .ok_or_else(|| format!("exchangeInfo missing configured symbol {normalized}"))?;
+        if !value.is_trading_tradifi_perpetual() {
+            return Err(format!(
+                "configured symbol {normalized} is not an active TradFi perpetual"
+            ));
+        }
+        let filters = value
+            .execution_filters()
+            .map_err(|error| format!("invalid Binance filters for {normalized}: {error}"))?
+            .scaled(price_scale, quantity_scale)
+            .map_err(|error| format!("unscalable Binance filters for {normalized}: {error}"))?;
+        result.insert(normalized, filters);
+    }
+    Ok(result)
+}
+
+async fn load_funding_intervals(
+    environment: BinanceEnvironment,
+    symbols: &[String],
+) -> Result<BTreeMap<String, u32>, String> {
+    let client = PublicMarketMetadataClient::new(environment.endpoints().rest_base, None)
+        .map_err(|error| format!("funding metadata client construction failed: {error}"))?;
+    let mut result = BTreeMap::new();
+    for symbol in symbols {
+        let normalized = symbol.trim().to_ascii_uppercase();
+        let rows = client
+            .funding_info(Some(&normalized))
+            .await
+            .map_err(|error| format!("fundingInfo unavailable for {normalized}: {error}"))?;
+        let row = rows
+            .into_iter()
+            .find(|value| value.symbol.eq_ignore_ascii_case(&normalized))
+            .ok_or_else(|| format!("fundingInfo missing configured symbol {normalized}"))?;
+        if row.funding_interval_hours == 0 {
+            return Err(format!(
+                "fundingInfo returned zero interval for {normalized}"
+            ));
+        }
+        result.insert(normalized, row.funding_interval_hours);
+    }
+    Ok(result)
+}
+
 fn main() {
     let args = parse_args().unwrap_or_else(|error| fail(error));
     let profile = StrategyProfile::load(&args.profile_path).unwrap_or_else(|error| fail(error));
@@ -112,6 +179,17 @@ fn main() {
         .build()
         .unwrap_or_else(|error| fail(format!("cannot create runtime: {error}")));
     runtime.block_on(async move {
+        let execution_filters = load_execution_filters(
+            environment,
+            &symbols,
+            profile.price_scale,
+            profile.quantity_scale,
+        )
+        .await
+        .unwrap_or_else(|error| fail(format!("Binance execution-rule gate failed: {error}")));
+        let funding_intervals = load_funding_intervals(environment, &symbols)
+            .await
+            .unwrap_or_else(|error| fail(format!("Binance funding-rule gate failed: {error}")));
         let mut health = RuntimeHealthReporter::new(profile.runtime_audit_path.clone());
         health
             .start(RuntimeProfile::Batch, timestamp_ms())
@@ -258,6 +336,8 @@ fn main() {
             max_anchor_age_ms: profile.max_anchor_age_ms,
             fee_ppm: profile.fee_ppm,
             fee_schedule: profile.fee_schedule.clone(),
+            execution_filters,
+            funding_intervals,
             quantity_scale: profile.quantity_scale,
             price_scale: profile.price_scale,
             position_allocations: Some(allocations),

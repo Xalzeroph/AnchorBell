@@ -18,15 +18,15 @@ impl BinanceEnvironment {
                 rest_base: "https://demo-fapi.binance.com",
                 market_ws_base: "wss://demo-fstream.binance.com/market",
                 public_market_ws_base: "wss://demo-fstream.binance.com/public",
-                order_ws_base: "wss://demo-fstream.binance.com/ws-fapi/v1",
-                user_data_ws_base: "wss://demo-fstream.binance.com",
+                order_ws_base: "wss://testnet.binancefuture.com/ws-fapi/v1",
+                user_data_ws_base: "wss://demo-fstream.binance.com/private",
             },
             Self::Production => BinanceEndpoints {
                 rest_base: "https://fapi.binance.com",
                 market_ws_base: "wss://fstream.binance.com/market",
                 public_market_ws_base: "wss://fstream.binance.com/public",
                 order_ws_base: "wss://ws-fapi.binance.com/ws-fapi/v1",
-                user_data_ws_base: "wss://fstream.binance.com",
+                user_data_ws_base: "wss://fstream.binance.com/private",
             },
         }
     }
@@ -98,7 +98,7 @@ mod tests {
         );
         assert_eq!(
             testnet.order_ws_base,
-            "wss://demo-fstream.binance.com/ws-fapi/v1"
+            "wss://testnet.binancefuture.com/ws-fapi/v1"
         );
         assert_ne!(testnet.rest_base, production.rest_base);
         assert_ne!(testnet.market_ws_base, production.market_ws_base);

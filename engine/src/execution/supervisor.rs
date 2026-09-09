@@ -587,6 +587,13 @@ impl ExecutionSupervisor {
                 self.recovery.record_event(update.event_time_ms);
                 Ok(())
             }
+            UserDataEvent::Unmodeled { event_time_ms, .. } => {
+                // Keep the stream alive and audit the event; unknown payloads
+                // never mutate trading state or authorize new risk.
+                self.last_user_event_at_ms = event_time_ms;
+                self.recovery.record_event(event_time_ms);
+                Ok(())
+            }
         }
     }
 }
@@ -779,6 +786,8 @@ mod tests {
         let event = UserDataEvent::AccountUpdate(crate::execution::AccountUpdate {
             event_time_ms: 2_000,
             transaction_time_ms: 2_000,
+            reason: "ORDER".into(),
+            balances: vec![],
             positions: vec![crate::execution::PositionUpdate {
                 symbol: "CXMTUSDT".into(),
                 position_amount: "2.000000001".into(),
