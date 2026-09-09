@@ -1,0 +1,26 @@
+[Unit]
+Description=AnchorBell authenticated dashboard
+After=network-online.target anchorbell-simulation.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=anchorbell
+Group=anchorbell
+WorkingDirectory=/opt/anchorbell
+Environment=ANCHORBELL_DASHBOARD_BIND=127.0.0.1:8787
+Environment=ANCHORBELL_BATCH_ROOT=/var/lib/anchorbell
+ExecStart=/opt/anchorbell/target/release/anchorbell_dashboard
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/anchorbell/target/ui-runs
+StandardOutput=journal
+StandardError=journal
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
