@@ -1,5 +1,5 @@
 use crate::event::EngineEvent;
-use crate::execution::OrderIntent;
+use crate::execution::{OrderIntent, OrderIntentError};
 use crate::platform::{HealthSnapshot, ReadinessReport, SystemRegistry, SystemRole};
 use crate::runtime::RuntimeChannels;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -105,16 +105,11 @@ impl TradingRuntime {
             let Some(intent) = handler.on_event(event) else {
                 continue;
             };
-            if !intent.post_only && !intent.reduce_only {
+            validate_intent(&intent).map_err(|error| {
                 self.halted = true;
                 self.running = false;
-                return Err(DispatchError::NonMakerIntent);
-            }
-            if intent.symbol == 0 || intent.price <= 0 || intent.quantity <= 0 {
-                self.halted = true;
-                self.running = false;
-                return Err(DispatchError::InvalidIntent);
-            }
+                error
+            })?;
             order_tx.send(intent).await.map_err(|_| {
                 self.halted = true;
                 self.running = false;
@@ -153,15 +148,19 @@ impl TradingRuntime {
         let Some(intent) = handler.on_event(event) else {
             return Ok(None);
         };
-        if !intent.post_only && !intent.reduce_only {
+        if let Err(error) = validate_intent(&intent) {
             self.halted = true;
-            return Err(DispatchError::NonMakerIntent);
-        }
-        if intent.symbol == 0 || intent.price <= 0 || intent.quantity <= 0 {
-            self.halted = true;
-            return Err(DispatchError::InvalidIntent);
+            return Err(error);
         }
         Ok(Some(intent))
+    }
+}
+
+fn validate_intent(intent: &OrderIntent) -> Result<(), DispatchError> {
+    match intent.validate() {
+        Ok(()) => Ok(()),
+        Err(OrderIntentError::UnscopedAggressor) => Err(DispatchError::NonMakerIntent),
+        Err(OrderIntentError::InvalidShape) => Err(DispatchError::InvalidIntent),
     }
 }
 
@@ -202,6 +201,22 @@ mod tests {
             Some(OrderIntent::maker_buy(7, 100, 2))
         );
         assert_eq!(runtime.processed_events(), 1);
+    }
+
+    #[test]
+    fn accepts_reduce_only_taker_intents() {
+        let mut runtime = TradingRuntime::new();
+        let mut handler = |_event| {
+            Some(OrderIntent::emergency_reduce_only_taker(
+                7,
+                crate::execution::Side::Sell,
+                99,
+                2,
+            ))
+        };
+
+        assert!(runtime.dispatch_event(&mut handler, tick()).is_ok());
+        assert!(!runtime.is_halted());
     }
 
     #[test]
