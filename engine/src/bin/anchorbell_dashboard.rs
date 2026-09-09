@@ -992,6 +992,7 @@ fn manifest_view(value: Option<&Value>) -> Value {
     };
     json!({
         "anchor_source": manifest.get("anchor_source"),
+        "price_scale": manifest.get("price_scale").cloned().unwrap_or_else(|| json!(8)),
         "anchor_kline_interval": manifest.get("anchor_kline_interval"),
         "duration_secs": manifest.get("duration_secs"),
         "entry_threshold_bps": manifest.get("entry_threshold_bps"),
@@ -1019,6 +1020,25 @@ fn index_view(value: Option<&Value>) -> Value {
         "experiment_plan_id": index.get("experiment_plan_id"),
         "experiments": index.get("experiments"),
     })
+}
+
+fn latest_fx_quotes(run_dir: &Path) -> Value {
+    let Ok(contents) = fs::read_to_string(run_dir.join("shared-fx.jsonl")) else {
+        return json!({});
+    };
+    let mut quotes = serde_json::Map::new();
+    for line in contents.lines().rev() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(currency) = value.get("currency").and_then(Value::as_str) else {
+            continue;
+        };
+        if !quotes.contains_key(currency) {
+            quotes.insert(currency.to_owned(), value);
+        }
+    }
+    Value::Object(quotes)
 }
 
 async fn runs_response() -> (u16, &'static str, Vec<u8>) {
@@ -1111,6 +1131,44 @@ async fn runs_response() -> (u16, &'static str, Vec<u8>) {
                 }));
             }
         }
+        let mut market_data = manifest
+            .as_ref()
+            .and_then(|v| v.get("index_anchor_conversions"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let latest_fx = latest_fx_quotes(&run_dir);
+        if let Value::Object(entries) = &mut market_data {
+            for entry in entries.values_mut() {
+                let Value::Object(item) = entry else {
+                    continue;
+                };
+                let Some(currency) = item
+                    .get("local_currency")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                else {
+                    continue;
+                };
+                let Some(Value::Object(quote)) = latest_fx.get(&currency) else {
+                    continue;
+                };
+                for key in [
+                    "buy_local_per_usdt_ppm",
+                    "sell_local_per_usdt_ppm",
+                    "midpoint_local_per_usdt_ppm",
+                ] {
+                    if let Some(value) = quote.get(key) {
+                        item.insert(key.to_owned(), value.clone());
+                    }
+                }
+                if let Some(value) = quote.get("observed_at_ms") {
+                    item.insert("fx_observed_at_ms".to_owned(), value.clone());
+                }
+                if let Some(value) = quote.get("source") {
+                    item.insert("fx_source".to_owned(), value.clone());
+                }
+            }
+        }
         runs.push(json!({
             "name": run_dir.file_name().and_then(|v| v.to_str()).unwrap_or_default(),
             "run_id": run_id,
@@ -1123,7 +1181,7 @@ async fn runs_response() -> (u16, &'static str, Vec<u8>) {
                 .or_else(|| index.as_ref().and_then(|v| v.get("build_identity")).cloned())
                 .unwrap_or(Value::Null),
             "methods": methods,
-            "market_data": manifest.as_ref().and_then(|v| v.get("index_anchor_conversions")).cloned().unwrap_or_else(|| json!({})),
+            "market_data": market_data,
             "manifest": manifest_view(manifest.as_ref()),
             "index": index_view(index.as_ref()),
         }));
