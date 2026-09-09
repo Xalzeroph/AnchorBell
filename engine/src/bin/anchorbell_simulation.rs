@@ -51,11 +51,20 @@ async fn load_index_anchors_with_retry(
     environment: BinanceEnvironment,
     symbols: &[String],
     price_scale: u32,
+    anchor_kline_interval: &str,
     proxy: Option<&str>,
 ) -> Result<BinanceIndexAnchorSet, String> {
     let mut last_error = String::from("unknown index anchor error");
     for attempt in 0..3 {
-        match load_index_anchor_set(environment, symbols, price_scale, proxy).await {
+        match load_index_anchor_set(
+            environment,
+            symbols,
+            price_scale,
+            anchor_kline_interval,
+            proxy,
+        )
+        .await
+        {
             Ok(anchor_set) => return Ok(anchor_set),
             Err(error) => {
                 last_error = error.to_string();
@@ -99,6 +108,7 @@ async fn main() {
             args.environment,
             symbols,
             args.price_scale,
+            &strategy_profile.anchor_kline_interval,
             args.proxy.as_deref(),
         )
         .await
@@ -172,7 +182,7 @@ async fn main() {
         "strategy_variant": args.strategy_variant.label(),
         "threshold_scale_ppm": args.threshold_scale_ppm,
         "anchor_source": if args.index_anchors {
-            "binance_premium_index"
+            "binance_index_price_klines"
         } else {
             "csv"
         },
@@ -222,6 +232,7 @@ async fn main() {
             } else {
                 0
             },
+            anchor_kline_interval: strategy_profile.anchor_kline_interval.clone(),
             http_proxy: args.proxy,
             market_output_path: args.market_records,
             fx_output_path: fx_records.clone(),
@@ -262,7 +273,7 @@ async fn main() {
         "strategy_variant": args.strategy_variant.label(),
         "threshold_scale_ppm": args.threshold_scale_ppm,
         "anchor_source": if args.index_anchors {
-            "binance_premium_index"
+            "binance_index_price_klines"
         } else {
             "csv"
         },

@@ -1,11 +1,11 @@
 //! The AnchorBell TradFi catalog and anchor-stability eligibility boundary.
-
-use serde::Deserialize;
-use std::sync::LazyLock;
 //!
 //! ADR/ADS presence is recorded as issuer evidence. It is not, by itself, a
 //! veto: the FrozenClose strategy is blocked only when the ADR market provides
 //! active price discovery during the Hong Kong close-to-open interval.
+
+use serde::Deserialize;
+use std::sync::LazyLock;
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -89,7 +89,10 @@ fn load_instruments(region: EquityRegion) -> Vec<TradFiInstrument> {
         "/../config/anchorbell-universe.json"
     )))
     .expect("anchorbell universe config must be valid JSON");
-    assert_eq!(config.schema_version, 1, "unsupported universe config schema");
+    assert_eq!(
+        config.schema_version, 1,
+        "unsupported universe config schema"
+    );
     config
         .instruments
         .into_iter()

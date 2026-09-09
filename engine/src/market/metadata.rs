@@ -7,6 +7,7 @@ use std::{
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
 use crate::network::{RequestClass, RequestCoordinator};
@@ -25,6 +26,8 @@ pub enum PublicMetadataError {
     HttpStatus { status: u16 },
     #[error("public metadata response could not be decoded")]
     Decode,
+    #[error("index price kline response is invalid")]
+    InvalidIndexPriceKline,
     #[error("symbol metadata is not present in exchangeInfo: {0}")]
     SymbolNotFound(String),
     #[error("metadata snapshot has inconsistent symbols")]
@@ -151,6 +154,13 @@ pub struct BinancePremiumIndexSnapshot {
 pub struct BinanceTimedPremiumIndexSnapshot {
     pub snapshot: BinancePremiumIndexSnapshot,
     pub observed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinanceIndexPriceKline {
+    pub open_time_ms: u64,
+    pub close_price: String,
+    pub close_time_ms: u64,
 }
 
 /// Funding history returned by Binance's USD-M fundingRate endpoint.
@@ -1057,6 +1067,57 @@ impl PublicMarketMetadataClient {
             "/fapi/v1/depth?symbol={symbol}&limit={limit}"
         ))
         .await
+    }
+
+    /// Fetches Binance's historical index-price candles used to materialize
+    /// an official exchange-close anchor. The current premium-index endpoint
+    /// is intentionally not used for this purpose because it is an intraday
+    /// observation when the process starts during an equity session.
+    pub async fn index_price_klines(
+        &self,
+        pair: &str,
+        interval: &str,
+        start_time_ms: u64,
+        end_time_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<BinanceIndexPriceKline>, PublicMetadataError> {
+        let pair = pair.trim().to_ascii_uppercase();
+        let interval = interval.trim();
+        if pair.is_empty()
+            || !pair.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            || interval.is_empty()
+            || !interval.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        {
+            return Err(PublicMetadataError::SymbolNotFound(pair));
+        }
+        if end_time_ms < start_time_ms {
+            return Err(PublicMetadataError::InvalidIndexPriceKline);
+        }
+        let limit = limit.clamp(1, 1_500);
+        let rows = self
+            .get_json::<Vec<Vec<Value>>>(&format!(
+                "/fapi/v1/indexPriceKlines?pair={pair}&interval={interval}&startTime={start_time_ms}&endTime={end_time_ms}&limit={limit}"
+            ))
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                if row.len() < 7 {
+                    return Err(PublicMetadataError::InvalidIndexPriceKline);
+                }
+                Ok(BinanceIndexPriceKline {
+                    open_time_ms: row[0]
+                        .as_u64()
+                        .ok_or(PublicMetadataError::InvalidIndexPriceKline)?,
+                    close_price: row[4]
+                        .as_str()
+                        .ok_or(PublicMetadataError::InvalidIndexPriceKline)?
+                        .to_owned(),
+                    close_time_ms: row[6]
+                        .as_u64()
+                        .ok_or(PublicMetadataError::InvalidIndexPriceKline)?,
+                })
+            })
+            .collect()
     }
 
     /// Fetches recent funding settlements, preserving Binance's Regular/Special

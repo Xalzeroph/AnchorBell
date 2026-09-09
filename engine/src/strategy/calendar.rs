@@ -203,6 +203,32 @@ impl EquitySessionCalendar {
             && local_minute >= self.effective_final_close_minute(date_key)
     }
 
+    /// Returns the most recent completed final close before a UTC timestamp.
+    ///
+    /// A close is considered complete only after one additional minute so a
+    /// one-minute Binance index-price candle can be retrieved for that close.
+    /// This keeps the exchange calendar as the sole authority for the anchor
+    /// timestamp and fails closed for unsupported calendar snapshots.
+    pub fn latest_completed_close_before(&self, timestamp_ms: u64) -> Option<u64> {
+        let (current_day, _local_minute) = local_day_and_minute(timestamp_ms)?;
+        for offset in 0..=366 {
+            let day = current_day.checked_sub(offset)?;
+            let (date_key, weekday) = date_and_weekday(day)?;
+            if !Self::calendar_snapshot_supported(date_key)
+                || self.is_holiday(date_key)
+                || weekday > 5
+            {
+                continue;
+            }
+            let close_minute = self.effective_final_close_minute(date_key);
+            let close_at_ms = timestamp_at_local_minute(day, close_minute)?;
+            if close_at_ms.saturating_add(60_000) <= timestamp_ms {
+                return Some(close_at_ms);
+            }
+        }
+        None
+    }
+
     pub fn entry_allowed_on_date(
         &self,
         date_key: u32,
@@ -493,6 +519,24 @@ mod tests {
             20270101
         ));
         assert!(!A_SHARE_CALENDAR.entry_allowed_on_date(20270101, 5, 600, 30, true, true));
+    }
+
+    #[test]
+    fn latest_completed_close_uses_previous_trading_close_during_session() {
+        let during_session = timestamp_for_local(2026, 1, 6, 600);
+        assert_eq!(
+            A_SHARE_CALENDAR.latest_completed_close_before(during_session),
+            Some(timestamp_for_local(2026, 1, 5, 900))
+        );
+    }
+
+    #[test]
+    fn latest_completed_close_uses_same_day_after_final_close() {
+        let after_close = timestamp_for_local(2026, 1, 5, 901);
+        assert_eq!(
+            A_SHARE_CALENDAR.latest_completed_close_before(after_close),
+            Some(timestamp_for_local(2026, 1, 5, 900))
+        );
     }
 
     #[test]

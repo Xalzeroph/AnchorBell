@@ -91,6 +91,7 @@ pub struct SimulationBatchConfig {
     pub read_timeout_ms: u64,
     pub metrics_refresh_ms: u64,
     pub index_anchor_refresh_ms: u64,
+    pub anchor_kline_interval: String,
     pub fx_refresh_ms: u64,
     pub fx_max_age_ms: u64,
     pub queue_ahead: i64,
@@ -732,11 +733,21 @@ pub async fn run(
     let mut anchor_task = if config.index_anchor_refresh_ms > 0 {
         let environment = config.environment;
         let symbols = config.symbols.clone();
+        let price_scale = config.price_scale;
+        let anchor_kline_interval = config.anchor_kline_interval.clone();
         let refresh_ms = config.index_anchor_refresh_ms;
         Some(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(refresh_ms.max(1_000))).await;
-                match load_index_anchor_set(environment, &symbols, 8, None).await {
+                match load_index_anchor_set(
+                    environment,
+                    &symbols,
+                    price_scale,
+                    &anchor_kline_interval,
+                    None,
+                )
+                .await
+                {
                     Ok(anchor_set) => {
                         if anchor_tx.send(Ok(anchor_set.anchors)).await.is_err() {
                             break;

@@ -29,6 +29,7 @@
   "read_timeout_ms": 15000,
   "metrics_refresh_ms": 1000,
   "index_anchor_refresh_ms": 60000,
+  "anchor_kline_interval": "1m",
   "fx_refresh_ms": 30000,
   "fx_max_age_ms": 120000,
   "queue_ahead": 0,

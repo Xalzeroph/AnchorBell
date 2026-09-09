@@ -145,7 +145,13 @@ fn main() {
         let anchors = loop {
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(15),
-                load_index_anchor_set(environment, &symbols, profile.price_scale, None),
+                load_index_anchor_set(
+                    environment,
+                    &symbols,
+                    profile.price_scale,
+                    &profile.anchor_kline_interval,
+                    None,
+                ),
             )
             .await;
             match result {
@@ -226,6 +232,7 @@ fn main() {
             } else {
                 0
             },
+            anchor_kline_interval: profile.anchor_kline_interval.clone(),
             fx_refresh_ms: profile.fx_refresh_ms,
             fx_max_age_ms: profile.fx_max_age_ms,
             queue_ahead: profile.queue_ahead,

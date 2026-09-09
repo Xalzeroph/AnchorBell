@@ -12,12 +12,14 @@ pub async fn fetch(
     environment: BinanceEnvironment,
     symbols: &[String],
     price_scale: u32,
+    anchor_kline_interval: &str,
     http_proxy: Option<&str>,
 ) -> Result<BinanceIndexAnchorSet, SimulationError> {
     crate::simulation::engine::load_index_anchor_set_internal(
         environment,
         symbols,
         price_scale,
+        anchor_kline_interval,
         http_proxy,
     )
     .await

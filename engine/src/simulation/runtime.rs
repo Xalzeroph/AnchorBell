@@ -416,6 +416,9 @@ pub struct IndexAnchorConversion {
     pub fx_sell_local_per_usdt_ppm: i64,
     pub fx_observed_at_ms: u64,
     pub fx_source: String,
+    pub index_source: String,
+    pub index_open_time_ms: u64,
+    pub index_close_time_ms: u64,
     pub index_observed_at_ms: u64,
 }
 
@@ -429,6 +432,7 @@ pub(crate) async fn load_index_anchor_set_internal(
     environment: BinanceEnvironment,
     symbols: &[String],
     price_scale: u32,
+    anchor_kline_interval: &str,
     http_proxy: Option<&str>,
 ) -> Result<BinanceIndexAnchorSet, SimulationError> {
     if symbols.is_empty() {
@@ -474,15 +478,47 @@ pub(crate) async fn load_index_anchor_set_internal(
         selected_metadata.push(metadata);
     }
 
-    // Two in-flight snapshots preserve a 250 ms process-wide REST cadence
-    // while overlapping network latency; the gate, not task count, controls
-    // request pressure.
-    let snapshot_symbols = selected_metadata
-        .iter()
-        .map(|metadata| metadata.symbol.clone())
-        .collect::<Vec<_>>();
-    let snapshots = client.premium_index_snapshots(&snapshot_symbols, 2).await;
     let observed_now_ms = now_ms();
+    let mut historical_anchors = BTreeMap::new();
+    for metadata in &selected_metadata {
+        let symbol = metadata.symbol.clone();
+        let profile = profile_for(&symbol).ok_or_else(|| {
+            SimulationError::Market(format!("no anchor currency profile for {symbol}"))
+        })?;
+        let calendar = calendar_for(profile.region);
+        let close_at_ms = calendar
+            .latest_completed_close_before(observed_now_ms)
+            .ok_or_else(|| {
+                SimulationError::Market(format!(
+                    "no completed exchange close available for {symbol}"
+                ))
+            })?;
+        let klines = client
+            .index_price_klines(
+                &symbol,
+                anchor_kline_interval,
+                close_at_ms.saturating_sub(86_400_000),
+                close_at_ms,
+                1_500,
+            )
+            .await
+            .map_err(|error| {
+                SimulationError::Market(format!(
+                    "index price kline for {symbol} at close {close_at_ms}: {error}"
+                ))
+            })?;
+        let kline = klines
+            .into_iter()
+            .filter(|kline| kline.open_time_ms < close_at_ms && kline.close_time_ms <= close_at_ms)
+            .max_by_key(|kline| kline.close_time_ms)
+            .ok_or_else(|| {
+                SimulationError::Market(format!(
+                    "no completed historical close kline for {symbol} at {close_at_ms}"
+                ))
+            })?;
+        historical_anchors.insert(symbol, (profile, kline));
+    }
+
     let mut fx_quotes = BTreeMap::new();
     let fx_client = BinanceC2cFxClient::new(http_proxy)
         .map_err(|error| SimulationError::Market(format!("index anchor FX client: {error}")))?;
@@ -515,21 +551,7 @@ pub(crate) async fn load_index_anchor_set_internal(
 
     let mut anchors = BTreeMap::new();
     let mut conversions = BTreeMap::new();
-    for timed_snapshot in snapshots {
-        let timed_snapshot = timed_snapshot.map_err(|error| {
-            SimulationError::Market(format!("index anchor premium snapshot: {error}"))
-        })?;
-        timed_snapshot
-            .snapshot
-            .validate_for_anchor_price(timed_snapshot.observed_at_ms, observed_now_ms)
-            .map_err(|error| {
-                SimulationError::Market(format!("index anchor validation: {error}"))
-            })?;
-        let snapshot = timed_snapshot.snapshot;
-        let symbol = snapshot.symbol.clone();
-        let profile = profile_for(&symbol).ok_or_else(|| {
-            SimulationError::Market(format!("no anchor currency profile for {symbol}"))
-        })?;
+    for (symbol, (profile, kline)) in historical_anchors {
         let fx_quote = fx_quotes
             .get(profile.anchor_currency.as_str())
             .ok_or_else(|| {
@@ -539,7 +561,7 @@ pub(crate) async fn load_index_anchor_set_internal(
                 ))
             })?;
         let index_price =
-            crate::market::binance::parse_price_ticks(&snapshot.index_price, price_scale).map_err(
+            crate::market::binance::parse_price_ticks(&kline.close_price, price_scale).map_err(
                 |error| {
                     SimulationError::Market(format!(
                         "index anchor price for {symbol} is invalid: {error:?}"
@@ -563,7 +585,7 @@ pub(crate) async fn load_index_anchor_set_internal(
             symbol.clone(),
             AnchorSnapshot {
                 close_price_ticks: index_price.0,
-                observed_at_ms: timed_snapshot.observed_at_ms,
+                observed_at_ms: kline.close_time_ms,
                 // A static anchor remains valid until the authority publishes a
                 // replacement or the calendar/session layer invalidates it.
                 valid_until_ms: 0,
@@ -580,7 +602,10 @@ pub(crate) async fn load_index_anchor_set_internal(
                 fx_sell_local_per_usdt_ppm: fx_quote.sell_local_per_usdt_ppm,
                 fx_observed_at_ms: fx_quote.observed_at_ms,
                 fx_source: fx_quote.source.to_owned(),
-                index_observed_at_ms: timed_snapshot.observed_at_ms,
+                index_source: "binance_index_price_klines".to_owned(),
+                index_open_time_ms: kline.open_time_ms,
+                index_close_time_ms: kline.close_time_ms,
+                index_observed_at_ms: kline.close_time_ms,
             },
         );
     }
@@ -599,13 +624,18 @@ pub async fn load_binance_index_anchors(
     environment: BinanceEnvironment,
     symbols: &[String],
     price_scale: u32,
+    anchor_kline_interval: &str,
     http_proxy: Option<&str>,
 ) -> Result<BTreeMap<String, AnchorSnapshot>, SimulationError> {
-    Ok(
-        load_index_anchor_set_internal(environment, symbols, price_scale, http_proxy)
-            .await?
-            .anchors,
+    Ok(load_index_anchor_set_internal(
+        environment,
+        symbols,
+        price_scale,
+        anchor_kline_interval,
+        http_proxy,
     )
+    .await?
+    .anchors)
 }
 
 fn normalize_symbol(value: &str) -> Option<String> {
@@ -4984,6 +5014,7 @@ pub struct SimulationConfig {
     pub read_timeout_ms: u64,
     pub duration_secs: u64,
     pub index_anchor_refresh_ms: u64,
+    pub anchor_kline_interval: String,
     pub http_proxy: Option<String>,
     pub market_output_path: Option<PathBuf>,
     pub fx_output_path: Option<PathBuf>,
@@ -5146,6 +5177,7 @@ pub async fn run_simulation(
         let environment = config.environment;
         let symbols = config.symbols.clone();
         let price_scale = config.price_scale;
+        let anchor_kline_interval = config.anchor_kline_interval.clone();
         let http_proxy = config.http_proxy.clone();
         let refresh_ms = config.index_anchor_refresh_ms;
         Some(tokio::spawn(async move {
@@ -5155,6 +5187,7 @@ pub async fn run_simulation(
                     environment,
                     &symbols,
                     price_scale,
+                    &anchor_kline_interval,
                     http_proxy.as_deref(),
                 )
                 .await
