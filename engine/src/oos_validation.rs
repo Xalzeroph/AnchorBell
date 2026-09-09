@@ -215,7 +215,7 @@ pub fn evaluate_robust_candidate(
     } else if positive_oos_survival_ppm < constraints.min_oos_positive_return_ppm {
         "oos_positive_return_survival_below_floor"
     } else if lower_quartile < constraints.min_lower_quartile_net_return_bps {
-        "oos_return_floor_not_met"
+        "lower_quartile_return_floor_not_met"
     } else if median_sharpe < constraints.min_median_sharpe_ratio {
         "median_sharpe_floor_not_met"
     } else if median_sortino < constraints.min_median_sortino_ratio {
@@ -400,7 +400,7 @@ mod tests {
             },
         );
         assert!(!result.eligible);
-        assert_eq!(result.reason, "lower_quartile_return_floor_not_met");
+        assert_eq!(result.reason, "oos_return_floor_not_met");
     }
 
     #[test]
