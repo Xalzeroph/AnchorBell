@@ -1,1 +1,38 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#07111f"><link rel="manifest" href="/manifest.webmanifest"><link rel="stylesheet" href="/styles.css"><title>AnchorBell Control Center</title></head><body><aside><div class="brand"><b>A</b><span>AnchorBell<small>Control Center</small></span></div><nav><button data-v="overview">总览</button><button data-v="instruments">市场与标的</button><button data-v="runtimes">运行实例</button><button data-v="platform">系统拓扑</button><button data-v="raw">全量数据</button></nav><footer><i></i><span id="conn">连接中</span><button id="install" hidden>安装到设备</button></footer></aside><main><header><div><small>ANCHORBELL / OBSERVABILITY</small><h1 id="title">系统总览</h1><p>服务器实时运行、市场、方法与风险状态。</p></div><div><span id="clock"></span><button id="theme" aria-label="切换主题">亮色</button><button id="refresh">刷新</button></div></header><section id="view"></section></main><script src="/app.js"></script></body></html>
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#05070d">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="stylesheet" href="/styles.css">
+<script>document.documentElement.dataset.theme=localStorage.getItem('anchorbell-theme')||'dark'</script>
+<title>AnchorBell</title>
+</head>
+<body>
+<div class="shell">
+<aside class="sidebar" id="sidebar">
+  <div class="brand"><span class="brand-mark">A</span><span><b>AnchorBell</b><small>Trading Observatory</small></span></div>
+  <nav id="nav">
+    <button class="nav-item active" data-page="dashboard"><span>⌂</span>总览</button>
+    <button class="nav-item" data-page="markets"><span>◉</span>市场</button>
+    <button class="nav-item" data-page="runtimes"><span>◌</span>运行实例</button>
+    <button class="nav-item" data-page="checks"><span>✓</span>安全检查</button>
+    <button class="nav-item" data-page="raw"><span>{ }</span>原始数据</button>
+  </nav>
+  <div class="sidebar-bottom"><div class="live-dot"></div><span id="connection">连接中</span><button id="new-session" class="quiet">新建会话</button></div>
+</aside>
+<main class="content">
+  <header class="topbar">
+    <div class="topbar-left"><button id="menu" class="icon-button mobile-only">☰</button><div><div class="eyebrow">ANCHORBELL / CONTROL CENTER</div><h1 id="page-title">系统总览</h1><p id="page-subtitle">实时观察市场、策略与风险状态</p></div></div>
+    <div class="topbar-actions"><span class="session-chip"><i></i><span id="session-label">会话</span></span><button id="theme" class="icon-button" aria-label="切换主题">☼</button><button id="refresh" class="primary-button">刷新</button></div>
+  </header>
+  <div id="notice" class="notice" hidden></div>
+  <section id="view"></section>
+</main>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>
