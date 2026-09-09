@@ -1142,10 +1142,17 @@ pub async fn run(
                                 ) {
                                 Ok(consumed) => consumed,
                                 Err(OrderBookError::SequenceGap { expected, first, .. }) => {
+                                    if let Some(buffer) = depth_buffers.get_mut(&symbol) {
+                                        // A gap anywhere in the buffered interval
+                                        // means the interval cannot be repaired.
+                                        // Do not replay a contaminated prefix on
+                                        // the next snapshot attempt.
+                                        buffer.clear();
+                                    }
                                     let retry_at = now_ms().saturating_add(5_000);
                                     next_depth_resync_at_ms.insert(symbol.clone(), retry_at);
                                     eprintln!(
-                                        "depth resync waiting for bridge for {symbol}: expected={expected}, first_buffered={first}; retrying after {retry_at}"
+                                        "depth resync sequence gap for {symbol}: expected={expected}, first_buffered={first}; buffer discarded, retrying after {retry_at}"
                                     );
                                     continue;
                                 }
