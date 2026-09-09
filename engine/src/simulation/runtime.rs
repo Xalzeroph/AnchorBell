@@ -4754,6 +4754,18 @@ fn simulation_anchor_usable(symbol: &str, anchor_observed_at_ms: u64, now_ms: u6
     true
 }
 
+fn close_candle_reaches_final_close(
+    calendar: &EquitySessionCalendar,
+    date_key: u32,
+    weekday: u8,
+    timestamp_ms: u64,
+) -> bool {
+    let minute = local_minute(timestamp_ms);
+    calendar.after_final_close(date_key, weekday, minute)
+        || (minute.saturating_add(1) == calendar.effective_final_close_minute(date_key)
+            && timestamp_ms % 60_000 >= 59_000)
+}
+
 fn anchor_refresh_allowed(symbol: &str, timestamp_ms: u64) -> bool {
     let Some(profile) = profile_for(symbol) else {
         return false;
@@ -4772,7 +4784,7 @@ fn anchor_refresh_allowed(symbol: &str, timestamp_ms: u64) -> bool {
     if weekday > 5 || calendar.is_holiday(date_key) {
         return true;
     }
-    if calendar.after_final_close(date_key, weekday, minute) {
+    if close_candle_reaches_final_close(&calendar, date_key, weekday, timestamp_ms) {
         return true;
     }
 
