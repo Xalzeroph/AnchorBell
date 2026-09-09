@@ -52,7 +52,9 @@ impl DashboardState {
         let key = key.trim();
         let key = if key.is_empty()
             || key.len() > 128
-            || !key.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
         {
             "default"
         } else {
