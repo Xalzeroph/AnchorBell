@@ -105,11 +105,11 @@ impl TradingRuntime {
             let Some(intent) = handler.on_event(event) else {
                 continue;
             };
-            validate_intent(&intent).inspect_err(|error| {
-                self.halted = true;
-                self.running = false;
-                error
-            })?;
+            validate_intent(&intent)
+                .inspect_err(|_| {
+                    self.halted = true;
+                    self.running = false;
+                })?;
             order_tx.send(intent).await.map_err(|_| {
                 self.halted = true;
                 self.running = false;
