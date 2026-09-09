@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
     process::Stdio,
@@ -36,11 +37,47 @@ const MAX_REQUEST_BYTES: usize = 1_048_576;
 #[derive(Clone)]
 struct DashboardState {
     session: Arc<Mutex<DashboardSession>>,
+    sessions: Arc<Mutex<BTreeMap<String, Arc<Mutex<DashboardSession>>>>>,
     credential_store: Arc<PersistentCredentialStore>,
     runtimes: Arc<Mutex<RuntimeRegistry>>,
+    runtime_sessions: Arc<Mutex<BTreeMap<String, Arc<Mutex<RuntimeRegistry>>>>>,
     registry: Arc<Mutex<SystemRegistry>>,
     auth_token: Option<String>,
     tenant_id: Option<String>,
+    session_key: String,
+}
+
+impl DashboardState {
+    async fn for_session(&self, key: &str) -> Self {
+        let key = key.trim();
+        let key = if key.is_empty()
+            || key.len() > 128
+            || !key.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
+        {
+            "default"
+        } else {
+            key
+        };
+        let session = {
+            let mut sessions = self.sessions.lock().await;
+            sessions
+                .entry(key.to_owned())
+                .or_insert_with(|| Arc::new(Mutex::new(DashboardSession::default())))
+                .clone()
+        };
+        let runtimes = {
+            let mut runtime_sessions = self.runtime_sessions.lock().await;
+            runtime_sessions
+                .entry(key.to_owned())
+                .or_insert_with(|| Arc::new(Mutex::new(RuntimeRegistry::default())))
+                .clone()
+        };
+        let mut scoped = self.clone();
+        scoped.session = session;
+        scoped.runtimes = runtimes;
+        scoped.session_key = key.to_owned();
+        scoped
+    }
 }
 
 #[derive(Clone)]
@@ -166,6 +203,7 @@ struct HttpRequest {
     path: String,
     authorization: Option<String>,
     tenant_id: Option<String>,
+    session_id: Option<String>,
     body: Vec<u8>,
 }
 
@@ -190,10 +228,9 @@ async fn main() -> std::io::Result<()> {
     }
     let listener = TcpListener::bind(&bind_address).await?;
     let credential_store = Arc::new(PersistentCredentialStore);
-    let saved_testnet_credentials = credential_store
-        .load(BinanceEnvironment::Testnet)
-        .ok()
-        .flatten();
+    // Credentials are deliberately session-memory-only. A shared persistent
+    // credential store would violate per-session account isolation.
+    let saved_testnet_credentials: Option<BinanceCredentials> = None;
     let mut registry = SystemRegistry::default();
     let observed_at_ms = now_ms();
     registry.bootstrap_health(observed_at_ms);
@@ -205,15 +242,26 @@ async fn main() -> std::io::Result<()> {
             .report_health(HealthSnapshot::ready(id, observed_at_ms))
             .expect("dashboard registry bootstrap must be valid");
     }
+    let default_session = Arc::new(Mutex::new(DashboardSession::with_credentials(
+        saved_testnet_credentials,
+    )));
+    let default_runtimes = Arc::new(Mutex::new(RuntimeRegistry::default()));
     let state = DashboardState {
-        session: Arc::new(Mutex::new(DashboardSession::with_credentials(
-            saved_testnet_credentials,
-        ))),
+        session: Arc::clone(&default_session),
+        sessions: Arc::new(Mutex::new(BTreeMap::from([(
+            "default".to_owned(),
+            default_session,
+        )]))),
         credential_store,
-        runtimes: Arc::new(Mutex::new(RuntimeRegistry::default())),
+        runtimes: Arc::clone(&default_runtimes),
+        runtime_sessions: Arc::new(Mutex::new(BTreeMap::from([(
+            "default".to_owned(),
+            default_runtimes,
+        )]))),
         registry: Arc::new(Mutex::new(registry)),
         auth_token,
         tenant_id,
+        session_key: "default".to_owned(),
     };
     println!("AnchorBell dashboard listening on http://{bind_address}");
 
@@ -252,6 +300,12 @@ async fn route(request: HttpRequest, state: DashboardState) -> (u16, &'static st
             json!({"ok": false, "message": "authentication required"}),
         );
     }
+    let session_key = request
+        .session_id
+        .as_deref()
+        .or(request.tenant_id.as_deref())
+        .unwrap_or("default");
+    let state = state.for_session(session_key).await;
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/") => text_response(
             200,
@@ -1054,15 +1108,14 @@ async fn readiness_response(state: &DashboardState) -> (u16, &'static str, Vec<u
 async fn status_response(state: &DashboardState) -> Value {
     let session = state.session.lock().await;
     let environment = session.config.environment;
-    let saved_credentials = state
-        .credential_store
-        .has_saved(environment)
-        .unwrap_or(false);
+    // Persistence is intentionally disabled so one session can never discover
+    // another user's credential presence or secret.
+    let saved_credentials = false;
     serde_json::to_value(StatusResponse {
         environment: environment.to_string(),
         has_credentials: session.credentials.is_some(),
         saved_credentials,
-        credential_store_available: state.credential_store.is_available(),
+        credential_store_available: false,
         allow_production: session.config.allow_production,
         allow_order_submission: session.config.allow_live_orders,
         symbol: session.symbol.clone(),
@@ -1174,16 +1227,13 @@ async fn save_credentials(body: Vec<u8>, state: &DashboardState) -> (u16, &'stat
         Ok(credentials) => credentials,
         Err(_) => return json_response(400, json!({"ok": false, "message": "API 凭证不能为空"})),
     };
-    if let Err(error) = state.credential_store.save(environment, &credentials) {
-        return json_response(500, json!({"ok": false, "message": error.to_string()}));
-    }
     let mut session = state.session.lock().await;
     if session.config.environment == environment {
         session.credentials = Some(credentials);
     }
     json_response(
         200,
-        json!({"ok": true, "message": format!("{} 凭证已保存到 Windows 本机凭证库", environment)}),
+        json!({"ok": true, "message": format!("{} 凭证仅保存在当前会话内", environment)}),
     )
 }
 
@@ -1201,16 +1251,13 @@ async fn delete_credentials(body: Vec<u8>, state: &DashboardState) -> (u16, &'st
             )
         }
     };
-    if let Err(error) = state.credential_store.delete(environment) {
-        return json_response(500, json!({"ok": false, "message": error.to_string()}));
-    }
     let mut session = state.session.lock().await;
     if session.config.environment == environment {
         session.credentials = None;
     }
     json_response(
         200,
-        json!({"ok": true, "message": format!("{} 本机保存凭证已删除", environment)}),
+        json!({"ok": true, "message": format!("{} 当前会话凭证已删除", environment)}),
     )
 }
 
@@ -1642,6 +1689,10 @@ async fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, &'static st
         let (name, value) = line.split_once(':')?;
         (name.eq_ignore_ascii_case("x-anchorbell-tenant")).then(|| value.trim().to_owned())
     });
+    let session_id = header.lines().skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        (name.eq_ignore_ascii_case("x-anchorbell-session")).then(|| value.trim().to_owned())
+    });
     let content_length = lines
         .find_map(|line| {
             let (name, value) = line.split_once(':')?;
@@ -1669,6 +1720,7 @@ async fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, &'static st
         path,
         authorization,
         tenant_id,
+        session_id,
         body: bytes[body_start..body_start + content_length].to_vec(),
     })
 }
