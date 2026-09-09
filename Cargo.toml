@@ -7,7 +7,7 @@ edition = "2021"
 version = "0.1.0"
 authors = ["Xalzeroph"]
 license = "Apache-2.0"
-description = "Industrial maker-only quantitative execution platform for Binance equity perpetual anchor strategies."
+description = "Industrial maker-first quantitative execution platform for Binance equity perpetual anchor strategies."
 repository = "https://github.com/Xalzeroph/AnchorBell"
 
 [profile.release]
