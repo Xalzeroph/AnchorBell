@@ -23,7 +23,7 @@ use crate::{
     execution::{BinanceEnvironment, SessionCheckpoint},
     market::{
         binance::{parse_price_ticks, parse_quantity, BinanceMarketEvent},
-        metadata::BinanceDepthSnapshot,
+        metadata::{BinanceDepthSnapshot, BinanceScaledExecutionFilters},
         recorder::{add_event_lineage, market_event_to_json},
         BinanceC2cFxClient, BinanceC2cFxPoller, BinanceMarketConfig, BinanceMarketFeed,
         BinanceMarketStream, FxPollerConfig, FxUpdate, PublicMarketMetadataClient, ReconnectPolicy,
@@ -82,6 +82,8 @@ pub struct SimulationBatchConfig {
     pub max_anchor_age_ms: u64,
     pub fee_ppm: i64,
     pub fee_schedule: FeeScheduleConfig,
+    pub execution_filters: BTreeMap<String, BinanceScaledExecutionFilters>,
+    pub funding_intervals: BTreeMap<String, u32>,
     pub quantity_scale: u32,
     pub price_scale: u32,
     pub position_allocations: Option<BTreeMap<String, PositionAllocation>>,
@@ -433,7 +435,9 @@ fn build_engine(
     .with_quote_reprice_min_interval_ms(config.quote_reprice_min_interval_ms)
     .with_emergency_execution_policy(config.emergency_execution)?
     .with_dynamic_capital_refresh_ms(config.dynamic_capital_refresh_ms)
-    .with_threshold_scale_ppm(config.threshold_scale_ppm);
+    .with_threshold_scale_ppm(config.threshold_scale_ppm)
+    .with_execution_filters(config.execution_filters.clone())
+    .with_funding_intervals(config.funding_intervals.clone());
     engine.restore_calibration_states(calibration_seeds);
     if let Some(allocations) = config.position_allocations.clone() {
         engine = engine.with_position_allocations(allocations)?;
@@ -825,11 +829,12 @@ pub async fn run(
     let depth_client = PublicMarketMetadataClient::new(endpoints.rest_base, None)
         .map_err(|error| SimulationError::Market(format!("depth snapshot client: {error}")))?;
     let mut depth_books = BTreeMap::<String, LocalOrderBook>::new();
+    let mut depth_buffers =
+        BTreeMap::<String, VecDeque<crate::market::binance::DepthUpdate>>::new();
+    let mut replay_events = VecDeque::<BinanceMarketEvent>::new();
     for symbol in &config.symbols {
-        // Start immediately with an empty book. The first depth delta marks the
-        // book as requiring a snapshot, which is recovered by the background
-        // resync supervisor below. Startup never serializes REST snapshots.
         depth_books.insert(symbol.to_ascii_uppercase(), LocalOrderBook::default());
+        depth_buffers.insert(symbol.to_ascii_uppercase(), VecDeque::new());
     }
 
     // A depth gap must never await REST from inside the market event handler.
@@ -989,7 +994,13 @@ pub async fn run(
                     }
                     persist_calibration_store(&calibration_store_path, &ledgers).await?;
                 }
-                event = event_rx.recv() => {
+                event = async {
+                    if let Some(event) = replay_events.pop_front() {
+                        Some(event)
+                    } else {
+                        event_rx.recv().await
+                    }
+                } => {
                     if event_dropped.load(Ordering::Relaxed) != 0 {
                         return Err::<(), SimulationError>(SimulationError::Market(
                             "market event queue overflowed; run invalidated".to_owned(),
@@ -1000,21 +1011,48 @@ pub async fn run(
                     last_received_at_ms = received_at;
                     if let BinanceMarketEvent::DepthUpdate(depth) = &event {
                         let symbol = depth.symbol.to_ascii_uppercase();
-                        let resync = {
+                        let mut resync = false;
+                        {
                             let book = depth_books.get_mut(&symbol).ok_or_else(|| {
-                                SimulationError::Market(format!("depth update for unknown symbol {symbol}"))
+                                SimulationError::Market(format!(
+                                    "depth update for unknown symbol {symbol}"
+                                ))
                             })?;
-                            match book.apply_diff(depth) {
-                                Ok(_) => false,
-                                Err(OrderBookError::SequenceGap { .. })
-                                | Err(OrderBookError::SnapshotRequired) => true,
-                                Err(error) => {
+                            if !book.is_valid() {
+                                let buffer = depth_buffers.get_mut(&symbol).ok_or_else(|| {
+                                    SimulationError::Market(format!(
+                                        "depth buffer missing for {symbol}"
+                                    ))
+                                })?;
+                                if buffer.len() >= 10_000 {
                                     return Err(SimulationError::Market(format!(
-                                        "depth book invalid for {symbol}: {error:?}"
+                                        "depth bootstrap buffer overflowed for {symbol}"
                                     )));
                                 }
+                                buffer.push_back(depth.clone());
+                                resync = true;
+                            } else if let Err(error) = book.apply_diff(depth) {
+                                match error {
+                                    OrderBookError::SequenceGap { .. }
+                                    | OrderBookError::SnapshotRequired => {
+                                        let buffer =
+                                            depth_buffers.get_mut(&symbol).ok_or_else(|| {
+                                                SimulationError::Market(format!(
+                                                    "depth buffer missing for {symbol}"
+                                                ))
+                                            })?;
+                                        buffer.clear();
+                                        buffer.push_back(depth.clone());
+                                        resync = true;
+                                    }
+                                    error => {
+                                        return Err(SimulationError::Market(format!(
+                                            "depth book invalid for {symbol}: {error:?}"
+                                        )));
+                                    }
+                                }
                             }
-                        };
+                        }
                         if resync {
                             if next_depth_resync_at_ms
                                 .get(&symbol)
@@ -1085,17 +1123,26 @@ pub async fn run(
                                 config.price_scale,
                                 config.quantity_scale,
                             )?;
-                            depth_books
+                            let buffered = depth_buffers
+                                .get(&symbol)
+                                .map(|events| events.iter().cloned().collect::<Vec<_>>())
+                                .unwrap_or_default();
+                            let consumed = depth_books
                                 .get_mut(&symbol)
                                 .ok_or_else(|| {
                                     SimulationError::Market(format!(
                                         "depth resync book disappeared for {symbol}"
                                     ))
                                 })?
-                                .load_snapshot(last_update_id, &bids, &asks)
+                                .load_snapshot_and_replay(
+                                    last_update_id,
+                                    &bids,
+                                    &asks,
+                                    &buffered,
+                                )
                                 .map_err(|error| {
                                     SimulationError::Market(format!(
-                                        "depth resync invalid for {symbol}: {error:?}"
+                                        "depth resync bridge invalid for {symbol}: {error:?}"
                                     ))
                                 })?;
                             for ledger in &mut ledgers {
@@ -1105,6 +1152,14 @@ pub async fn run(
                                     &bids,
                                     &asks,
                                 )?;
+                            }
+                            if let Some(buffer) = depth_buffers.get_mut(&symbol) {
+                                for _ in 0..consumed {
+                                    buffer.pop_front();
+                                }
+                                replay_events.extend(
+                                    buffer.drain(..).map(BinanceMarketEvent::DepthUpdate)
+                                );
                             }
                             next_depth_resync_at_ms.remove(&symbol);
                         }

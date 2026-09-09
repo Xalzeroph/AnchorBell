@@ -21,6 +21,8 @@ pub enum UserDataError {
     Transport(String),
     #[error("user data stream closed")]
     Closed,
+    #[error("user data listen key expired")]
+    ListenKeyExpired,
     #[error("user data frame exceeds configured limit")]
     FrameTooLarge,
 }
@@ -30,6 +32,13 @@ pub enum UserDataEvent {
     OrderUpdate(Box<OrderUpdate>),
     AccountUpdate(AccountUpdate),
     ListenKeyExpired,
+    /// Preserve newly introduced Binance user events for audit without
+    /// dropping the stream or pretending they changed trading state.
+    Unmodeled {
+        event_time_ms: u64,
+        event_type: String,
+        payload: Value,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -54,7 +63,9 @@ pub struct OrderUpdate {
 pub struct AccountUpdate {
     pub event_time_ms: u64,
     pub transaction_time_ms: u64,
+    pub reason: String,
     pub positions: Vec<PositionUpdate>,
+    pub balances: Vec<BalanceUpdate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -94,6 +105,26 @@ struct OrderWire {
     reduce_only: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BalanceUpdate {
+    pub asset: String,
+    pub wallet_balance: String,
+    pub cross_wallet_balance: String,
+    pub balance_change: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BalanceWire {
+    #[serde(rename = "a")]
+    asset: String,
+    #[serde(rename = "wb")]
+    wallet_balance: String,
+    #[serde(rename = "cw")]
+    cross_wallet_balance: String,
+    #[serde(rename = "bc")]
+    balance_change: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct PositionWire {
     #[serde(rename = "s")]
@@ -112,8 +143,12 @@ struct PositionWire {
 struct AccountWire {
     #[serde(rename = "T")]
     transaction_time_ms: u64,
+    #[serde(rename = "m", default)]
+    reason: String,
     #[serde(rename = "P", default)]
     positions: Vec<PositionWire>,
+    #[serde(rename = "B", default)]
+    balances: Vec<BalanceWire>,
 }
 
 pub fn parse_user_data_message(payload: &[u8]) -> Result<UserDataEvent, UserDataError> {
@@ -161,6 +196,7 @@ pub fn parse_user_data_message(payload: &[u8]) -> Result<UserDataEvent, UserData
             Ok(UserDataEvent::AccountUpdate(AccountUpdate {
                 event_time_ms,
                 transaction_time_ms: wire.transaction_time_ms,
+                reason: wire.reason,
                 positions: wire
                     .positions
                     .into_iter()
@@ -172,10 +208,24 @@ pub fn parse_user_data_message(payload: &[u8]) -> Result<UserDataEvent, UserData
                         position_side: position.position_side,
                     })
                     .collect(),
+                balances: wire
+                    .balances
+                    .into_iter()
+                    .map(|balance| BalanceUpdate {
+                        asset: balance.asset,
+                        wallet_balance: balance.wallet_balance,
+                        cross_wallet_balance: balance.cross_wallet_balance,
+                        balance_change: balance.balance_change,
+                    })
+                    .collect(),
             }))
         }
         "listenKeyExpired" => Ok(UserDataEvent::ListenKeyExpired),
-        other => Err(UserDataError::Unsupported(other.to_owned())),
+        other => Ok(UserDataEvent::Unmodeled {
+            event_time_ms,
+            event_type: other.to_owned(),
+            payload: value,
+        }),
     }
 }
 
@@ -224,13 +274,23 @@ impl BinanceUserDataStream {
                     if text.len() > self.max_frame_bytes {
                         return Err(UserDataError::FrameTooLarge);
                     }
-                    on_event(parse_user_data_message(text.as_bytes())?);
+                    let event = parse_user_data_message(text.as_bytes())?;
+                    if matches!(event, UserDataEvent::ListenKeyExpired) {
+                        on_event(event);
+                        return Err(UserDataError::ListenKeyExpired);
+                    }
+                    on_event(event);
                 }
                 Message::Binary(bytes) => {
                     if bytes.len() > self.max_frame_bytes {
                         return Err(UserDataError::FrameTooLarge);
                     }
-                    on_event(parse_user_data_message(&bytes)?);
+                    let event = parse_user_data_message(&bytes)?;
+                    if matches!(event, UserDataEvent::ListenKeyExpired) {
+                        on_event(event);
+                        return Err(UserDataError::ListenKeyExpired);
+                    }
+                    on_event(event);
                 }
                 Message::Ping(bytes) => {
                     socket
@@ -276,19 +336,19 @@ mod tests {
 
     #[test]
     fn parses_account_position_update() {
-        let payload = br#"{"e":"ACCOUNT_UPDATE","E":100,"a":{"T":101,"P":[{"s":"CXMTUSDT","pa":"2","ep":"8","up":"1","ps":"BOTH"}]}}"#;
+        let payload = br#"{"e":"ACCOUNT_UPDATE","E":100,"a":{"T":101,"m":"ORDER","B":[{"a":"USDT","wb":"100","cw":"100","bc":"0"}],"P":[{"s":"CXMTUSDT","pa":"2","ep":"8","up":"1","ps":"BOTH"}]}}"#;
         let event = parse_user_data_message(payload).unwrap();
         assert!(
-            matches!(event, UserDataEvent::AccountUpdate(value) if value.positions.len() == 1 && value.positions[0].position_amount == "2")
+            matches!(event, UserDataEvent::AccountUpdate(value) if value.positions.len() == 1 && value.positions[0].position_amount == "2" && value.balances.len() == 1)
         );
     }
 
     #[test]
-    fn unknown_events_fail_closed() {
-        let payload = br#"{"e":"UNKNOWN","E":100}"#;
+    fn new_events_are_preserved_without_tearing_down_the_stream() {
+        let payload = br#"{"e":"ACCOUNT_CONFIG_UPDATE","E":100,"T":101,"ac":{"s":"BOTH"}}"#;
         assert!(matches!(
             parse_user_data_message(payload),
-            Err(UserDataError::Unsupported(_))
+            Ok(UserDataEvent::Unmodeled { event_type, .. }) if event_type == "ACCOUNT_CONFIG_UPDATE"
         ));
     }
 }

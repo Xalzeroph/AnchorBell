@@ -21,8 +21,9 @@ use anchorbell_engine::{
     },
     market::{
         binance::{BinanceMarketEvent, BookTicker, MarkPrice},
-        quote_event, BinanceC2cFxClient, BinanceC2cFxPoller, BinanceMarketConfig,
-        BinanceMarketFeed, BinanceMarketStream, FxPollerConfig, FxUpdate, MarketTruthState,
+        quote_event, AssetClass, BinanceC2cFxClient, BinanceC2cFxPoller, BinanceMarketConfig,
+        BinanceMarketFeed, BinanceMarketStream, BinanceScaledExecutionFilters, FxPollerConfig,
+        FxUpdate, InstrumentRegistryConfig, MarketTruthState, PublicMarketMetadataClient,
     },
     runtime::load_index_anchor_set,
     runtime::{
@@ -83,6 +84,33 @@ struct WorkingOrder {
     quantity_ticks: i64,
 }
 
+fn validate_live_instruments(profile: &StrategyProfile, symbols: &[String]) -> Result<(), String> {
+    let registry = InstrumentRegistryConfig::embedded()
+        .map_err(|error| format!("cannot load instrument registry: {error}"))?;
+    let classifications = registry.by_symbol();
+    for symbol in symbols {
+        let normalized = symbol.trim().to_ascii_uppercase();
+        let classification = classifications.get(&normalized).ok_or_else(|| {
+            format!("live symbol {normalized} is missing external classification")
+        })?;
+        if classification.asset_class != profile.asset_class {
+            return Err(format!(
+                "live asset class mismatch for {normalized}: profile={:?}, symbol={:?}",
+                profile.asset_class, classification.asset_class
+            ));
+        }
+        if classification.asset_class == AssetClass::Unknown {
+            return Err(format!("live symbol {normalized} has unknown asset class"));
+        }
+        if !classification.live_enabled {
+            return Err(format!(
+                "live symbol {normalized} is not enabled by the instrument registry"
+            ));
+        }
+    }
+    Ok(())
+}
+
 const SHADOW_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, serde::Serialize)]
@@ -127,9 +155,15 @@ impl ShadowSimulation {
         anchors: BTreeMap<String, AnchorSnapshot>,
         args: &Args,
         profile: &StrategyProfile,
+        execution_filters: &BTreeMap<String, BinanceScaledExecutionFilters>,
+        funding_intervals: &BTreeMap<String, u32>,
+        maker_fee_ppm: i64,
+        taker_fee_ppm: i64,
     ) -> Result<Self, String> {
         fs::create_dir_all(shadow_dir)
             .map_err(|error| format!("shadow simulation directory failed: {error}"))?;
+        let mut emergency_execution = profile.emergency_execution;
+        emergency_execution.taker_fee_ppm = taker_fee_ppm;
         let engine = SimulationEngine::new(
             anchors,
             args.entry_threshold_bps,
@@ -137,15 +171,17 @@ impl ShadowSimulation {
             args.quantity,
             args.max_mark_index_gap_bps,
             args.max_anchor_age_ms,
-            profile.fee_schedule.maker_fee_ppm,
+            maker_fee_ppm,
             args.quantity_scale,
-            profile.emergency_execution,
+            emergency_execution,
         )
         .map_err(|error| format!("shadow simulation config rejected: {error}"))?
         .with_live_risk_gates()
         .with_strategy_variant(SimulationPolicyVariant::M4Statistical)
         .with_fee_schedule_source(profile.fee_schedule.source.clone())
-        .with_price_scale(args.price_scale);
+        .with_price_scale(args.price_scale)
+        .with_execution_filters(execution_filters.clone())
+        .with_funding_intervals(funding_intervals.clone());
         let manifest = serde_json::json!({
             "schema_version": SHADOW_SCHEMA_VERSION,
             "run_id": run_id,
@@ -153,7 +189,9 @@ impl ShadowSimulation {
             "strategy_variant": SimulationPolicyVariant::M4Statistical.label(),
             "market_event_source": "live_binance_public",
             "execution": "simulation_only",
-            "fee_ppm": profile.fee_schedule.maker_fee_ppm,
+            "fee_ppm": maker_fee_ppm,
+            "taker_fee_ppm": taker_fee_ppm,
+            "fee_source": "binance_commission_rate",
             "fee_schedule": profile.fee_schedule,
             "entry_threshold_bps": args.entry_threshold_bps,
             "max_position": args.max_position,
@@ -391,6 +429,132 @@ async fn main() {
     }
 }
 
+async fn load_execution_filters(
+    environment: BinanceEnvironment,
+    symbols: &[String],
+    price_scale: u32,
+    quantity_scale: u32,
+    proxy: Option<&str>,
+) -> Result<BTreeMap<String, BinanceScaledExecutionFilters>, String> {
+    let endpoints = environment.endpoints();
+    let metadata_client = PublicMarketMetadataClient::new(endpoints.rest_base, proxy)
+        .map_err(|error| format!("Binance metadata client rejected: {error}"))?;
+    let metadata = metadata_client
+        .exchange_info()
+        .await
+        .map_err(|error| format!("Binance exchangeInfo unavailable: {error}"))?;
+    let mut by_symbol = BTreeMap::new();
+    for item in metadata {
+        by_symbol.insert(item.symbol.to_ascii_uppercase(), item);
+    }
+    let mut result = BTreeMap::new();
+    for symbol in symbols {
+        let normalized = symbol.to_ascii_uppercase();
+        let item = by_symbol
+            .get(&normalized)
+            .ok_or_else(|| format!("exchangeInfo missing configured live symbol {normalized}"))?;
+        if item.status != "TRADING" || item.contract_type != "TRADIFI_PERPETUAL" {
+            return Err(format!(
+                "configured live symbol {normalized} is not an active TradFi perpetual: status={}, contract_type={}",
+                item.status, item.contract_type
+            ));
+        }
+        let filters = item
+            .execution_filters()
+            .map_err(|error| format!("Binance filters rejected for {normalized}: {error}"))?
+            .scaled(price_scale, quantity_scale)
+            .map_err(|error| {
+                format!("Binance filter scaling rejected for {normalized}: {error}")
+            })?;
+        result.insert(normalized, filters);
+    }
+    Ok(result)
+}
+
+fn parse_commission_ppm(value: &str) -> Option<i64> {
+    let value = value.trim();
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        || whole.parse::<u64>().ok()? > 1
+        || fraction.len() > 6
+    {
+        return None;
+    }
+    let whole_ppm = whole.parse::<i64>().ok()?.checked_mul(1_000_000)?;
+    let fraction_value = if fraction.is_empty() {
+        0
+    } else {
+        fraction
+            .parse::<i64>()
+            .ok()?
+            .checked_mul(10_i64.checked_pow((6 - fraction.len()) as u32)?)?
+    };
+    whole_ppm.checked_add(fraction_value)
+}
+
+async fn load_commission_rates(
+    client: &BinanceRestClient,
+    credentials: &BinanceCredentials,
+    symbols: &[String],
+) -> Result<(i64, i64), String> {
+    let timestamp = client
+        .server_time_ms()
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut observed = None;
+    for symbol in symbols {
+        let rate = client
+            .commission_rate(credentials, symbol, timestamp, RECV_WINDOW_MS)
+            .await
+            .map_err(|error| format!("commissionRate unavailable for {symbol}: {error}"))?;
+        let maker = parse_commission_ppm(&rate.maker_commission_rate)
+            .ok_or_else(|| format!("invalid maker commission for {symbol}"))?;
+        let taker = parse_commission_ppm(&rate.taker_commission_rate)
+            .ok_or_else(|| format!("invalid taker commission for {symbol}"))?;
+        match observed {
+            None => observed = Some((maker, taker)),
+            Some((expected_maker, expected_taker))
+                if expected_maker == maker && expected_taker == taker => {}
+            Some((expected_maker, expected_taker)) => {
+                return Err(format!(
+                    "per-symbol commission differs: {symbol} maker={maker} taker={taker}, expected maker={expected_maker} taker={expected_taker}"
+                ));
+            }
+        }
+    }
+    observed.ok_or_else(|| "commissionRate returned no symbols".to_owned())
+}
+
+async fn load_funding_intervals(
+    environment: BinanceEnvironment,
+    symbols: &[String],
+    proxy: Option<&str>,
+) -> Result<BTreeMap<String, u32>, String> {
+    let client = PublicMarketMetadataClient::new(environment.endpoints().rest_base, proxy)
+        .map_err(|error| format!("funding metadata client construction failed: {error}"))?;
+    let mut result = BTreeMap::new();
+    for symbol in symbols {
+        let normalized = symbol.trim().to_ascii_uppercase();
+        let rows = client
+            .funding_info(Some(&normalized))
+            .await
+            .map_err(|error| format!("fundingInfo unavailable for {normalized}: {error}"))?;
+        let row = rows
+            .into_iter()
+            .find(|value| value.symbol.eq_ignore_ascii_case(&normalized))
+            .ok_or_else(|| format!("fundingInfo missing configured symbol {normalized}"))?;
+        if row.funding_interval_hours == 0 {
+            return Err(format!(
+                "fundingInfo returned zero interval for {normalized}"
+            ));
+        }
+        result.insert(normalized, row.funding_interval_hours);
+    }
+    Ok(result)
+}
+
 async fn run(args: Args) -> Result<i32, String> {
     let deployment = DeploymentConfig::from_process_environment()
         .map_err(|error| format!("deployment config rejected: {error:?}"))?;
@@ -407,11 +571,57 @@ async fn run(args: Args) -> Result<i32, String> {
     }
     let strategy_profile = StrategyProfile::load("config/anchorbell-simulation.json")?;
     let symbols = strategy_profile.symbols.clone();
+    validate_live_instruments(&strategy_profile, &symbols)?;
     let client = Arc::new(
         BinanceRestClient::new(args.environment, policy, args.proxy.as_deref())
             .map_err(|error| error.to_string())?,
     );
+    let execution_filters = load_execution_filters(
+        args.environment,
+        &symbols,
+        args.price_scale,
+        args.quantity_scale,
+        args.proxy.as_deref(),
+    )
+    .await?;
+    let funding_intervals =
+        load_funding_intervals(args.environment, &symbols, args.proxy.as_deref()).await?;
+    let (maker_fee_ppm, taker_fee_ppm) =
+        load_commission_rates(&client, &credentials, &symbols).await?;
+    let position_mode = client
+        .position_mode(
+            &credentials,
+            client.server_time_ms().await.map_err(|e| e.to_string())?,
+            RECV_WINDOW_MS,
+        )
+        .await
+        .map_err(|error| format!("position mode unavailable: {error}"))?;
+    if position_mode.dual_side_position {
+        return Err(
+            "Binance account is in Hedge Mode; AnchorBell requires one-way mode before live use"
+                .to_owned(),
+        );
+    }
     let server_time = client.server_time_ms().await.map_err(|e| e.to_string())?;
+    if args.send_orders {
+        let position_mode = client
+            .position_mode(&credentials, server_time, RECV_WINDOW_MS)
+            .await
+            .map_err(|e| format!("Binance position mode preflight failed: {e}"))?;
+        if position_mode.dual_side_position {
+            return Err(
+                "Hedge Mode is not supported by this order adapter; refusing live orders".into(),
+            );
+        }
+        for symbol in &symbols {
+            client
+                .commission_rate(&credentials, symbol, server_time, RECV_WINDOW_MS)
+                .await
+                .map_err(|e| {
+                    format!("Binance account commission preflight failed for {symbol}: {e}")
+                })?;
+        }
+    }
     let run_id = format!("live-{}-{}", args.environment.as_str(), now_ms());
     let registry = RunRegistry::new("target/live-runs");
     registry
@@ -463,7 +673,11 @@ async fn run(args: Args) -> Result<i32, String> {
     .map_err(|error| format!("cannot load Binance index anchors: {error}"))?
     .anchors;
     if anchors.len() != symbols.len() {
-        return Err("anchor set is not the exact nine-symbol universe".into());
+        return Err(format!(
+            "anchor set does not exactly cover configured universe: anchors={}, symbols={}",
+            anchors.len(),
+            symbols.len()
+        ));
     }
     let shadow_dir = checkpoint_path
         .parent()
@@ -475,6 +689,10 @@ async fn run(args: Args) -> Result<i32, String> {
         anchors.clone(),
         &args,
         &strategy_profile,
+        &execution_filters,
+        &funding_intervals,
+        maker_fee_ppm,
+        taker_fee_ppm,
     )?;
     println!(
         "{}",
@@ -546,7 +764,8 @@ async fn run(args: Args) -> Result<i32, String> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(16_384);
     let market_overflow = spawn_market(&args, tx.clone(), &symbols)?;
     spawn_fx(&args, tx.clone())?;
-    spawn_user_data(&args, client.clone(), credentials.clone(), tx.clone()).await?;
+    let user_overflow =
+        spawn_user_data(&args, client.clone(), credentials.clone(), tx.clone()).await?;
 
     println!(
         "{}",
@@ -567,6 +786,7 @@ async fn run(args: Args) -> Result<i32, String> {
     let mut working = recovered_working;
     let mut order_sequence = 0_u64;
     let mut last_shadow_event_sequence = 0_u64;
+    let mut last_user_event_time_ms = 0_u64;
     let mut last_gate_blockers = Vec::<String>::new();
     let mut last_checkpoint_at_ms = 0_u64;
     let mut health_tick = tokio::time::interval(Duration::from_millis(250));
@@ -580,6 +800,13 @@ async fn run(args: Args) -> Result<i32, String> {
                     supervisor.on_disconnect();
                     return Err(
                         "market event queue overflowed or market producer stopped; risk stopped"
+                            .into(),
+                    );
+                }
+                if user_overflow.load(Ordering::Acquire) {
+                    supervisor.on_disconnect();
+                    return Err(
+                        "user data event queue overflowed; risk stopped"
                             .into(),
                     );
                 }
@@ -674,6 +901,19 @@ async fn run(args: Args) -> Result<i32, String> {
                             .map_err(|error| format!("reference health report rejected: {error}"))?;
                     }
                     Event::User(value) => {
+                        let user_event_time_ms = user_event_time_ms(&value);
+                        if user_event_time_ms > 0
+                            && user_event_time_ms < last_user_event_time_ms
+                        {
+                            println!("{}", serde_json::json!({
+                                "event": "user_event_out_of_order",
+                                "event_time_ms": user_event_time_ms,
+                                "last_event_time_ms": last_user_event_time_ms,
+                            }));
+                            continue;
+                        }
+                        last_user_event_time_ms =
+                            last_user_event_time_ms.max(user_event_time_ms);
                         apply_user(&mut state, &mut working, &value, args.quantity_scale)?;
                         let live_position_ticks = state.values().fold(0_i64, |total, item| {
                             total.saturating_add(item.position_ticks)
@@ -836,6 +1076,15 @@ async fn run(args: Args) -> Result<i32, String> {
                                         now,
                                         sequence: order_sequence,
                                         reduce_only: false,
+                                        execution_filters: *execution_filters
+                                            .get(symbol)
+                                            .ok_or_else(|| format!("missing execution filters for {symbol}"))?,
+                                        mark_price_ticks: local
+                                            .mark
+                                            .as_ref()
+                                            .ok_or_else(|| format!("missing mark price for {symbol}"))?
+                                            .mark_price
+                                            .0,
                                     }).await?;
                                     shadow.live_order_submitted(&order.client_order_id, now);
                                     println!("{}", serde_json::json!({
@@ -899,6 +1148,15 @@ async fn run(args: Args) -> Result<i32, String> {
                                         now,
                                         sequence: order_sequence,
                                         reduce_only: true,
+                                        execution_filters: *execution_filters
+                                            .get(symbol)
+                                            .ok_or_else(|| format!("missing execution filters for {symbol}"))?,
+                                        mark_price_ticks: local
+                                            .mark
+                                            .as_ref()
+                                            .ok_or_else(|| format!("missing mark price for {symbol}"))?
+                                            .mark_price
+                                            .0,
                                     }).await?;
                                             working.insert(symbol.clone(), order);
                                         }
@@ -1057,6 +1315,12 @@ async fn reconcile_account(
         if rows.next().is_some() {
             return Err(format!("multiple position legs for {symbol}"));
         }
+        if row.position_side != "BOTH" {
+            return Err(format!(
+                "hedge mode position leg {symbol}/{:?} is unsupported; live orders are one-way only",
+                row.position_side
+            ));
+        }
         let position = parse_ticks(&row.position_amount, quantity_scale)
             .ok_or_else(|| format!("invalid position precision for {symbol}"))?;
         states.insert(
@@ -1125,6 +1389,15 @@ fn ewma(previous: i64, sample: i64) -> i64 {
     }
 }
 
+fn user_event_time_ms(event: &UserDataEvent) -> u64 {
+    match event {
+        UserDataEvent::OrderUpdate(value) => value.event_time_ms,
+        UserDataEvent::AccountUpdate(value) => value.event_time_ms,
+        UserDataEvent::ListenKeyExpired => 0,
+        UserDataEvent::Unmodeled { event_time_ms, .. } => *event_time_ms,
+    }
+}
+
 fn apply_user(
     state: &mut BTreeMap<String, SymbolState>,
     working: &mut BTreeMap<String, WorkingOrder>,
@@ -1151,6 +1424,7 @@ fn apply_user(
             }
         }
         UserDataEvent::ListenKeyExpired => {}
+        UserDataEvent::Unmodeled { .. } => {}
     }
     Ok(())
 }
@@ -1192,7 +1466,11 @@ fn spawn_market(
     symbols: &[String],
 ) -> Result<Arc<AtomicBool>, String> {
     let endpoints = args.environment.endpoints();
-    let shards = BinanceMarketConfig::for_symbols(
+    let reconnect = anchorbell_engine::market::ReconnectPolicy {
+        max_attempts: None,
+        ..Default::default()
+    };
+    let mut shards = BinanceMarketConfig::for_symbols(
         endpoints.market_ws_base,
         symbols,
         BinanceMarketFeed::ReferenceAndTrades,
@@ -1202,13 +1480,26 @@ fn spawn_market(
         5_000,
         15_000,
         args.proxy.clone(),
-        anchorbell_engine::market::ReconnectPolicy {
-            max_attempts: None,
-            ..Default::default()
-        },
+        reconnect.clone(),
         args.max_subscriptions_per_shard,
     )
     .map_err(|e| format!("{e:?}"))?;
+    let mut book_ticker_shards = BinanceMarketConfig::for_symbols(
+        endpoints.public_market_ws_base,
+        symbols,
+        BinanceMarketFeed::BookTicker,
+        args.price_scale,
+        args.quantity_scale,
+        MAX_FRAME_BYTES,
+        5_000,
+        15_000,
+        args.proxy.clone(),
+        reconnect,
+        args.max_subscriptions_per_shard,
+    )
+    .map_err(|e| format!("{e:?}"))?;
+    shards.append(&mut book_ticker_shards);
+
     let market_overflow = Arc::new(AtomicBool::new(false));
     for shard in shards {
         let producer = tx.clone();
@@ -1254,7 +1545,7 @@ async fn spawn_user_data(
     client: Arc<BinanceRestClient>,
     credentials: BinanceCredentials,
     tx: tokio::sync::mpsc::Sender<Event>,
-) -> Result<String, String> {
+) -> Result<Arc<AtomicBool>, String> {
     let initial_listen_key = client
         .start_user_data_stream(&credentials)
         .await
@@ -1262,6 +1553,8 @@ async fn spawn_user_data(
     let environment = args.environment;
     let proxy = args.proxy.clone();
     let task_tx = tx.clone();
+    let user_overflow = Arc::new(AtomicBool::new(false));
+    let user_overflow_for_task = Arc::clone(&user_overflow);
     let initial_for_task = initial_listen_key.clone();
     tokio::spawn(async move {
         let mut listen_key = initial_for_task;
@@ -1302,9 +1595,12 @@ async fn spawn_user_data(
                 }
             });
             let event_tx = task_tx.clone();
+            let overflow = Arc::clone(&user_overflow_for_task);
             let result = tokio::select! {
                 result = stream.run(|event| {
-                    let _ = event_tx.try_send(Event::User(event));
+                    if event_tx.try_send(Event::User(event)).is_err() {
+                        overflow.store(true, Ordering::Release);
+                    }
                 }) => format!("user data stream ended: {result:?}"),
                 result = &mut keepalive_task => format!("user data keepalive ended: {result:?}"),
             };
@@ -1330,7 +1626,7 @@ async fn spawn_user_data(
             }
         }
     });
-    Ok(initial_listen_key)
+    Ok(user_overflow)
 }
 
 // This edge adapter keeps authentication, order identity, and exchange scales explicit.
@@ -1386,6 +1682,8 @@ struct PlaceOrderRequest<'a> {
     now: u64,
     sequence: u64,
     reduce_only: bool,
+    execution_filters: BinanceScaledExecutionFilters,
+    mark_price_ticks: i64,
 }
 
 async fn place_order(request: PlaceOrderRequest<'_>) -> Result<WorkingOrder, String> {
@@ -1399,7 +1697,20 @@ async fn place_order(request: PlaceOrderRequest<'_>) -> Result<WorkingOrder, Str
         now,
         sequence,
         reduce_only,
+        execution_filters,
+        mark_price_ticks,
     } = request;
+    execution_filters
+        .validate_order(
+            intent.price,
+            intent.quantity,
+            mark_price_ticks,
+            intent.side == Side::Buy,
+            quantity_scale,
+        )
+        .map_err(|reason| {
+            format!("Binance exchange filter rejected order for {symbol}: {reason}")
+        })?;
     let client_order_id = format!("anchorbell-{}-{}", now, sequence);
     let server_time = client.server_time_ms().await.map_err(|e| e.to_string())?;
     if intent.is_emergency_taker() {

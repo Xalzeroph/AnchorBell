@@ -76,7 +76,7 @@ pub struct BinanceSymbolFilter {
     pub multiplier_down: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BinanceExecutionFilters {
     pub min_price: String,
     pub max_price: String,
@@ -87,6 +87,122 @@ pub struct BinanceExecutionFilters {
     pub min_notional: String,
     pub multiplier_up: String,
     pub multiplier_down: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BinanceScaledExecutionFilters {
+    pub min_price_ticks: i64,
+    pub max_price_ticks: i64,
+    pub price_tick: i64,
+    pub min_quantity_units: i64,
+    pub max_quantity_units: i64,
+    pub quantity_step: i64,
+    pub min_notional_price_ticks: i64,
+    pub multiplier_up_ppm: i64,
+    pub multiplier_down_ppm: i64,
+}
+
+impl BinanceExecutionFilters {
+    pub fn scaled(
+        &self,
+        price_scale: u32,
+        quantity_scale: u32,
+    ) -> Result<BinanceScaledExecutionFilters, PublicMetadataError> {
+        let price = |value: &str| {
+            super::binance::parse_price_ticks(value, price_scale)
+                .map(|value| value.0)
+                .map_err(|_| PublicMetadataError::InvalidExchangeFilter {
+                    filter: "PRICE_FILTER",
+                    field: "scaled_value",
+                })
+        };
+        let quantity = |value: &str| {
+            super::binance::parse_quantity(value, quantity_scale)
+                .map(|value| value.0)
+                .map_err(|_| PublicMetadataError::InvalidExchangeFilter {
+                    filter: "LOT_SIZE",
+                    field: "scaled_value",
+                })
+        };
+        let multiplier = |value: &str| {
+            super::binance::parse_price_ticks(value, 6)
+                .map(|value| value.0)
+                .map_err(|_| PublicMetadataError::InvalidExchangeFilter {
+                    filter: "PERCENT_PRICE",
+                    field: "scaled_value",
+                })
+        };
+        Ok(BinanceScaledExecutionFilters {
+            min_price_ticks: price(&self.min_price)?,
+            max_price_ticks: price(&self.max_price)?,
+            price_tick: price(&self.price_tick)?,
+            min_quantity_units: quantity(&self.min_quantity)?,
+            max_quantity_units: quantity(&self.max_quantity)?,
+            quantity_step: quantity(&self.quantity_step)?,
+            min_notional_price_ticks: price(&self.min_notional)?,
+            multiplier_up_ppm: multiplier(&self.multiplier_up)?,
+            multiplier_down_ppm: multiplier(&self.multiplier_down)?,
+        })
+    }
+}
+
+impl BinanceScaledExecutionFilters {
+    pub fn validate_order(
+        self,
+        price_ticks: i64,
+        quantity_units: i64,
+        mark_price_ticks: i64,
+        is_buy: bool,
+        quantity_scale: u32,
+    ) -> Result<(), &'static str> {
+        if price_ticks <= 0 || quantity_units <= 0 || mark_price_ticks <= 0 {
+            return Err("exchange_order_non_positive");
+        }
+        if price_ticks < self.min_price_ticks {
+            return Err("exchange_price_below_min");
+        }
+        if price_ticks > self.max_price_ticks {
+            return Err("exchange_price_above_max");
+        }
+        if self.price_tick <= 0 || price_ticks % self.price_tick != 0 {
+            return Err("exchange_price_tick");
+        }
+        if quantity_units < self.min_quantity_units {
+            return Err("exchange_quantity_below_min");
+        }
+        if quantity_units > self.max_quantity_units {
+            return Err("exchange_quantity_above_max");
+        }
+        if self.quantity_step <= 0 || quantity_units % self.quantity_step != 0 {
+            return Err("exchange_quantity_step");
+        }
+        let quantity_factor = 10_i128
+            .checked_pow(quantity_scale)
+            .ok_or("exchange_quantity_scale")?;
+        let notional = i128::from(price_ticks)
+            .checked_mul(i128::from(quantity_units))
+            .ok_or("exchange_notional_overflow")?;
+        let minimum = i128::from(self.min_notional_price_ticks)
+            .checked_mul(quantity_factor)
+            .ok_or("exchange_notional_overflow")?;
+        if notional < minimum {
+            return Err("exchange_min_notional");
+        }
+        let price_factor = i128::from(price_ticks)
+            .checked_mul(1_000_000)
+            .ok_or("exchange_percent_price_overflow")?;
+        let mark_limit = i128::from(mark_price_ticks)
+            .checked_mul(i128::from(if is_buy {
+                self.multiplier_up_ppm
+            } else {
+                self.multiplier_down_ppm
+            }))
+            .ok_or("exchange_percent_price_overflow")?;
+        if (is_buy && price_factor > mark_limit) || (!is_buy && price_factor < mark_limit) {
+            return Err("exchange_percent_price");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -150,6 +266,9 @@ pub struct BinancePremiumIndexSnapshot {
     pub last_funding_rate: String,
     #[serde(rename = "nextFundingTime")]
     pub next_funding_time_ms: u64,
+    /// Binance exchange-side observation time, not local receipt time.
+    #[serde(default)]
+    pub time: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -433,19 +552,29 @@ static PUBLIC_REST_GOVERNOR: OnceLock<Arc<tokio::sync::Mutex<PublicRestGovernor>
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublicRestRequestClass {
     Generic,
-    Depth,
+    Depth(usize),
     Funding,
     ExchangeInfo,
+    IndexPriceKline,
 }
 
 impl PublicRestRequestClass {
+    fn query_limit(path: &str) -> usize {
+        path.split('&')
+            .find_map(|part| part.strip_prefix("limit="))
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(100)
+    }
+
     fn from_path(path: &str) -> Self {
         if path.contains("/depth") {
-            Self::Depth
-        } else if path.contains("/fundingRate") {
+            Self::Depth(Self::query_limit(path))
+        } else if path.contains("/fundingRate") || path.contains("/fundingInfo") {
             Self::Funding
         } else if path.contains("/exchangeInfo") {
             Self::ExchangeInfo
+        } else if path.contains("/indexPriceKlines") {
+            Self::IndexPriceKline
         } else {
             Self::Generic
         }
@@ -453,7 +582,14 @@ impl PublicRestRequestClass {
 
     fn weight(self) -> f64 {
         match self {
-            Self::Depth => 5.0,
+            Self::Depth(limit) => match limit {
+                5 | 10 | 20 | 50 => 2.0,
+                100 => 5.0,
+                500 => 10.0,
+                1_000 => 20.0,
+                _ => 20.0,
+            },
+            Self::IndexPriceKline => 10.0,
             Self::Funding | Self::ExchangeInfo | Self::Generic => 1.0,
         }
     }
@@ -856,8 +992,12 @@ async fn read_premium_index_cache(
         return None;
     }
     Some(BinanceTimedPremiumIndexSnapshot {
+        observed_at_ms: if cache.snapshot.time > 0 {
+            cache.snapshot.time
+        } else {
+            cache.fetched_at_ms
+        },
         snapshot: cache.snapshot,
-        observed_at_ms: cache.fetched_at_ms,
     })
 }
 
@@ -1257,7 +1397,10 @@ impl PublicMarketMetadataClient {
                 if snapshot.symbol != symbol {
                     return Err(PublicMetadataError::SymbolMismatch);
                 }
-                let observed_at_ms = current_time_ms();
+                if snapshot.time == 0 {
+                    return Err(PublicMetadataError::StaleSnapshot);
+                }
+                let observed_at_ms = snapshot.time;
                 if let Err(error) =
                     write_premium_index_cache(&self.rest_base, &symbol, &snapshot).await
                 {
@@ -1459,6 +1602,7 @@ mod tests {
                 index_price: "8.27850".into(),
                 last_funding_rate: "-0.00010000".into(),
                 next_funding_time_ms: 2_000,
+                time: 1_000,
             },
         }
     }
@@ -1512,6 +1656,15 @@ mod tests {
         assert_eq!(
             PublicRestRequestClass::from_path("/fapi/v1/exchangeInfo").weight(),
             1.0
+        );
+        assert_eq!(
+            PublicRestRequestClass::from_path("/fapi/v1/depth?symbol=CXMTUSDT&limit=1000").weight(),
+            20.0
+        );
+        assert_eq!(
+            PublicRestRequestClass::from_path("/fapi/v1/indexPriceKlines?pair=CXMTUSDT&limit=1500")
+                .weight(),
+            10.0
         );
     }
 

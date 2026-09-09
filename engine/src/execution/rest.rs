@@ -172,6 +172,24 @@ pub struct BinanceAccountSnapshot {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct BinancePositionMode {
+    #[serde(rename = "dualSidePosition")]
+    pub dual_side_position: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct BinanceCommissionRate {
+    #[serde(rename = "symbol")]
+    pub symbol: String,
+    #[serde(rename = "makerCommissionRate")]
+    pub maker_commission_rate: String,
+    #[serde(rename = "takerCommissionRate")]
+    pub taker_commission_rate: String,
+    #[serde(rename = "rpiCommissionRate", default)]
+    pub rpi_commission_rate: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct BinanceTradFiContractResponse {
     pub code: i64,
     pub msg: String,
@@ -638,6 +656,62 @@ impl BinanceRestClient {
             });
         }
         Ok(response)
+    }
+
+    pub async fn position_mode(
+        &self,
+        credentials: &BinanceCredentials,
+        timestamp_ms: u64,
+        recv_window_ms: u64,
+    ) -> Result<BinancePositionMode, BinanceRestError> {
+        let body = self
+            .execute_signed(
+                Method::GET,
+                "/fapi/v1/positionSide/dual",
+                BTreeMap::new(),
+                credentials,
+                timestamp_ms,
+                recv_window_ms,
+                false,
+            )
+            .await?;
+        serde_json::from_slice(&body).map_err(|_| BinanceRestError::Decode)
+    }
+
+    pub async fn commission_rate(
+        &self,
+        credentials: &BinanceCredentials,
+        symbol: &str,
+        timestamp_ms: u64,
+        recv_window_ms: u64,
+    ) -> Result<BinanceCommissionRate, BinanceRestError> {
+        if !valid_symbol(symbol) {
+            return Err(BinanceRestError::InvalidOrderRequest("symbol"));
+        }
+        let mut params = BTreeMap::new();
+        params.insert("symbol".into(), symbol.to_owned());
+        let body = self
+            .execute_signed(
+                Method::GET,
+                "/fapi/v1/commissionRate",
+                params,
+                credentials,
+                timestamp_ms,
+                recv_window_ms,
+                false,
+            )
+            .await?;
+        let value: BinanceCommissionRate =
+            serde_json::from_slice(&body).map_err(|_| BinanceRestError::Decode)?;
+        if value.symbol != symbol
+            || value.maker_commission_rate.is_empty()
+            || value.taker_commission_rate.is_empty()
+        {
+            return Err(BinanceRestError::InvalidOrderResponse(
+                "commission identity/rates",
+            ));
+        }
+        Ok(value)
     }
 
     pub async fn authoritative_account_snapshot(

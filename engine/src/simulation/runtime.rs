@@ -36,7 +36,8 @@ use crate::{
         binance::{AggTrade, BinanceMarketEvent, BookTicker, MarkPrice},
         recorder::{add_event_lineage, market_event_to_json},
         BinanceC2cFxClient, BinanceC2cFxPoller, BinanceMarketConfig, BinanceMarketFeed,
-        BinanceMarketStream, FxPollerConfig, FxUpdate, PublicMarketMetadataClient, ReconnectPolicy,
+        BinanceMarketStream, BinanceScaledExecutionFilters, FxPollerConfig, FxUpdate,
+        PublicMarketMetadataClient, ReconnectPolicy,
     },
     observability::{DecisionAudit, DecisionGateAudit, DECISION_AUDIT_SCHEMA_VERSION},
     orderbook::LocalOrderBook,
@@ -703,6 +704,8 @@ struct SimulationSymbolState {
     mark_price_ticks: Option<i64>,
     index_price_ticks: Option<i64>,
     next_funding_time_ms: u64,
+    /// Contract-level settlement interval fetched from Binance fundingInfo.
+    funding_interval_hours: u32,
     /// Exchange event time used for ordering, funding, and signal-age semantics.
     last_mark_time_ms: u64,
     /// Local receipt time used exclusively for transport/data-freshness gating.
@@ -1107,6 +1110,7 @@ pub struct SimulationEngine {
     last_dynamic_capital_update_ms: u64,
     causal_ledger: CausalLedger,
     emergency_policy: EmergencyExecutionPolicy,
+    execution_filters: BTreeMap<String, BinanceScaledExecutionFilters>,
 }
 
 impl SimulationEngine {
@@ -1151,6 +1155,7 @@ impl SimulationEngine {
                         mark_price_ticks: None,
                         index_price_ticks: None,
                         next_funding_time_ms: 0,
+                        funding_interval_hours: 8,
                         last_mark_time_ms: 0,
                         last_mark_received_at_ms: 0,
                         last_trade_id: None,
@@ -1237,6 +1242,7 @@ impl SimulationEngine {
             last_dynamic_capital_update_ms: 0,
             causal_ledger: CausalLedger::default(),
             emergency_policy,
+            execution_filters: BTreeMap::new(),
         })
     }
 
@@ -1335,6 +1341,23 @@ impl SimulationEngine {
 
     pub fn with_price_scale(mut self, price_scale: u32) -> Self {
         self.price_scale = price_scale;
+        self
+    }
+
+    pub fn with_execution_filters(
+        mut self,
+        execution_filters: BTreeMap<String, BinanceScaledExecutionFilters>,
+    ) -> Self {
+        self.execution_filters = execution_filters;
+        self
+    }
+
+    pub fn with_funding_intervals(mut self, funding_intervals: BTreeMap<String, u32>) -> Self {
+        for (symbol, interval_hours) in funding_intervals {
+            if let Some(state) = self.states.get_mut(&symbol) {
+                state.funding_interval_hours = interval_hours.max(1);
+            }
+        }
         self
     }
 
@@ -2830,6 +2853,7 @@ impl SimulationEngine {
                         self.emergency_policy,
                         self.fee_ppm,
                         self.max_mark_index_gap_bps,
+                        state.funding_interval_hours,
                     );
                     (desired, true, state.working.is_some(), exit_reason)
                 }
@@ -3158,6 +3182,23 @@ impl SimulationEngine {
         reduce_only: bool,
         decision_id: Option<u64>,
     ) -> Vec<SimulationRecord> {
+        if let Some(filters) = self.execution_filters.get(symbol).copied() {
+            let mark_price_ticks = self
+                .states
+                .get(symbol)
+                .and_then(|state| state.mark_price_ticks)
+                .unwrap_or_default();
+            if let Err(reason) = filters.validate_order(
+                intent.price,
+                intent.quantity,
+                mark_price_ticks,
+                intent.side == Side::Buy,
+                self.quantity_scale,
+            ) {
+                self.reject_entry(reason);
+                return Vec::new();
+            }
+        }
         if !intent.is_admissible_shape() {
             return Vec::new();
         }
@@ -3780,6 +3821,7 @@ fn maker_exit_intent_for_state(
     emergency_policy: EmergencyExecutionPolicy,
     fee_ppm: i64,
     max_mark_index_gap_bps: i64,
+    funding_interval_hours: u32,
 ) -> (Option<OrderIntent>, &'static str) {
     let Some(position_quantity) = state.position.checked_abs() else {
         return (None, "maker_exit_position_overflow");
@@ -3793,7 +3835,7 @@ fn maker_exit_intent_for_state(
     let funding = if state.next_funding_time_ms > timestamp_ms {
         FundingSchedule::new(
             Some(state.next_funding_time_ms),
-            Some(8),
+            Some(funding_interval_hours.max(1)),
             state.latest_funding_rate_e8.map(|rate| rate / 100),
             FundingRateKind::Regular,
             timestamp_ms,

@@ -46,6 +46,9 @@ pub struct LocalOrderBook {
     asks: BTreeMap<i64, i64>,
     last_update_id: Option<u64>,
     valid: bool,
+    /// The first diff after a REST snapshot uses Binance's bridge rule
+    /// (U <= lastUpdateId + 1 <= u); pu continuity applies thereafter.
+    awaiting_first_diff: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +70,57 @@ pub enum OrderBookError {
 }
 
 impl LocalOrderBook {
+    /// Applies Binance's REST/WebSocket bridge rule to buffered depth events.
+    pub fn load_snapshot_and_replay(
+        &mut self,
+        last_update_id: u64,
+        bids: &[(i64, i64)],
+        asks: &[(i64, i64)],
+        buffered: &[DepthUpdate],
+    ) -> Result<usize, OrderBookError> {
+        self.load_snapshot(last_update_id, bids, asks)?;
+        let Some(first_index) = buffered.iter().position(|update| {
+            update.first_update_id <= last_update_id && update.final_update_id >= last_update_id
+        }) else {
+            self.valid = false;
+            return Err(OrderBookError::SequenceGap {
+                expected: last_update_id,
+                first: buffered.first().map_or(0, |u| u.first_update_id),
+                previous: buffered.first().and_then(|u| u.previous_final_update_id),
+            });
+        };
+        self.apply_bridge(&buffered[first_index])?;
+        let mut consumed = first_index + 1;
+        for update in buffered.iter().skip(consumed) {
+            self.apply_diff(update)?;
+            consumed += 1;
+        }
+        Ok(consumed)
+    }
+
+    fn apply_bridge(&mut self, update: &DepthUpdate) -> Result<(), OrderBookError> {
+        let last = self
+            .last_update_id
+            .ok_or(OrderBookError::SnapshotRequired)?;
+        if update.first_update_id > last || update.final_update_id < last {
+            self.valid = false;
+            return Err(OrderBookError::SequenceGap {
+                expected: last,
+                first: update.first_update_id,
+                previous: update.previous_final_update_id,
+            });
+        }
+        for level in &update.bids {
+            insert_level(&mut self.bids, level.price.0, level.quantity.0)?;
+        }
+        for level in &update.asks {
+            insert_level(&mut self.asks, level.price.0, level.quantity.0)?;
+        }
+        validate_crossed(&self.bids, &self.asks)?;
+        self.last_update_id = Some(update.final_update_id);
+        Ok(())
+    }
+
     pub fn load_snapshot(
         &mut self,
         last_update_id: u64,
@@ -86,6 +140,7 @@ impl LocalOrderBook {
         self.asks = next_asks;
         self.last_update_id = Some(last_update_id);
         self.valid = true;
+        self.awaiting_first_diff = true;
         Ok(())
     }
 
@@ -102,9 +157,7 @@ impl LocalOrderBook {
         let expected = last.saturating_add(1);
         let sequence_ok = update.first_update_id <= expected
             && update.final_update_id >= expected
-            && update
-                .previous_final_update_id
-                .is_none_or(|previous| previous == last);
+            && (self.awaiting_first_diff || update.previous_final_update_id == Some(last));
         if !sequence_ok {
             self.valid = false;
             return Err(OrderBookError::SequenceGap {
@@ -124,6 +177,7 @@ impl LocalOrderBook {
             return Err(error);
         }
         self.last_update_id = Some(update.final_update_id);
+        self.awaiting_first_diff = false;
         Ok(DepthApplyResult::Applied)
     }
 

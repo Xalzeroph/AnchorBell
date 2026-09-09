@@ -181,6 +181,7 @@ mod tests {
                 index_price: "8.27850".into(),
                 last_funding_rate: "-0.00010000".into(),
                 next_funding_time_ms: 2_000,
+                time: 1_000,
             },
             observed_at_ms,
         }
