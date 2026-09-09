@@ -53,7 +53,12 @@ register_method!(
     MethodLayer::Risk,
     None,
     SimulationPolicyVariant::CoreV1,
-    &["permanent_core", "binance_safety", "tail_risk_guard", "evidence_circuit_breaker"],
+    &[
+        "permanent_core",
+        "binance_safety",
+        "tail_risk_guard",
+        "evidence_circuit_breaker"
+    ],
     &[
         "adaptive_risk",
         "exchange_filters",

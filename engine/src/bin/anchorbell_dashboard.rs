@@ -974,12 +974,29 @@ fn compact_value(value: &Value, depth: usize) -> Value {
         Value::Array(values) => {
             const MAX_ITEMS: usize = 64;
             if values.len() <= MAX_ITEMS {
-                return Value::Array(values.iter().map(|child| compact_value(child, depth + 1)).collect());
+                return Value::Array(
+                    values
+                        .iter()
+                        .map(|child| compact_value(child, depth + 1))
+                        .collect(),
+                );
             }
             let mut compact = Vec::with_capacity(MAX_ITEMS + 1);
             compact.push(json!({"_truncated_items": values.len() - MAX_ITEMS}));
-            compact.extend(values.iter().take(MAX_ITEMS / 2).map(|child| compact_value(child, depth + 1)));
-            compact.extend(values.iter().rev().take(MAX_ITEMS / 2).rev().map(|child| compact_value(child, depth + 1)));
+            compact.extend(
+                values
+                    .iter()
+                    .take(MAX_ITEMS / 2)
+                    .map(|child| compact_value(child, depth + 1)),
+            );
+            compact.extend(
+                values
+                    .iter()
+                    .rev()
+                    .take(MAX_ITEMS / 2)
+                    .rev()
+                    .map(|child| compact_value(child, depth + 1)),
+            );
             Value::Array(compact)
         }
         _ => value.clone(),
@@ -1043,22 +1060,28 @@ fn latest_fx_quotes(run_dir: &Path) -> Value {
 
 async fn runs_response() -> (u16, &'static str, Vec<u8>) {
     let Some(root) = external_batch_root() else {
-        return json_response(200, json!({
-            "ok": true,
-            "observed_at_ms": now_ms(),
-            "run_count": 0,
-            "runs": [],
-        }));
+        return json_response(
+            200,
+            json!({
+                "ok": true,
+                "observed_at_ms": now_ms(),
+                "run_count": 0,
+                "runs": [],
+            }),
+        );
     };
     let latest_dir = latest_external_batch().map(|(path, _)| path);
     let mut runs = Vec::new();
     let Ok(entries) = fs::read_dir(&root) else {
-        return json_response(200, json!({
-            "ok": true,
-            "observed_at_ms": now_ms(),
-            "run_count": 0,
-            "runs": [],
-        }));
+        return json_response(
+            200,
+            json!({
+                "ok": true,
+                "observed_at_ms": now_ms(),
+                "run_count": 0,
+                "runs": [],
+            }),
+        );
     };
     for entry in entries.flatten() {
         let run_dir = entry.path();
@@ -1071,25 +1094,48 @@ async fn runs_response() -> (u16, &'static str, Vec<u8>) {
         if manifest.is_none() && index.is_none() {
             continue;
         }
-        let created_at_ms = manifest.as_ref()
+        let created_at_ms = manifest
+            .as_ref()
             .and_then(|v| v.get("created_at_ms").and_then(Value::as_u64))
-            .or_else(|| index.as_ref().and_then(|v| v.get("created_at_ms").and_then(Value::as_u64)))
+            .or_else(|| {
+                index
+                    .as_ref()
+                    .and_then(|v| v.get("created_at_ms").and_then(Value::as_u64))
+            })
             .unwrap_or_default();
-        let run_id = status.as_ref()
+        let run_id = status
+            .as_ref()
             .and_then(|v| v.get("run_id").and_then(Value::as_str))
-            .or_else(|| index.as_ref().and_then(|v| v.get("run_id").and_then(Value::as_str)))
+            .or_else(|| {
+                index
+                    .as_ref()
+                    .and_then(|v| v.get("run_id").and_then(Value::as_str))
+            })
             .unwrap_or_default();
-        let run_status = status.as_ref()
+        let run_status = status
+            .as_ref()
             .and_then(|v| v.get("status").and_then(Value::as_str))
-            .or_else(|| index.as_ref().and_then(|v| v.get("status").and_then(Value::as_str)))
+            .or_else(|| {
+                index
+                    .as_ref()
+                    .and_then(|v| v.get("status").and_then(Value::as_str))
+            })
             .unwrap_or("unknown");
-        let definitions = index.as_ref()
+        let definitions = index
+            .as_ref()
             .and_then(|v| v.get("experiments"))
-            .or_else(|| manifest.as_ref().and_then(|v| v.get("experiment_definitions")));
+            .or_else(|| {
+                manifest
+                    .as_ref()
+                    .and_then(|v| v.get("experiment_definitions"))
+            });
         let mut methods = Vec::new();
         if let Some(definitions) = definitions.and_then(Value::as_array) {
             for definition in definitions {
-                let id = definition.get("experiment_id").and_then(Value::as_str).unwrap_or_default();
+                let id = definition
+                    .get("experiment_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 if id.is_empty() {
                     continue;
                 }
@@ -1097,17 +1143,23 @@ async fn runs_response() -> (u16, &'static str, Vec<u8>) {
                 let detailed = latest_dir.as_ref().is_some_and(|path| path == &run_dir);
                 let symbols = if detailed {
                     compact_value(
-                        metrics.as_ref().and_then(|v| v.get("symbols")).unwrap_or(&Value::Null),
+                        metrics
+                            .as_ref()
+                            .and_then(|v| v.get("symbols"))
+                            .unwrap_or(&Value::Null),
                         0,
                     )
                 } else {
                     Value::Array(
-                        metrics.as_ref()
+                        metrics
+                            .as_ref()
                             .and_then(|v| v.get("symbols"))
                             .and_then(Value::as_array)
                             .into_iter()
                             .flatten()
-                            .filter_map(|symbol| symbol.get("symbol").map(|name| json!({"symbol": name})))
+                            .filter_map(|symbol| {
+                                symbol.get("symbol").map(|name| json!({"symbol": name}))
+                            })
                             .collect(),
                     )
                 };
@@ -1186,15 +1238,22 @@ async fn runs_response() -> (u16, &'static str, Vec<u8>) {
             "index": index_view(index.as_ref()),
         }));
     }
-    runs.sort_by_key(|run| run.get("created_at_ms").and_then(Value::as_u64).unwrap_or_default());
+    runs.sort_by_key(|run| {
+        run.get("created_at_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+    });
     runs.reverse();
-    json_response(200, json!({
-        "ok": true,
-        "observed_at_ms": now_ms(),
-        "root": root.display().to_string(),
-        "run_count": runs.len(),
-        "runs": runs,
-    }))
+    json_response(
+        200,
+        json!({
+            "ok": true,
+            "observed_at_ms": now_ms(),
+            "root": root.display().to_string(),
+            "run_count": runs.len(),
+            "runs": runs,
+        }),
+    )
 }
 
 fn downsample_history(value: Option<&Value>) -> Value {
