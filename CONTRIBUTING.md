@@ -12,6 +12,6 @@ external exchange adapters.
 - Run `cargo fmt --all -- --check` and `cargo test --workspace --locked`.
 - Never include API keys, account data, or authenticated payloads.
 
-Keep commits narrow and describe the exact verification performed. Changes that
-weaken maker-only execution, session flattening, stale-data handling, or
-production safety require explicit design discussion.
+Keep commits narrow and describe the exact verification performed. Changes that weaken maker-first execution, session flattening, stale-data handling,
+production safety, or the registered reduce-only emergency taker policy require
+explicit design discussion.
