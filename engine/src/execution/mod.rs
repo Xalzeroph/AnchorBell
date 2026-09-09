@@ -72,7 +72,7 @@ pub use deployment::{
 pub use environment::{BinanceEndpoints, BinanceEnvironment, EnvironmentParseError};
 pub use funding_risk::{FundingAwareRiskGate, FundingRiskAction, FundingRiskInput};
 pub use gateway::{ExchangeOrder, ExecutionGateway, GatewayResult, SimulationGateway};
-pub use intent::{OrderIntent, Side};
+pub use intent::{OrderIntent, OrderIntentError, Side};
 pub use lifecycle::{LifecycleError, LifecycleEvent, MakerOrder, OrderStatus};
 pub use lifecycle_contract::{
     ExecutionMode, LifecycleAuthority, OrderLifecycleState, UnifiedOrderEvent, UnifiedOrderState,
