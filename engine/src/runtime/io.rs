@@ -14,6 +14,9 @@ use sha2::{Digest, Sha256};
 use tokio::{io::AsyncWriteExt, sync::mpsc, task::JoinHandle};
 
 const LINE_WRITER_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+const INITIAL_ZSTD_LEVEL: i32 = 3;
+const DEEP_ZSTD_LEVEL: i32 = 9;
+const DEEP_RECOMPRESS_MIN_SAVINGS_BPS: u64 = 100;
 
 pub struct AsyncLineWriter {
     pub sender: mpsc::Sender<String>,
@@ -170,7 +173,7 @@ fn compress_segment_blocking(
             error,
         )
     })?;
-    let mut encoder = zstd::stream::write::Encoder::new(archive, 3)
+    let mut encoder = zstd::stream::write::Encoder::new(archive, INITIAL_ZSTD_LEVEL)
         .map_err(|error| io_context("create zstd encoder", &raw_path, error))?;
     let mut buffer = vec![0_u8; 1024 * 1024];
     let mut hasher = Sha256::new();
@@ -212,10 +215,13 @@ fn compress_segment_blocking(
     }
     std::fs::rename(&temporary_archive, &archive_path)
         .map_err(|error| io_context("publish zstd line-writer archive", &archive_path, error))?;
+    let (compression_level, compressed_bytes) =
+        maybe_deep_recompress(&archive_path, compressed_bytes)?;
     let metadata = serde_json::json!({
         "schema_version": 1,
         "compression": "zstd",
-        "compression_level": 3,
+        "compression_level": compression_level,
+        "compression_stage": if compression_level == DEEP_ZSTD_LEVEL { "deep" } else { "base" },
         "uncompressed_bytes": uncompressed_bytes,
         "compressed_bytes": compressed_bytes,
         "line_count": line_count,
@@ -232,6 +238,46 @@ fn compress_segment_blocking(
         .map_err(|error| io_context("remove verified raw line-writer segment", &raw_path, error))?;
     Ok(())
 }
+fn maybe_deep_recompress(path: &Path, current_bytes: u64) -> Result<(i32, u64), io::Error> {
+    // A second pass is deliberately bounded: recompressing compressed bytes
+    // indefinitely cannot improve entropy and can make archives larger.
+    if current_bytes < 1024 {
+        return Ok((INITIAL_ZSTD_LEVEL, current_bytes));
+    }
+    let temporary = path.with_extension("zst.deep.tmp");
+    let input = File::open(path)
+        .map_err(|error| io_context("open base zstd archive for deep pass", path, error))?;
+    let mut decoder = zstd::stream::read::Decoder::new(input)
+        .map_err(|error| io_context("create deep zstd decoder", path, error))?;
+    let archive = File::create(&temporary)
+        .map_err(|error| io_context("create deep zstd temporary archive", &temporary, error))?;
+    let mut encoder = zstd::stream::write::Encoder::new(archive, DEEP_ZSTD_LEVEL)
+        .map_err(|error| io_context("create deep zstd encoder", &temporary, error))?;
+    io::copy(&mut decoder, &mut encoder)
+        .map_err(|error| io_context("deep zstd recompression", path, error))?;
+    let archive = encoder
+        .finish()
+        .map_err(|error| io_context("finish deep zstd archive", &temporary, error))?;
+    archive
+        .sync_all()
+        .map_err(|error| io_context("sync deep zstd archive", &temporary, error))?;
+    let deep_bytes = archive
+        .metadata()
+        .map_err(|error| io_context("inspect deep zstd archive", &temporary, error))?
+        .len();
+    let required_savings = 10_000_u64.saturating_sub(DEEP_RECOMPRESS_MIN_SAVINGS_BPS);
+    if deep_bytes > 0
+        && deep_bytes.saturating_mul(10_000) < current_bytes.saturating_mul(required_savings)
+    {
+        std::fs::rename(&temporary, path)
+            .map_err(|error| io_context("publish deep zstd archive", path, error))?;
+        Ok((DEEP_ZSTD_LEVEL, deep_bytes))
+    } else {
+        let _ = std::fs::remove_file(&temporary);
+        Ok((INITIAL_ZSTD_LEVEL, current_bytes))
+    }
+}
+
 pub async fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), io::Error> {
     let bytes = serde_json::to_vec(value).map_err(|error| io::Error::other(error.to_string()))?;
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
