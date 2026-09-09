@@ -33,6 +33,16 @@ impl FeeScheduleConfig {
         }
         Ok(())
     }
+
+    pub fn validate_at(&self, now_ms: u64) -> Result<(), &'static str> {
+        self.validate()?;
+        if self.effective_from_ms > now_ms
+            || self.effective_until_ms.is_some_and(|until| now_ms >= until)
+        {
+            return Err("fee schedule is not effective at the current timestamp");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -40,6 +50,7 @@ pub struct StrategyProfile {
     pub schema_version: u16,
     pub policy_id: String,
     pub default_strategy_variant: String,
+    pub market_id: String,
     pub experiment_plan_id: String,
     pub universe_id: String,
     pub asset_class: AssetClass,
@@ -108,6 +119,7 @@ impl StrategyProfile {
         if self.policy_id.trim().is_empty()
             || self.experiment_plan_id.trim().is_empty()
             || self.default_strategy_variant.trim().is_empty()
+            || self.market_id.trim().is_empty()
             || self.universe_id.trim().is_empty()
             || self.asset_class == AssetClass::Unknown
             || self.symbols.is_empty()
@@ -215,6 +227,7 @@ mod tests {
             schema_version: STRATEGY_PROFILE_SCHEMA_VERSION,
             policy_id: "test".into(),
             default_strategy_variant: "m4".into(),
+            market_id: "binance_usdm_tradfi_perpetual".into(),
             experiment_plan_id: "test".into(),
             universe_id: "test".into(),
             asset_class: AssetClass::OrdinaryEquity,

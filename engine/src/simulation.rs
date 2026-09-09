@@ -32,5 +32,5 @@ pub fn compiled_build_identity() -> String {
     SimulationRunManifest::compiled_build_identity()
 }
 pub use engine::*;
-pub use experiment_plan::{ExperimentPlan, ExperimentSpec};
+pub use experiment_plan::{ExperimentPlan, ExperimentRole, ExperimentSpec};
 pub use replay_config::ReplayConfig;

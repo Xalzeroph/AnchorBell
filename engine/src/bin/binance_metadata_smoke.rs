@@ -14,7 +14,7 @@ async fn main() {
         }
     };
     let client = match PublicMarketMetadataClient::new(
-        deployment.environment.endpoints().rest_base,
+        deployment.environment.endpoints().rest_base.as_str(),
         std::env::var("ANCHORBELL_HTTP_PROXY").ok().as_deref(),
     ) {
         Ok(client) => client,

@@ -132,7 +132,7 @@ impl BinanceOrderWebSocket {
             .validate_for(environment)
             .map_err(OrderTransportError::Policy)?;
         let endpoint = environment.endpoints().order_ws_base;
-        let socket = connect_websocket(endpoint, 10_000, http_proxy)
+        let socket = connect_websocket(endpoint.as_str(), 10_000, http_proxy)
             .await
             .map_err(|error| OrderTransportError::Network(error.to_string()))?;
         Ok(Self { socket, policy })

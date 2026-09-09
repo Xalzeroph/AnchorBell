@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "policy_id": "CORE-V1-binance-safe-server-20260909",
+  "market_id": "binance_usdm_tradfi_perpetual",
   "environment": "Production",
   "index_anchors": true,
   "symbols": [

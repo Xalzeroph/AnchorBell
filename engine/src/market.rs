@@ -37,8 +37,9 @@ pub use instrument_registry::{
 pub use live::{BinanceMarketConfig, BinanceMarketFeed, BinanceMarketStream, MarketStreamError};
 pub use metadata::{
     BinanceBookTickerSnapshot, BinanceDepthSnapshot, BinanceExecutionFilters,
-    BinancePremiumIndexSnapshot, BinanceScaledExecutionFilters, BinanceSymbolFilter,
-    BinanceSymbolMetadata, BinanceSymbolSnapshot, BinanceTimedPremiumIndexSnapshot,
+    BinanceFundingInfo, BinanceFundingRateSnapshot, BinancePremiumIndexSnapshot,
+    BinanceScaledExecutionFilters, BinanceSymbolFilter, BinanceSymbolMetadata,
+    BinanceSymbolSnapshot, BinanceTimedPremiumIndexSnapshot,
     PublicMarketMetadataClient, PublicMetadataError, PUBLIC_SNAPSHOT_MAX_AGE_MS,
     PUBLIC_SNAPSHOT_POLICY,
 };

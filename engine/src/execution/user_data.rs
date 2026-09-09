@@ -6,7 +6,7 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio_tungstenite::tungstenite::Message;
 
-use super::BinanceEnvironment;
+use super::{binance_runtime_config, BinanceEnvironment};
 use crate::network::connect_websocket;
 
 #[derive(Debug, Error)]
@@ -248,7 +248,7 @@ impl BinanceUserDataStream {
         Ok(Self {
             environment,
             listen_key,
-            max_frame_bytes: 1_048_576,
+            max_frame_bytes: binance_runtime_config().operational.max_frame_bytes,
             http_proxy,
         })
     }

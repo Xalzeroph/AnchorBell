@@ -69,7 +69,10 @@ pub use deployment::{
     DeploymentConfig, DeploymentConfigError, ENABLE_ORDER_SUBMISSION_VAR, ENABLE_PRODUCTION_VAR,
     ENVIRONMENT_VAR, LIVE_TRADING_CONFIRMATION, LIVE_TRADING_CONFIRMATION_VAR,
 };
-pub use environment::{BinanceEndpoints, BinanceEnvironment, EnvironmentParseError};
+pub use environment::{
+    binance_runtime_config, BinanceEndpoints, BinanceEnvironment, BinanceOperationalConfig,
+    BinanceRequestWeights, BinanceRuntimeConfig, EnvironmentParseError,
+};
 pub use funding_risk::{FundingAwareRiskGate, FundingRiskAction, FundingRiskInput};
 pub use gateway::{ExchangeOrder, ExecutionGateway, GatewayResult, SimulationGateway};
 pub use intent::{OrderIntent, OrderIntentError, Side};

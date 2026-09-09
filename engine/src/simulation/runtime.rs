@@ -27,7 +27,7 @@ use decision_audit::DecisionAuditContext;
 
 use crate::{
     backtest::TopOfBook,
-    execution::BinanceEnvironment,
+    execution::{binance_runtime_config, BinanceEnvironment},
     execution::{
         decide_adaptive_taker, AdaptiveTakerDecision, AdaptiveTakerInput, EmergencyExecutionPolicy,
         OrderIntent, Side,
@@ -506,7 +506,7 @@ pub(crate) async fn load_index_anchor_set_internal(
     }
     let mut seen = BTreeMap::new();
     let mut selected_metadata = Vec::with_capacity(symbols.len());
-    let client = PublicMarketMetadataClient::new(environment.endpoints().rest_base, http_proxy)
+    let client = PublicMarketMetadataClient::new(environment.endpoints().rest_base.as_str(), http_proxy)
         .map_err(|error| SimulationError::Market(format!("index anchor client: {error}")))?;
     let exchange_info = client
         .exchange_info()
@@ -861,6 +861,7 @@ pub struct SimulationSummary {
     pub rejected_entries: u64,
     /// Rejections partitioned by the owning layer (strategy/risk/execution).
     pub gate_rejections: BTreeMap<String, u64>,
+    pub gate_rejection_records: Vec<GateRejectionRecord>,
     pub realized_pnl_ticks: i64,
     pub unrealized_pnl_ticks: i64,
     pub market_pnl_ticks: i64,
@@ -876,6 +877,18 @@ pub struct SimulationSummary {
     pub peak_absolute_position: i64,
     pub working_orders: u64,
     pub flat_at_end: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GateRejectionRecord {
+    pub reason: String,
+    pub symbol: String,
+    pub market: String,
+    pub method: String,
+    pub source: String,
+    pub threshold: Option<i64>,
+    pub observed_value: Option<i64>,
+    pub timestamp_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -948,7 +961,6 @@ struct ThresholdDiagnostic {
     missing_component: Option<&'static str>,
 }
 
-const FUNDING_FLATTEN_LEAD_MS: u64 = 5 * 60 * 1_000;
 const MICRO_BPS_SCALE: i64 = 1_000_000;
 const PICO_BPS_SCALE: i64 = 1_000_000_000_000;
 const EWMA_PREVIOUS_WEIGHT_PPM: i64 = 700_000;
@@ -1162,6 +1174,11 @@ pub struct SimulationEngine {
     filled_quantity: i64,
     rejected_entries: u64,
     gate_rejections: BTreeMap<String, u64>,
+    gate_rejection_records: Vec<GateRejectionRecord>,
+    market_id: String,
+    method_id: String,
+    funding_lead_ms: u64,
+    funding_metadata_complete: bool,
     peak_absolute_position: i64,
     last_event_at_ms: u64,
     last_received_at_ms: u64,
@@ -1214,7 +1231,7 @@ impl SimulationEngine {
                         mark_price_ticks: None,
                         index_price_ticks: None,
                         next_funding_time_ms: 0,
-                        funding_interval_hours: 8,
+                        funding_interval_hours: 0,
                         last_mark_time_ms: 0,
                         last_mark_received_at_ms: 0,
                         last_trade_id: None,
@@ -1294,6 +1311,11 @@ impl SimulationEngine {
             filled_quantity: 0,
             rejected_entries: 0,
             gate_rejections: BTreeMap::new(),
+            gate_rejection_records: Vec::new(),
+            market_id: String::new(),
+            method_id: String::new(),
+            funding_lead_ms: 0,
+            funding_metadata_complete: false,
             peak_absolute_position: 0,
             last_event_at_ms: 0,
             last_received_at_ms: 0,
@@ -1335,7 +1357,9 @@ impl SimulationEngine {
     }
 
     fn funding_controller_active(&self) -> bool {
-        self.strategy_variant.uses_funding_controller() && self.funding_controller_enabled
+        self.strategy_variant.uses_funding_controller()
+            && self.funding_controller_enabled
+            && self.funding_metadata_complete
     }
 
     fn funding_entry_allowed_for_strategy(
@@ -1344,9 +1368,15 @@ impl SimulationEngine {
         now_ms: u64,
     ) -> bool {
         if self.strategy_variant.uses_funding_controller() && !self.funding_controller_enabled {
-            funding_entry_allowed(state, now_ms)
+            funding_entry_allowed(state, now_ms, self.funding_lead_ms)
         } else {
-            funding_entry_allowed_variant(state, now_ms, self.strategy_variant, self.fee_ppm)
+            funding_entry_allowed_variant(
+                state,
+                now_ms,
+                self.strategy_variant,
+                self.fee_ppm,
+                self.funding_lead_ms,
+            )
         }
     }
 
@@ -1403,6 +1433,21 @@ impl SimulationEngine {
         self
     }
 
+    pub fn with_market_context(mut self, market_id: String) -> Self {
+        self.market_id = market_id;
+        self
+    }
+
+    pub fn with_method_context(mut self, method_id: String) -> Self {
+        self.method_id = method_id;
+        self
+    }
+
+    pub fn with_funding_lead_ms(mut self, lead_ms: u64) -> Self {
+        self.funding_lead_ms = lead_ms;
+        self
+    }
+
     pub fn with_execution_filters(
         mut self,
         execution_filters: BTreeMap<String, BinanceScaledExecutionFilters>,
@@ -1412,6 +1457,9 @@ impl SimulationEngine {
     }
 
     pub fn with_funding_intervals(mut self, funding_intervals: BTreeMap<String, u32>) -> Self {
+        self.funding_metadata_complete = !funding_intervals.is_empty()
+            && funding_intervals.len() == self.states.len()
+            && funding_intervals.values().all(|hours| *hours > 0);
         for (symbol, interval_hours) in funding_intervals {
             if let Some(state) = self.states.get_mut(&symbol) {
                 state.funding_interval_hours = interval_hours.max(1);
@@ -1858,9 +1906,31 @@ impl SimulationEngine {
         }
     }
 
-    fn reject_entry(&mut self, owner: &'static str) {
+    fn reject_entry(&mut self, owner: &str) {
         self.rejected_entries = self.rejected_entries.saturating_add(1);
         *self.gate_rejections.entry(owner.to_owned()).or_default() += 1;
+    }
+
+    fn reject_entry_structured(
+        &mut self,
+        symbol: &str,
+        reason: &str,
+        source: &str,
+        threshold: Option<i64>,
+        observed_value: Option<i64>,
+        timestamp_ms: u64,
+    ) {
+        self.reject_entry(reason);
+        self.gate_rejection_records.push(GateRejectionRecord {
+            reason: reason.to_owned(),
+            symbol: symbol.to_owned(),
+            market: self.market_id.clone(),
+            method: self.method_id.clone(),
+            source: source.to_owned(),
+            threshold,
+            observed_value,
+            timestamp_ms,
+        });
     }
 
     pub fn summary(&self) -> SimulationSummary {
@@ -1897,6 +1967,7 @@ impl SimulationEngine {
             filled_quantity: self.filled_quantity,
             rejected_entries: self.rejected_entries,
             gate_rejections: self.gate_rejections.clone(),
+            gate_rejection_records: self.gate_rejection_records.clone(),
             realized_pnl_ticks,
             unrealized_pnl_ticks,
             market_pnl_ticks,
@@ -2205,7 +2276,7 @@ impl SimulationEngine {
                     next_funding_time_ms: state.next_funding_time_ms,
                     latest_funding_rate_e8: state.latest_funding_rate_e8,
                     funding_flatten_deadline_ms: (!funding_controller_active)
-                        .then(|| funding_flatten_deadline(state.next_funding_time_ms))
+                        .then(|| funding_flatten_deadline(state.next_funding_time_ms, self.funding_lead_ms))
                         .flatten(),
                     funding_action: if self.strategy_variant.uses_funding_controller()
                         && !self.funding_controller_enabled
@@ -2913,6 +2984,7 @@ impl SimulationEngine {
                         self.fee_ppm,
                         self.max_mark_index_gap_bps,
                         state.funding_interval_hours,
+                        self.funding_lead_ms,
                     );
                     (desired, true, state.working.is_some(), exit_reason)
                 }
@@ -2924,6 +2996,7 @@ impl SimulationEngine {
                     requested_quantity,
                     self.max_mark_index_gap_bps,
                     self.fee_ppm,
+                    self.funding_lead_ms,
                 );
                 let evidence_ok = reduce_only
                     || dynamic_threshold_for(
@@ -2962,7 +3035,7 @@ impl SimulationEngine {
                     && book.bid_quantity > 0
                     && book.ask_quantity > 0
                     && mark_index_ok
-                    && signal_age_ms <= 5_000
+                    && signal_age_ms <= binance_runtime_config().operational.max_signal_age_ms
                     && state.anchor.valid_at(timestamp_ms, self.max_anchor_age_ms)
                     && (!self.live_risk_gates
                         || state.anchor.observed_at_ms == 0
@@ -3053,8 +3126,8 @@ impl SimulationEngine {
                             threshold,
                             threshold_relief_micro_bps: state.adaptive_relief_micro_bps,
                             threshold_relief_pico_bps: state.adaptive_relief_pico_bps,
-                            inventory_skew_bps: 50,
-                            inventory_skew_pico_bps: 50 * PICO_BPS_SCALE,
+                            inventory_skew_bps: binance_runtime_config().operational.default_inventory_skew_bps,
+                            inventory_skew_pico_bps: binance_runtime_config().operational.default_inventory_skew_bps * PICO_BPS_SCALE,
                             buy_adverse_selection_bps: if strategy_variant.uses_microstructure() {
                                 buy_micro_adverse_bps
                             } else {
@@ -3088,7 +3161,7 @@ impl SimulationEngine {
                             fill_aware: strategy_variant.uses_fill_gate(),
                             max_mark_index_gap_bps: self.max_mark_index_gap_bps,
                             signal_age_ms,
-                            max_signal_age_ms: 5_000,
+                            max_signal_age_ms: binance_runtime_config().operational.max_signal_age_ms,
                         });
                         input.and_then(AnchorMakerStrategy::generate_adaptive_intent)
                     };
@@ -3141,7 +3214,14 @@ impl SimulationEngine {
                 }));
                 record
             };
-            self.reject_entry(decision_reason);
+            self.reject_entry_structured(
+                symbol,
+                decision_reason,
+                "strategy_risk_gate",
+                None,
+                None,
+                timestamp_ms,
+            );
             if has_working {
                 let mut records = vec![decision_record];
                 records.extend(self.cancel_symbol(
@@ -3236,7 +3316,7 @@ impl SimulationEngine {
     fn place_symbol(
         &mut self,
         symbol: &str,
-        intent: OrderIntent,
+        mut intent: OrderIntent,
         timestamp_ms: u64,
         reduce_only: bool,
         decision_id: Option<u64>,
@@ -3247,6 +3327,38 @@ impl SimulationEngine {
                 .get(symbol)
                 .and_then(|state| state.mark_price_ticks)
                 .unwrap_or_default();
+            let current_position = self
+                .states
+                .get(symbol)
+                .map(|state| state.position.checked_abs().unwrap_or(i64::MAX))
+                .unwrap_or_default();
+            let maximum_quantity = if reduce_only {
+                current_position
+            } else {
+                self.position_allocations
+                    .get(symbol)
+                    .map(|allocation| allocation.max_position.saturating_sub(current_position))
+                    .unwrap_or(self.max_position.saturating_sub(current_position))
+            };
+            match filters.normalize_quantity(
+                intent.quantity,
+                intent.price,
+                maximum_quantity,
+                self.quantity_scale,
+            ) {
+                Ok(quantity) => intent.quantity = quantity,
+                Err(reason) => {
+                    self.reject_entry_structured(
+                        symbol,
+                        reason,
+                        "binance_exchange_filters",
+                        Some(filters.min_notional_price_ticks),
+                        Some(intent.quantity),
+                        timestamp_ms,
+                    );
+                    return Vec::new();
+                }
+            }
             if let Err(reason) = filters.validate_order(
                 intent.price,
                 intent.quantity,
@@ -3254,7 +3366,14 @@ impl SimulationEngine {
                 intent.side == Side::Buy,
                 self.quantity_scale,
             ) {
-                self.reject_entry(reason);
+                self.reject_entry_structured(
+                    symbol,
+                    reason,
+                    "binance_exchange_filters",
+                    Some(filters.min_notional_price_ticks),
+                    Some(intent.quantity),
+                    timestamp_ms,
+                );
                 return Vec::new();
             }
         }
@@ -3264,11 +3383,25 @@ impl SimulationEngine {
         let client_id = self.next_client_id;
         if intent.is_emergency_taker() {
             if !reduce_only {
-                self.reject_entry("execution_taker_not_reduce_only");
+                self.reject_entry_structured(
+                    symbol,
+                    "execution_taker_not_reduce_only",
+                    "execution_policy",
+                    None,
+                    None,
+                    timestamp_ms,
+                );
                 return Vec::new();
             }
             let Some(book) = self.states.get(symbol).and_then(|state| state.book) else {
-                self.reject_entry("execution_taker_invalid_book");
+                self.reject_entry_structured(
+                    symbol,
+                    "execution_taker_invalid_book",
+                    "execution_policy",
+                    None,
+                    None,
+                    timestamp_ms,
+                );
                 return Vec::new();
             };
             let crosses = match intent.side {
@@ -3276,14 +3409,28 @@ impl SimulationEngine {
                 Side::Sell => intent.price <= book.bid_price_ticks,
             };
             if !crosses {
-                self.reject_entry("execution_taker_not_aggressive");
+                self.reject_entry_structured(
+                    symbol,
+                    "execution_taker_not_aggressive",
+                    "execution_policy",
+                    None,
+                    Some(intent.price),
+                    timestamp_ms,
+                );
                 return Vec::new();
             }
             let position = self.states[symbol].position;
             if (intent.side == Side::Buy && position >= 0)
                 || (intent.side == Side::Sell && position <= 0)
             {
-                self.reject_entry("execution_taker_not_reducing");
+                self.reject_entry_structured(
+                    symbol,
+                    "execution_taker_not_reducing",
+                    "execution_policy",
+                    None,
+                    Some(position),
+                    timestamp_ms,
+                );
                 return Vec::new();
             }
             let quantity = intent
@@ -3348,7 +3495,14 @@ impl SimulationEngine {
             ];
         }
         if !intent.post_only {
-            self.reject_entry("execution_maker_validation");
+            self.reject_entry_structured(
+                symbol,
+                "execution_maker_validation",
+                "execution_policy",
+                None,
+                Some(intent.price),
+                timestamp_ms,
+            );
             return Vec::new();
         }
         self.next_client_id = self.next_client_id.saturating_add(1);
@@ -3361,7 +3515,14 @@ impl SimulationEngine {
             Side::Sell => intent.price >= book.ask_price_ticks,
         };
         if !maker_valid {
-            self.reject_entry("execution_maker_validation");
+            self.reject_entry_structured(
+                symbol,
+                "execution_maker_validation",
+                "execution_policy",
+                None,
+                Some(intent.price),
+                timestamp_ms,
+            );
             return Vec::new();
         }
         if reduce_only
@@ -3550,7 +3711,7 @@ fn decision_audit(context: DecisionAuditContext<'_>) -> DecisionAudit {
         && context
             .timestamp_ms
             .saturating_sub(context.state.last_mark_time_ms)
-            <= 5_000;
+            <= binance_runtime_config().operational.max_signal_age_ms;
     let anchor_valid = context
         .state
         .anchor
@@ -3568,6 +3729,7 @@ fn decision_audit(context: DecisionAuditContext<'_>) -> DecisionAudit {
             context.timestamp_ms,
             context.engine.strategy_variant,
             context.engine.fee_ppm,
+            context.engine.funding_lead_ms,
         );
     let effective_quantity = book
         .map(|book| {
@@ -3719,6 +3881,7 @@ fn m9_intent_for_state(
     requested_quantity: i64,
     max_mark_index_gap_bps: i64,
     fee_ppm: i64,
+    funding_lead_ms: u64,
 ) -> (Option<OrderIntent>, bool, &'static str) {
     let Some(book) = state.book else {
         return (None, false, "m9_market_book_unavailable");
@@ -3726,7 +3889,7 @@ fn m9_intent_for_state(
     let Some(fair_value) = fair_value_for_state(state) else {
         return (None, false, "m9_fair_value_unavailable");
     };
-    let Some(deadline_ms) = funding_flatten_deadline(state.next_funding_time_ms) else {
+    let Some(deadline_ms) = funding_flatten_deadline(state.next_funding_time_ms, funding_lead_ms) else {
         return (None, false, "m9_deadline_unavailable");
     };
     let mark = state.mark_price_ticks.unwrap_or(0);
@@ -3881,6 +4044,7 @@ fn maker_exit_intent_for_state(
     fee_ppm: i64,
     max_mark_index_gap_bps: i64,
     funding_interval_hours: u32,
+    funding_lead_ms: u64,
 ) -> (Option<OrderIntent>, &'static str) {
     let Some(position_quantity) = state.position.checked_abs() else {
         return (None, "maker_exit_position_overflow");
@@ -3909,8 +4073,8 @@ fn maker_exit_intent_for_state(
         timestamp_ms,
         next_equity_pre_open_at_ms(symbol, timestamp_ms),
         funding,
-        30 * 60 * 1_000,
-        5 * 60 * 1_000,
+        binance_runtime_config().operational.default_maker_flatten_horizon_ms,
+        funding_lead_ms,
     ) else {
         return (None, "maker_exit_plan_invalid");
     };
@@ -3988,7 +4152,7 @@ fn maker_exit_intent_for_state(
         position: state.position,
         position_confirmed: true,
         now_ms: timestamp_ms,
-        max_book_age_ms: 5_000,
+        max_book_age_ms: binance_runtime_config().operational.max_signal_age_ms,
         plan,
         book: Some(ExitBook {
             bid: book.bid_price_ticks,
@@ -4005,7 +4169,7 @@ fn maker_exit_intent_for_state(
             min_notional: 1,
             quantity_scale,
             observed_at_ms: timestamp_ms,
-            max_age_ms: 5_000,
+            max_age_ms: binance_runtime_config().operational.max_signal_age_ms,
         }),
         working,
     });
@@ -4040,13 +4204,18 @@ pub fn event_time_ms(event: &BinanceMarketEvent) -> u64 {
     }
 }
 
-fn funding_flatten_deadline(next_funding_time_ms: u64) -> Option<u64> {
-    (next_funding_time_ms > 0).then(|| next_funding_time_ms.saturating_sub(FUNDING_FLATTEN_LEAD_MS))
+fn funding_flatten_deadline(next_funding_time_ms: u64, funding_lead_ms: u64) -> Option<u64> {
+    (next_funding_time_ms > 0)
+        .then(|| next_funding_time_ms.saturating_sub(funding_lead_ms))
 }
 
-fn funding_entry_allowed(state: &SimulationSymbolState, now_ms: u64) -> bool {
+fn funding_entry_allowed(
+    state: &SimulationSymbolState,
+    now_ms: u64,
+    funding_lead_ms: u64,
+) -> bool {
     state.next_funding_time_ms > now_ms
-        && funding_flatten_deadline(state.next_funding_time_ms)
+        && funding_flatten_deadline(state.next_funding_time_ms, funding_lead_ms)
             .is_some_and(|deadline| now_ms < deadline)
 }
 
@@ -4146,9 +4315,10 @@ fn funding_entry_allowed_variant(
     now_ms: u64,
     variant: SimulationPolicyVariant,
     fee_ppm: i64,
+    funding_lead_ms: u64,
 ) -> bool {
     if !variant.uses_funding_controller() {
-        return funding_entry_allowed(state, now_ms);
+        return funding_entry_allowed(state, now_ms, funding_lead_ms);
     }
     m8_funding_decision(
         state,
@@ -4236,7 +4406,8 @@ fn data_quality_for(
     // retained only for latency diagnostics.
     if state.last_mark_time_ms == 0
         || now_ms < state.last_mark_time_ms
-        || now_ms.saturating_sub(state.last_mark_time_ms) > 5_000
+        || now_ms.saturating_sub(state.last_mark_time_ms)
+            > binance_runtime_config().operational.max_signal_age_ms
     {
         return DataQualityStatus::Stale;
     }
@@ -5225,7 +5396,7 @@ pub async fn run_simulation(
         BinanceMarketFeed::BookTicker,
         config.price_scale,
         config.quantity_scale,
-        1_048_576,
+        binance_runtime_config().operational.max_frame_bytes,
         config.connect_timeout_ms,
         config.read_timeout_ms,
         config.http_proxy.clone(),
@@ -5240,7 +5411,7 @@ pub async fn run_simulation(
             BinanceMarketFeed::ReferenceAndTrades,
             config.price_scale,
             config.quantity_scale,
-            1_048_576,
+        binance_runtime_config().operational.max_frame_bytes,
             config.connect_timeout_ms,
             config.read_timeout_ms,
             config.http_proxy.clone(),
