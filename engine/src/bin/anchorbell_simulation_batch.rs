@@ -147,11 +147,14 @@ async fn load_funding_intervals(
         let history = client
             .funding_rate_history(&normalized, 100)
             .await
-            .map_err(|error| format!("fundingRate history unavailable for {normalized}: {error}"))?;
+            .map_err(|error| {
+                format!("fundingRate history unavailable for {normalized}: {error}")
+            })?;
         validate_funding_history(&normalized, &row, &history)?;
         history_counts.insert(normalized.clone(), history.len());
+        let funding_interval_hours = row.funding_interval_hours;
         metadata.insert(normalized.clone(), row);
-        result.insert(normalized, row.funding_interval_hours);
+        result.insert(normalized, funding_interval_hours);
     }
     Ok((result, metadata, history_counts))
 }
@@ -342,7 +345,7 @@ fn main() {
                 .unwrap_or_else(|error| {
                     fail(format!("cannot allocate simulation-batch capital: {error}"))
                 });
-        let specs = experiment_plan
+        let specs: Vec<SimulationBatchSpec> = experiment_plan
             .runtime_specs_with_ablations()
             .unwrap_or_else(|error| fail(format!("invalid experiment plan: {error}")))
             .into_iter()

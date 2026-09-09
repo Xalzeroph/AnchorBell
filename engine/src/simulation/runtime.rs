@@ -506,8 +506,9 @@ pub(crate) async fn load_index_anchor_set_internal(
     }
     let mut seen = BTreeMap::new();
     let mut selected_metadata = Vec::with_capacity(symbols.len());
-    let client = PublicMarketMetadataClient::new(environment.endpoints().rest_base.as_str(), http_proxy)
-        .map_err(|error| SimulationError::Market(format!("index anchor client: {error}")))?;
+    let client =
+        PublicMarketMetadataClient::new(environment.endpoints().rest_base.as_str(), http_proxy)
+            .map_err(|error| SimulationError::Market(format!("index anchor client: {error}")))?;
     let exchange_info = client
         .exchange_info()
         .await
@@ -2276,7 +2277,12 @@ impl SimulationEngine {
                     next_funding_time_ms: state.next_funding_time_ms,
                     latest_funding_rate_e8: state.latest_funding_rate_e8,
                     funding_flatten_deadline_ms: (!funding_controller_active)
-                        .then(|| funding_flatten_deadline(state.next_funding_time_ms, self.funding_lead_ms))
+                        .then(|| {
+                            funding_flatten_deadline(
+                                state.next_funding_time_ms,
+                                self.funding_lead_ms,
+                            )
+                        })
                         .flatten(),
                     funding_action: if self.strategy_variant.uses_funding_controller()
                         && !self.funding_controller_enabled
@@ -3126,8 +3132,13 @@ impl SimulationEngine {
                             threshold,
                             threshold_relief_micro_bps: state.adaptive_relief_micro_bps,
                             threshold_relief_pico_bps: state.adaptive_relief_pico_bps,
-                            inventory_skew_bps: binance_runtime_config().operational.default_inventory_skew_bps,
-                            inventory_skew_pico_bps: binance_runtime_config().operational.default_inventory_skew_bps * PICO_BPS_SCALE,
+                            inventory_skew_bps: binance_runtime_config()
+                                .operational
+                                .default_inventory_skew_bps,
+                            inventory_skew_pico_bps: binance_runtime_config()
+                                .operational
+                                .default_inventory_skew_bps
+                                * PICO_BPS_SCALE,
                             buy_adverse_selection_bps: if strategy_variant.uses_microstructure() {
                                 buy_micro_adverse_bps
                             } else {
@@ -3161,7 +3172,9 @@ impl SimulationEngine {
                             fill_aware: strategy_variant.uses_fill_gate(),
                             max_mark_index_gap_bps: self.max_mark_index_gap_bps,
                             signal_age_ms,
-                            max_signal_age_ms: binance_runtime_config().operational.max_signal_age_ms,
+                            max_signal_age_ms: binance_runtime_config()
+                                .operational
+                                .max_signal_age_ms,
                         });
                         input.and_then(AnchorMakerStrategy::generate_adaptive_intent)
                     };
@@ -3889,7 +3902,8 @@ fn m9_intent_for_state(
     let Some(fair_value) = fair_value_for_state(state) else {
         return (None, false, "m9_fair_value_unavailable");
     };
-    let Some(deadline_ms) = funding_flatten_deadline(state.next_funding_time_ms, funding_lead_ms) else {
+    let Some(deadline_ms) = funding_flatten_deadline(state.next_funding_time_ms, funding_lead_ms)
+    else {
         return (None, false, "m9_deadline_unavailable");
     };
     let mark = state.mark_price_ticks.unwrap_or(0);
@@ -4073,7 +4087,9 @@ fn maker_exit_intent_for_state(
         timestamp_ms,
         next_equity_pre_open_at_ms(symbol, timestamp_ms),
         funding,
-        binance_runtime_config().operational.default_maker_flatten_horizon_ms,
+        binance_runtime_config()
+            .operational
+            .default_maker_flatten_horizon_ms,
         funding_lead_ms,
     ) else {
         return (None, "maker_exit_plan_invalid");
@@ -4205,15 +4221,10 @@ pub fn event_time_ms(event: &BinanceMarketEvent) -> u64 {
 }
 
 fn funding_flatten_deadline(next_funding_time_ms: u64, funding_lead_ms: u64) -> Option<u64> {
-    (next_funding_time_ms > 0)
-        .then(|| next_funding_time_ms.saturating_sub(funding_lead_ms))
+    (next_funding_time_ms > 0).then(|| next_funding_time_ms.saturating_sub(funding_lead_ms))
 }
 
-fn funding_entry_allowed(
-    state: &SimulationSymbolState,
-    now_ms: u64,
-    funding_lead_ms: u64,
-) -> bool {
+fn funding_entry_allowed(state: &SimulationSymbolState, now_ms: u64, funding_lead_ms: u64) -> bool {
     state.next_funding_time_ms > now_ms
         && funding_flatten_deadline(state.next_funding_time_ms, funding_lead_ms)
             .is_some_and(|deadline| now_ms < deadline)
@@ -5411,7 +5422,7 @@ pub async fn run_simulation(
             BinanceMarketFeed::ReferenceAndTrades,
             config.price_scale,
             config.quantity_scale,
-        binance_runtime_config().operational.max_frame_bytes,
+            binance_runtime_config().operational.max_frame_bytes,
             config.connect_timeout_ms,
             config.read_timeout_ms,
             config.http_proxy.clone(),

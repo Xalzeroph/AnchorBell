@@ -12,8 +12,8 @@ use anchorbell_engine::{
     backtest_report::BacktestReport,
     execution::{
         binance_runtime_config, BinanceAccountStatusResponse, BinanceAccountStatusWire,
-        BinanceCredentials, BinanceEnvironment, BinanceOrderWebSocket, BinanceRestClient, DeploymentConfig,
-        DeploymentConfigError, Side,
+        BinanceCredentials, BinanceEnvironment, BinanceOrderWebSocket, BinanceRestClient,
+        DeploymentConfig, DeploymentConfigError, Side,
     },
     market::{
         BinanceMarketConfig, BinanceMarketStream, BinanceSubscription, InstrumentRegistryConfig,
@@ -746,11 +746,26 @@ async fn start_runtime(body: Vec<u8>, state: &DashboardState) -> (u16, &'static 
                 .arg("--quantity-scale")
                 .arg(strategy_profile.quantity_scale.to_string())
                 .arg("--max-position")
-                .arg(request.max_position.unwrap_or(strategy_profile.max_position).to_string())
+                .arg(
+                    request
+                        .max_position
+                        .unwrap_or(strategy_profile.max_position)
+                        .to_string(),
+                )
                 .arg("--quantity")
-                .arg(request.quantity.unwrap_or(strategy_profile.requested_quantity).to_string())
+                .arg(
+                    request
+                        .quantity
+                        .unwrap_or(strategy_profile.requested_quantity)
+                        .to_string(),
+                )
                 .arg("--entry-threshold-bps")
-                .arg(request.entry_threshold_bps.unwrap_or(strategy_profile.entry_threshold_bps).to_string())
+                .arg(
+                    request
+                        .entry_threshold_bps
+                        .unwrap_or(strategy_profile.entry_threshold_bps)
+                        .to_string(),
+                )
                 .arg("--max-mark-index-gap-bps")
                 .arg(strategy_profile.max_mark_index_gap_bps.to_string())
                 .arg("--funding-lead-ms")
@@ -1544,9 +1559,7 @@ async fn update_session(body: Vec<u8>, state: &DashboardState) -> (u16, &'static
     if symbol.is_empty() {
         return json_response(400, json!({"ok": false, "message": "交易标的不能为空"}));
     }
-    if configured_instrument(&symbol)
-        .is_none_or(|instrument| !instrument.simulation_enabled)
-    {
+    if configured_instrument(&symbol).is_none_or(|instrument| !instrument.simulation_enabled) {
         return json_response(
             400,
             json!({
@@ -1665,7 +1678,18 @@ async fn instruments_response(state: &DashboardState) -> (u16, &'static str, Vec
             return json_response(502, json!({"ok": false, "message": error.to_string()}))
         }
     };
-    let funding_info = client.funding_info(None).await.unwrap_or_default();
+    let funding_info = match client.funding_info(None).await {
+        Ok(funding_info) => funding_info,
+        Err(error) => {
+            return json_response(
+                502,
+                json!({
+                    "ok": false,
+                    "message": format!("Binance funding metadata unavailable: {error}"),
+                }),
+            )
+        }
+    };
     let funding_by_symbol = funding_info
         .into_iter()
         .map(|item| (item.symbol.clone(), item))

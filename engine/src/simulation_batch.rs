@@ -23,9 +23,7 @@ use crate::{
     execution::{BinanceEnvironment, SessionCheckpoint},
     market::{
         binance::{parse_price_ticks, parse_quantity, BinanceMarketEvent},
-        metadata::{
-            BinanceDepthSnapshot, BinanceFundingInfo, BinanceScaledExecutionFilters,
-        },
+        metadata::{BinanceDepthSnapshot, BinanceFundingInfo, BinanceScaledExecutionFilters},
         recorder::{add_event_lineage, market_event_to_json},
         BinanceC2cFxClient, BinanceC2cFxPoller, BinanceMarketConfig, BinanceMarketFeed,
         BinanceMarketStream, FxPollerConfig, FxUpdate, PublicMarketMetadataClient, ReconnectPolicy,
@@ -477,13 +475,12 @@ fn validate(config: &SimulationBatchConfig) -> Result<(), SimulationError> {
         || config.funding_intervals.len() != config.symbols.len()
         || config.funding_info.len() != config.symbols.len()
         || config.funding_history_counts.len() != config.symbols.len()
-        || config
-            .symbols
-            .iter()
-            .any(|symbol| !config.execution_filters.contains_key(symbol)
+        || config.symbols.iter().any(|symbol| {
+            !config.execution_filters.contains_key(symbol)
                 || !config.funding_intervals.contains_key(symbol)
                 || !config.funding_info.contains_key(symbol)
-                || !config.funding_history_counts.contains_key(symbol))
+                || !config.funding_history_counts.contains_key(symbol)
+        })
     {
         return Err(SimulationError::InvalidConfig(
             "batch execution requires complete per-symbol exchange and funding metadata",
@@ -839,7 +836,7 @@ pub async fn run(
     // Start buffering diff-depth before the REST snapshot, matching Binance's
     // required bootstrap order and preserving events during snapshot latency.
     let depth_configs = BinanceMarketConfig::for_symbols(
-        endpoints.public_market_ws_base,
+        endpoints.public_market_ws_base.clone(),
         &config.symbols,
         BinanceMarketFeed::OrderBookDepth,
         config.price_scale,
@@ -1486,7 +1483,10 @@ pub async fn run(
         .await?;
         return Err(error);
     }
-    if let Some(non_flat) = ledger_results.iter().find(|ledger| !ledger.summary.flat_at_end) {
+    if let Some(non_flat) = ledger_results
+        .iter()
+        .find(|ledger| !ledger.summary.flat_at_end)
+    {
         let error = SimulationError::Market(format!(
             "normal completion blocked: ledger {} ended with residual position={} working_orders={} settlement_status={}",
             non_flat.label,

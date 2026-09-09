@@ -15,7 +15,7 @@ pub enum EnvironmentParseError {
 
 impl BinanceEnvironment {
     pub fn endpoints(self) -> BinanceEndpoints {
-        runtime_config()
+        binance_runtime_config()
             .environments
             .get(self.as_str())
             .cloned()
@@ -104,22 +104,23 @@ pub struct BinanceRuntimeConfig {
 impl BinanceRuntimeConfig {
     fn validate(&self) -> Result<(), &'static str> {
         if self.environments.len() != 2
-            || self
-                .environments
-                .values()
-                .any(|endpoint| {
-                    endpoint.rest_base.trim().is_empty()
-                        || endpoint.market_ws_base.trim().is_empty()
-                        || endpoint.public_market_ws_base.trim().is_empty()
-                        || endpoint.order_ws_base.trim().is_empty()
-                        || endpoint.user_data_ws_base.trim().is_empty()
-                })
+            || self.environments.values().any(|endpoint| {
+                endpoint.rest_base.trim().is_empty()
+                    || endpoint.market_ws_base.trim().is_empty()
+                    || endpoint.public_market_ws_base.trim().is_empty()
+                    || endpoint.order_ws_base.trim().is_empty()
+                    || endpoint.user_data_ws_base.trim().is_empty()
+            })
             || self.request_weights.generic == 0
             || self.request_weights.exchange_info == 0
             || self.request_weights.funding == 0
             || self.request_weights.index_price_klines == 0
             || self.request_weights.depth_default == 0
-            || self.request_weights.depth_by_limit.values().any(|weight| *weight == 0)
+            || self
+                .request_weights
+                .depth_by_limit
+                .values()
+                .any(|weight| *weight == 0)
             || self.operational.max_frame_bytes == 0
             || self.operational.default_recv_window_ms == 0
             || self.operational.max_signal_age_ms == 0
@@ -134,11 +135,15 @@ impl BinanceRuntimeConfig {
 pub fn binance_runtime_config() -> &'static BinanceRuntimeConfig {
     static CONFIG: OnceLock<BinanceRuntimeConfig> = OnceLock::new();
     CONFIG.get_or_init(|| {
-        let config: BinanceRuntimeConfig = serde_json::from_str(include_str!(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../config/anchorbell-binance-runtime.json")
-        ))
+        let config: BinanceRuntimeConfig = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../config/anchorbell-binance-runtime.json"
+        )))
         .expect("embedded Binance runtime configuration must be valid JSON");
-        assert_eq!(config.schema_version, 1, "unsupported Binance runtime config schema");
+        assert_eq!(
+            config.schema_version, 1,
+            "unsupported Binance runtime config schema"
+        );
         config
             .validate()
             .expect("embedded Binance runtime configuration must pass validation");

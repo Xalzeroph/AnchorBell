@@ -44,6 +44,8 @@ fn engine() -> SimulationEngine {
     )
     .unwrap()
     .with_strategy_variant(SimulationPolicyVariant::M0Fixed)
+    .with_funding_intervals([("CXMTUSDT".to_owned(), 8)].into_iter().collect())
+    .with_funding_lead_ms(5 * 60 * 1_000)
 }
 
 fn feed(engine: &mut SimulationEngine, raw: &[u8]) -> Vec<SimulationRecord> {

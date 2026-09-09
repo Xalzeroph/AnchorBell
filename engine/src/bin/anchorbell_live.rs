@@ -14,10 +14,10 @@ use std::{
 
 use anchorbell_engine::{
     execution::{
-        binance_runtime_config, BinanceCredentials, BinanceEmergencyReduceOnlyTakerRequest, BinanceEnvironment,
-        BinanceMakerOrderRequest, BinanceRestClient, BinanceUserDataStream, DeploymentConfig,
-        ExecutionSupervisor, GateDecision, SessionCheckpoint, Side, SupervisorConfig,
-        SupervisorState, UserDataEvent,
+        binance_runtime_config, BinanceCredentials, BinanceEmergencyReduceOnlyTakerRequest,
+        BinanceEnvironment, BinanceMakerOrderRequest, BinanceRestClient, BinanceUserDataStream,
+        DeploymentConfig, ExecutionSupervisor, GateDecision, SessionCheckpoint, Side,
+        SupervisorConfig, SupervisorState, UserDataEvent,
     },
     market::{
         binance::{BinanceMarketEvent, BookTicker, MarkPrice},
@@ -503,7 +503,12 @@ async fn load_commission_rates(
     let mut observed = None;
     for symbol in symbols {
         let rate = client
-            .commission_rate(credentials, symbol, timestamp, binance_runtime_config().operational.default_recv_window_ms)
+            .commission_rate(
+                credentials,
+                symbol,
+                timestamp,
+                binance_runtime_config().operational.default_recv_window_ms,
+            )
             .await
             .map_err(|error| format!("commissionRate unavailable for {symbol}: {error}"))?;
         let maker = parse_commission_ppm(&rate.maker_commission_rate)
@@ -552,7 +557,9 @@ async fn load_funding_intervals(
         let history = client
             .funding_rate_history(&normalized, 100)
             .await
-            .map_err(|error| format!("fundingRate history unavailable for {normalized}: {error}"))?;
+            .map_err(|error| {
+                format!("fundingRate history unavailable for {normalized}: {error}")
+            })?;
         if history.is_empty()
             || history.iter().any(|item| {
                 item.symbol != normalized
@@ -561,7 +568,9 @@ async fn load_funding_intervals(
                     || !matches!(item.rate_type.as_str(), "Regular" | "Special")
             })
         {
-            return Err(format!("fundingRate history is incomplete for {normalized}"));
+            return Err(format!(
+                "fundingRate history is incomplete for {normalized}"
+            ));
         }
         result.insert(normalized, row.funding_interval_hours);
     }
@@ -618,7 +627,11 @@ async fn run(args: Args) -> Result<i32, String> {
     let server_time = client.server_time_ms().await.map_err(|e| e.to_string())?;
     if args.send_orders {
         let position_mode = client
-            .position_mode(&credentials, server_time, binance_runtime_config().operational.default_recv_window_ms)
+            .position_mode(
+                &credentials,
+                server_time,
+                binance_runtime_config().operational.default_recv_window_ms,
+            )
             .await
             .map_err(|e| format!("Binance position mode preflight failed: {e}"))?;
         if position_mode.dual_side_position {
@@ -628,7 +641,12 @@ async fn run(args: Args) -> Result<i32, String> {
         }
         for symbol in &symbols {
             client
-                .commission_rate(&credentials, symbol, server_time, binance_runtime_config().operational.default_recv_window_ms)
+                .commission_rate(
+                    &credentials,
+                    symbol,
+                    server_time,
+                    binance_runtime_config().operational.default_recv_window_ms,
+                )
                 .await
                 .map_err(|e| {
                     format!("Binance account commission preflight failed for {symbol}: {e}")
@@ -643,11 +661,11 @@ async fn run(args: Args) -> Result<i32, String> {
                 schema_version: RUN_REGISTRY_SCHEMA_VERSION,
                 run_id: run_id.clone(),
                 mode: RunMode::Live,
-                policy_id: "adaptive-anchor-live".into(),
+                policy_id: strategy_profile.policy_id.clone(),
                 capital_currency: "USDT".into(),
                 capital_minor_units: args.max_position,
-                universe: "frozen-close-ah".into(),
-                strategies: vec!["adaptive-anchor".into()],
+                universe: strategy_profile.universe_id.clone(),
+                strategies: vec![strategy_profile.default_strategy_variant.clone()],
                 ablations: Vec::new(),
                 checkpoint_interval_ms: strategy_profile.checkpoint_interval_ms,
                 max_stale_ms: strategy_profile.max_stale_ms,
@@ -770,7 +788,8 @@ async fn run(args: Args) -> Result<i32, String> {
     registry
         .heartbeat(&run_id, now_ms())
         .map_err(|error| format!("live run registry heartbeat failed: {error}"))?;
-    let _heartbeat = registry.spawn_heartbeat(run_id.clone(), strategy_profile.run_registry_heartbeat_ms);
+    let _heartbeat =
+        registry.spawn_heartbeat(run_id.clone(), strategy_profile.run_registry_heartbeat_ms);
     let mut truth = BTreeMap::<String, MarketTruthState>::new();
     let mut truth_sequence = 0_u64;
 
@@ -1246,19 +1265,25 @@ async fn run(args: Args) -> Result<i32, String> {
     )
     .await
     .map_err(|error| format!("final flat-state reconciliation failed: {error}"))?;
-    let residual = final_remote.iter().filter_map(|(symbol, remote)| {
-        if remote.position_ticks != 0 || !remote.working_orders.is_empty() {
-            Some(format!(
-                "{symbol}:position_ticks={},working_orders={}",
-                remote.position_ticks,
-                remote.working_orders.len()
-            ))
-        } else {
-            None
-        }
-    }).collect::<Vec<_>>();
+    let residual = final_remote
+        .iter()
+        .filter_map(|(symbol, remote)| {
+            if remote.position_ticks != 0 || !remote.working_orders.is_empty() {
+                Some(format!(
+                    "{symbol}:position_ticks={},working_orders={}",
+                    remote.position_ticks,
+                    remote.working_orders.len()
+                ))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
     if !residual.is_empty() {
-        let reason = format!("normal live completion blocked by residual remote state: {}", residual.join(","));
+        let reason = format!(
+            "normal live completion blocked by residual remote state: {}",
+            residual.join(",")
+        );
         let _ = registry.fail(&run_id, reason.clone(), now_ms());
         eprintln!("ALERT: {reason}");
         return Err(reason);
@@ -1303,7 +1328,11 @@ async fn reconcile_account(
 ) -> Result<BTreeMap<String, RemoteSymbolState>, String> {
     let timestamp = client.server_time_ms().await.map_err(|e| e.to_string())?;
     let snapshot = client
-        .authoritative_account_snapshot(credentials, timestamp, binance_runtime_config().operational.default_recv_window_ms)
+        .authoritative_account_snapshot(
+            credentials,
+            timestamp,
+            binance_runtime_config().operational.default_recv_window_ms,
+        )
         .await
         .map_err(|e| e.to_string())?;
     let is_configured = |symbol: &str| {
@@ -1501,7 +1530,9 @@ fn make_intent(
         args.quantity,
         state.ewma_abs_return_bps,
         args.entry_threshold_bps,
-        binance_runtime_config().operational.default_inventory_skew_bps,
+        binance_runtime_config()
+            .operational
+            .default_inventory_skew_bps,
         args.max_mark_index_gap_bps,
         now.saturating_sub(market_at),
         binance_runtime_config().operational.max_signal_age_ms,
@@ -1762,7 +1793,9 @@ async fn place_order(request: PlaceOrderRequest<'_>) -> Result<WorkingOrder, Str
             maximum_quantity,
             quantity_scale,
         )
-        .map_err(|reason| format!("Binance exchange quantity gate rejected order for {symbol}: {reason}"))?;
+        .map_err(|reason| {
+            format!("Binance exchange quantity gate rejected order for {symbol}: {reason}")
+        })?;
     execution_filters
         .validate_order(
             intent.price,

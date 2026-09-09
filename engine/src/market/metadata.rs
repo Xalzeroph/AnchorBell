@@ -10,8 +10,8 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::network::{RequestClass, RequestCoordinator};
 use crate::execution::binance_runtime_config;
+use crate::network::{RequestClass, RequestCoordinator};
 
 use super::freshness::{FreshnessClass, FreshnessPolicy, FreshnessState};
 
