@@ -1030,6 +1030,7 @@ async fn runs_response() -> (u16, &'static str, Vec<u8>) {
             "runs": [],
         }));
     };
+    let latest_dir = latest_external_batch().map(|(path, _)| path);
     let mut runs = Vec::new();
     let Ok(entries) = fs::read_dir(&root) else {
         return json_response(200, json!({
@@ -1073,11 +1074,28 @@ async fn runs_response() -> (u16, &'static str, Vec<u8>) {
                     continue;
                 }
                 let metrics = read_json_file(&run_dir.join(id).join("metrics.json"));
-                let symbols = compact_value(
-                    metrics.as_ref().and_then(|v| v.get("symbols")).unwrap_or(&Value::Null),
-                    0,
-                );
-                let history = downsample_history(metrics.as_ref().and_then(|v| v.get("history")));
+                let detailed = latest_dir.as_ref().is_some_and(|path| path == &run_dir);
+                let symbols = if detailed {
+                    compact_value(
+                        metrics.as_ref().and_then(|v| v.get("symbols")).unwrap_or(&Value::Null),
+                        0,
+                    )
+                } else {
+                    Value::Array(
+                        metrics.as_ref()
+                            .and_then(|v| v.get("symbols"))
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|symbol| symbol.get("symbol").map(|name| json!({"symbol": name})))
+                            .collect(),
+                    )
+                };
+                let history = if detailed {
+                    downsample_history(metrics.as_ref().and_then(|v| v.get("history")))
+                } else {
+                    json!([])
+                };
                 methods.push(json!({
                     "id": id,
                     "method": definition.get("method").cloned().unwrap_or(Value::Null),
