@@ -1,13 +1,8 @@
 # AnchorBell: Binance Equity Perpetual Anchor-Maker Engine
 
 <p align="center">
-<<<<<<< HEAD
-  <strong>Anchor the close. Quote the deviation. Flatten before reopen.</strong><br>
-  A Rust-first, maker-only industrial quantitative service for controlled Testnet/Production execution.
-=======
   <strong>Research the close. Quote the deviation. Reduce risk before the deadline.</strong><br>
-  A Rust-first, maker-only engine for Binance equity perpetual research and controlled Testnet/Production execution.
->>>>>>> refs/remotes/github/codex/safety-core
+  A Rust-first, maker-first engine with an adaptive, reduce-only taker escape path for Binance equity perpetual research and controlled Testnet/Production execution.
 </p>
 
 <p align="center">
@@ -20,6 +15,7 @@
   <a href="docs/SIMULATION_RUNTIME.md">Simulation / Replay</a> ·
   <a href="docs/DUAL_ENVIRONMENT_RUNBOOK.md">Dual Environment</a> ·
   <a href="docs/ARCHITECTURE.md">Architecture</a> ·
+  <a href="docs/ARCHITECTURE_GOVERNANCE.md">Governance</a> ·
   <a href="docs/PLATFORM_SYSTEM_CATALOG.md">System Catalog</a> ·
   <a href="docs/ROADMAP.md">Roadmap</a>
 </p>
@@ -28,10 +24,10 @@
   <a href="https://www.rust-lang.org/"><img alt="Rust 2021" src="https://img.shields.io/badge/Rust-2021-orange?logo=rust"></a>
   <a href="LICENSE"><img alt="Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-green"></a>
   <a href="https://www.binance.com/"><img alt="Binance" src="https://img.shields.io/badge/exchange-Binance-F0B90B"></a>
-  <a href="docs/TESTNET_AND_BACKTEST.md"><img alt="maker-only" src="https://img.shields.io/badge/execution-maker--only-blue"></a>
+  <a href="docs/TESTNET_AND_BACKTEST.md"><img alt="maker-first" src="https://img.shields.io/badge/execution-maker--first-blue"></a>
 </p>
 
-AnchorBell is a Rust-first, maker-only Binance equity perpetual quantitative service for
+AnchorBell is a Rust-first, maker-first Binance equity perpetual quantitative service with a strictly reduce-only emergency taker path for
 live-market data, isolated simulation, historical replay, controlled Testnet and
 explicitly gated Production execution, risk controls, order lifecycle management,
 recovery, and observability.
@@ -46,12 +42,12 @@ deviate from the last reliable equity-market close. AnchorBell models that close
 as a static anchor, evaluates the deviation, places only passive post-only quotes,
 and targets passive reduction before the underlying market reopens or the next
 funding-risk deadline. Unfilled residual exposure is reported, never treated as
-a synthetic fill.
+a synthetic fill. A registered emergency taker may be used only for reduce-only escape when the configured deadline, execution-cost, and safety gates prove passive reduction infeasible or materially riskier.
 
 The system is intentionally narrow:
 
 - Binance equity perpetual contracts.
-- Maker-only entry and exit.
+- Maker-first entry and normal reduction; an adaptive taker may reduce exposure only under the registered emergency policy.
 - Static closing-price anchor with explicit validity.
 - Hong Kong issuers with active ADR/ADS price discovery are excluded from the FrozenClose strategy; weak or stale OTC programs are recorded but do not become the anchor.
 - Short-lived exposure inside a defined session window.
@@ -64,12 +60,13 @@ exchange adapters. No strategy module is allowed to discover credentials,
 open sockets, or mutate exchange state directly.
 
 ```mermaid
-flowchart LR
-    A["Binance streams"] --> B["Parser"]
-    B --> C["Recorder / replay"]
-    C --> D["Strategy and risk"]
-    D --> E["Maker lifecycle"]
-    E --> F["Testnet adapter"]
+flowchart TD
+    A["Binance streams"] --> B["Parser / recorder"]
+    B --> C["Strategy + risk"]
+    C --> D["Maker lifecycle"]
+    C --> E["Emergency reduce-only taker"]
+    D --> F["Environment adapter"]
+    E --> F
 ```
 
 The critical boundaries are:
@@ -87,7 +84,7 @@ Composition happens at the edges. The core remains usable with simulation gatewa
 recorded data, or a future Binance network adapter.
 ## Design principles
 
-1. Maker-only is a hard invariant, not a best-effort preference.
+1. Maker-first is the default execution invariant; the emergency taker path is reduce-only, policy-gated, and never an entry path.
 2. The engine targets passive reduction before the earliest risk deadline and
    explicitly reports any unfilled residual exposure.
 3. Invalid anchors, stale data, and exceeded position limits fail closed.
