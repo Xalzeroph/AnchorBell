@@ -400,7 +400,7 @@ mod tests {
             },
         );
         assert!(!result.eligible);
-        assert_eq!(result.reason, "lower_quartile_return_not_positive");
+        assert_eq!(result.reason, "lower_quartile_return_floor_not_met");
     }
 
     #[test]
