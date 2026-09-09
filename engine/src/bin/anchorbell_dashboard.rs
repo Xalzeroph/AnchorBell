@@ -851,7 +851,11 @@ fn external_batch_observation() -> Option<Value> {
         .as_ref()
         .and_then(|value| value.get("run_id"))
         .and_then(Value::as_str)
-        .or_else(|| simulation.and_then(|value| value.get("run_id")).and_then(Value::as_str))
+        .or_else(|| {
+            simulation
+                .and_then(|value| value.get("run_id"))
+                .and_then(Value::as_str)
+        })
         .unwrap_or_default();
     let batch_status = status
         .as_ref()
@@ -862,12 +866,20 @@ fn external_batch_observation() -> Option<Value> {
         .as_ref()
         .and_then(|value| value.get("started_at_ms"))
         .and_then(Value::as_u64)
-        .or_else(|| simulation.and_then(|value| value.get("created_at_ms")).and_then(Value::as_u64));
+        .or_else(|| {
+            simulation
+                .and_then(|value| value.get("created_at_ms"))
+                .and_then(Value::as_u64)
+        });
     let build_identity = status
         .as_ref()
         .and_then(|value| value.get("build_identity"))
         .and_then(Value::as_str)
-        .or_else(|| simulation.and_then(|value| value.get("build_identity")).and_then(Value::as_str));
+        .or_else(|| {
+            simulation
+                .and_then(|value| value.get("build_identity"))
+                .and_then(Value::as_str)
+        });
     object.insert("source".to_owned(), json!("systemd_batch"));
     object.insert("batch_status".to_owned(), json!(batch_status));
     object.insert("run_id".to_owned(), json!(run_id));
@@ -893,9 +905,18 @@ fn external_batch_runtime_snapshot(observation: &Value) -> Value {
     let output_path = observation
         .get("run_dir")
         .and_then(Value::as_str)
-        .and_then(|path| observation.get("experiment_id").and_then(Value::as_str).map(|id| {
-            PathBuf::from(path).join(id).join("metrics.json").display().to_string()
-        }));
+        .and_then(|path| {
+            observation
+                .get("experiment_id")
+                .and_then(Value::as_str)
+                .map(|id| {
+                    PathBuf::from(path)
+                        .join(id)
+                        .join("metrics.json")
+                        .display()
+                        .to_string()
+                })
+        });
     json!({
         "mode": "simulation",
         "status": status,
