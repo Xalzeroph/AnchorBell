@@ -13,7 +13,7 @@ use anchorbell_engine::{
     execution::{
         BinanceAccountStatusResponse, BinanceAccountStatusWire, BinanceCredentials,
         BinanceEnvironment, BinanceOrderWebSocket, BinanceRestClient, DeploymentConfig,
-        DeploymentConfigError, PersistentCredentialStore, Side,
+        DeploymentConfigError, Side,
     },
     market::{
         BinanceMarketConfig, BinanceMarketStream, BinanceSubscription, InstrumentRegistryConfig,
@@ -38,7 +38,6 @@ const MAX_REQUEST_BYTES: usize = 1_048_576;
 struct DashboardState {
     session: Arc<Mutex<DashboardSession>>,
     sessions: Arc<Mutex<BTreeMap<String, Arc<Mutex<DashboardSession>>>>>,
-    credential_store: Arc<PersistentCredentialStore>,
     runtimes: Arc<Mutex<RuntimeRegistry>>,
     runtime_sessions: Arc<Mutex<BTreeMap<String, Arc<Mutex<RuntimeRegistry>>>>>,
     registry: Arc<Mutex<SystemRegistry>>,
@@ -229,7 +228,6 @@ async fn main() -> std::io::Result<()> {
         ));
     }
     let listener = TcpListener::bind(&bind_address).await?;
-    let credential_store = Arc::new(PersistentCredentialStore);
     // Credentials are deliberately session-memory-only. A shared persistent
     // credential store would violate per-session account isolation.
     let saved_testnet_credentials: Option<BinanceCredentials> = None;
@@ -254,7 +252,6 @@ async fn main() -> std::io::Result<()> {
             "default".to_owned(),
             default_session,
         )]))),
-        credential_store,
         runtimes: Arc::clone(&default_runtimes),
         runtime_sessions: Arc::new(Mutex::new(BTreeMap::from([(
             "default".to_owned(),
