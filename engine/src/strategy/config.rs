@@ -1,5 +1,5 @@
 //! Versioned, typed strategy/runtime configuration.
-use crate::execution::BinanceEnvironment;
+use crate::execution::{BinanceEnvironment, EmergencyExecutionPolicy};
 use crate::simulation::experiment_plan::ExperimentSpec;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, fs, path::Path};
@@ -40,6 +40,8 @@ pub struct StrategyProfile {
     pub decision_to_exchange_ms: u64,
     pub cancel_to_exchange_ms: u64,
     pub quote_reprice_min_interval_ms: u64,
+    #[serde(default)]
+    pub emergency_execution: EmergencyExecutionPolicy,
     pub dynamic_capital_refresh_ms: u64,
     pub depth_snapshot_limit: usize,
     pub checkpoint_interval_ms: u64,
@@ -104,6 +106,7 @@ impl StrategyProfile {
         {
             return Err("strategy profile contains invalid numeric or experiment values".into());
         }
+        self.emergency_execution.validate().map_err(str::to_owned)?;
         self.experiment_plan()
             .map_err(|error| format!("invalid experiment plan: {error}"))?;
         Ok(())
@@ -156,7 +159,7 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../config/anchorbell-simulation.json");
         let profile = StrategyProfile::load(path).unwrap();
         let plan = profile.experiment_plan().unwrap();
-        assert_eq!(plan.experiments.len(), 10);
+        assert_eq!(plan.experiments.len(), 11);
         assert!(plan.runtime_specs_with_ablations().is_ok());
     }
 
@@ -195,6 +198,7 @@ mod tests {
             decision_to_exchange_ms: 0,
             cancel_to_exchange_ms: 0,
             quote_reprice_min_interval_ms: 1,
+            emergency_execution: EmergencyExecutionPolicy::default(),
             dynamic_capital_refresh_ms: 1,
             depth_snapshot_limit: 1,
             checkpoint_interval_ms: 1,

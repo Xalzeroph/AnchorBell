@@ -595,6 +595,7 @@ impl SignalDecision {
                 price: price.0,
                 quantity,
                 post_only: true,
+                reduce_only: false,
             }),
             SignalDecision::SellMaker { price, quantity } => Some(OrderIntent {
                 symbol,
@@ -602,6 +603,7 @@ impl SignalDecision {
                 price: price.0,
                 quantity,
                 post_only: true,
+                reduce_only: false,
             }),
             SignalDecision::Blocked(_) => None,
         }

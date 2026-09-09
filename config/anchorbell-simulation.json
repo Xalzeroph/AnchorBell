@@ -21,7 +21,7 @@
   "requested_quantity": 1000000,
   "max_mark_index_gap_bps": 50,
   "max_anchor_age_ms": 120000,
-  "fee_ppm": 200,
+  "fee_ppm": 0,
   "quantity_scale": 8,
   "price_scale": 8,
   "max_subscriptions_per_shard": 64,
@@ -48,7 +48,7 @@
       "ablations": [],
       "role": "Control",
       "parent_experiment_id": null,
-      "execution_overlay": "maker_only",
+      "execution_overlay": "adaptive_emergency_reduce_only_taker",
       "evidence_policy": "oos_required"
     },
     {
@@ -57,7 +57,7 @@
       "ablations": [],
       "role": "Incremental",
       "parent_experiment_id": "F0_m0",
-      "execution_overlay": "maker_only",
+      "execution_overlay": "adaptive_emergency_reduce_only_taker",
       "evidence_policy": "oos_required"
     },
     {
@@ -66,7 +66,7 @@
       "ablations": [],
       "role": "Incremental",
       "parent_experiment_id": "F1_m1",
-      "execution_overlay": "maker_only",
+      "execution_overlay": "adaptive_emergency_reduce_only_taker",
       "evidence_policy": "oos_required"
     },
     {
@@ -75,7 +75,7 @@
       "ablations": [],
       "role": "Incremental",
       "parent_experiment_id": "F2_m2",
-      "execution_overlay": "maker_only",
+      "execution_overlay": "adaptive_emergency_reduce_only_taker",
       "evidence_policy": "oos_required"
     },
     {
@@ -84,7 +84,7 @@
       "ablations": [],
       "role": "Incremental",
       "parent_experiment_id": "F3_m3",
-      "execution_overlay": "maker_only",
+      "execution_overlay": "adaptive_emergency_reduce_only_taker",
       "evidence_policy": "oos_required"
     },
     {
@@ -93,7 +93,7 @@
       "ablations": [],
       "role": "Incremental",
       "parent_experiment_id": "F4_m4",
-      "execution_overlay": "maker_only",
+      "execution_overlay": "adaptive_emergency_reduce_only_taker",
       "evidence_policy": "oos_required"
     },
     {
@@ -102,7 +102,7 @@
       "ablations": [],
       "role": "Incremental",
       "parent_experiment_id": "F5_m5",
-      "execution_overlay": "maker_only",
+      "execution_overlay": "adaptive_emergency_reduce_only_taker",
       "evidence_policy": "oos_required"
     },
     {
@@ -111,7 +111,7 @@
       "ablations": [],
       "role": "Incremental",
       "parent_experiment_id": "F6_m6",
-      "execution_overlay": "maker_only",
+      "execution_overlay": "adaptive_emergency_reduce_only_taker",
       "evidence_policy": "oos_required"
     },
     {
@@ -120,7 +120,7 @@
       "ablations": [],
       "role": "Incremental",
       "parent_experiment_id": "F7_m7",
-      "execution_overlay": "maker_only",
+      "execution_overlay": "adaptive_emergency_reduce_only_taker",
       "evidence_policy": "oos_required"
     },
     {
@@ -131,7 +131,7 @@
       ],
       "role": "Ablation",
       "parent_experiment_id": "M8_full",
-      "execution_overlay": "maker_only",
+      "execution_overlay": "adaptive_emergency_reduce_only_taker",
       "evidence_policy": "oos_required"
     },
     {
@@ -140,7 +140,7 @@
       "ablations": [],
       "role": "Challenger",
       "parent_experiment_id": "M8_full",
-      "execution_overlay": "maker_only",
+      "execution_overlay": "adaptive_emergency_reduce_only_taker",
       "evidence_policy": "oos_required"
     }
   ],
@@ -148,5 +148,16 @@
   "universe_id": "frozen-close-ah",
   "max_stale_ms": 5000,
   "run_registry_heartbeat_ms": 5000,
-  "runtime_audit_path": "target/batch-runtime-audit.jsonl"
+  "runtime_audit_path": "target/batch-runtime-audit.jsonl",
+  "emergency_execution": {
+    "max_slippage_bps": 25,
+    "max_participation_bps": 5000,
+    "minimum_maker_confidence_bps": 7000,
+    "cooldown_ms": 1000,
+    "safety_buffer_ms": 1000,
+    "taker_fee_ppm": 400,
+    "urgency_cost_bps_per_second": 2,
+    "deadline_penalty_bps": 100,
+    "cost_margin_bps": 1
+  }
 }

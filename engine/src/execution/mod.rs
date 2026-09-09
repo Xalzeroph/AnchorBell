@@ -1,3 +1,4 @@
+pub mod adaptive_taker;
 pub mod binance;
 #[path = "binance_wire.rs"]
 pub mod binance_wire;
@@ -45,12 +46,17 @@ pub use ports::{
 pub use reconciliation::{reconcile, ReconciliationAction, ReconciliationInput};
 pub use recovery::{RecoveryEpoch, RecoveryEvent, RecoveryMachine, RecoveryState};
 pub use rest::{
-    BinanceAccountSnapshot, BinanceMakerOrderRequest, BinanceOpenOrder, BinanceOrderResponse,
-    BinancePositionRisk, BinanceRestClient, BinanceRestError, BinanceTradFiContractResponse,
+    BinanceAccountSnapshot, BinanceEmergencyReduceOnlyTakerRequest, BinanceMakerOrderRequest,
+    BinanceOpenOrder, BinanceOrderResponse, BinancePositionRisk, BinanceRestClient,
+    BinanceRestError, BinanceTradFiContractResponse,
 };
 
 pub use signing::{canonical_query, sign_query, signed_params, SigningError};
 
+pub use adaptive_taker::{
+    decide as decide_adaptive_taker, AdaptiveTakerDecision, AdaptiveTakerInput,
+    EmergencyExecutionPolicy, TakerBlockReason, TakerDecision, TakerTrigger,
+};
 pub use binance::BinanceGateway;
 pub use binance_wire::{
     BinanceAccountStatusResponse, BinanceAccountStatusResult, BinanceAccountStatusWire,

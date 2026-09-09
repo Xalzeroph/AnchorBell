@@ -44,6 +44,7 @@ mod tests {
             price: 100,
             quantity: 1,
             post_only: true,
+            reduce_only: false,
         };
         assert_eq!(gateway.submit(order), GatewayResult::Unavailable);
         assert_eq!(gateway.cancel(1), GatewayResult::Unavailable);

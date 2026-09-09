@@ -233,6 +233,7 @@ fn main() {
             decision_to_exchange_ms: profile.decision_to_exchange_ms,
             cancel_to_exchange_ms: profile.cancel_to_exchange_ms,
             quote_reprice_min_interval_ms: profile.quote_reprice_min_interval_ms,
+            emergency_execution: profile.emergency_execution,
             dynamic_capital_refresh_ms: profile.dynamic_capital_refresh_ms,
             depth_snapshot_limit: profile.depth_snapshot_limit,
             checkpoint_path: Some(checkpoint_path),

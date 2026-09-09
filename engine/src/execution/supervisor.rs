@@ -340,7 +340,11 @@ impl ExecutionSupervisor {
         if intent.symbol == 0 || intent.price <= 0 || intent.quantity <= 0 {
             return GateDecision::Halt(GateReason::InvalidIntent);
         }
-        if !intent.post_only {
+        if !intent.post_only
+            && (!intent.reduce_only
+                || (intent.side == Side::Buy && state.position >= 0)
+                || (intent.side == Side::Sell && state.position <= 0))
+        {
             return GateDecision::Halt(GateReason::NonMakerIntent);
         }
         if now_ms < state.market_at_ms
@@ -700,6 +704,7 @@ mod tests {
                 "CXMTUSDT",
                 OrderIntent {
                     post_only: false,
+                    reduce_only: false,
                     ..intent
                 },
                 1_001

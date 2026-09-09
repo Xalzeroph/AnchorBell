@@ -105,7 +105,7 @@ impl TradingRuntime {
             let Some(intent) = handler.on_event(event) else {
                 continue;
             };
-            if !intent.post_only {
+            if !intent.post_only && !intent.reduce_only {
                 self.halted = true;
                 self.running = false;
                 return Err(DispatchError::NonMakerIntent);
@@ -153,7 +153,7 @@ impl TradingRuntime {
         let Some(intent) = handler.on_event(event) else {
             return Ok(None);
         };
-        if !intent.post_only {
+        if !intent.post_only && !intent.reduce_only {
             self.halted = true;
             return Err(DispatchError::NonMakerIntent);
         }
@@ -205,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_taker_intents_and_halts() {
+    fn rejects_unscoped_taker_intents_and_halts() {
         let mut runtime = TradingRuntime::new();
         let mut handler = |_event| {
             Some(OrderIntent {
@@ -214,6 +214,7 @@ mod tests {
                 price: 100,
                 quantity: 2,
                 post_only: false,
+                reduce_only: false,
             })
         };
 

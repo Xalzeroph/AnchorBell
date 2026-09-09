@@ -28,7 +28,10 @@ use decision_audit::DecisionAuditContext;
 use crate::{
     backtest::TopOfBook,
     execution::BinanceEnvironment,
-    execution::{OrderIntent, Side},
+    execution::{
+        decide_adaptive_taker, AdaptiveTakerDecision, AdaptiveTakerInput, EmergencyExecutionPolicy,
+        OrderIntent, Side,
+    },
     market::{
         binance::{AggTrade, BinanceMarketEvent, BookTicker, MarkPrice},
         recorder::{add_event_lineage, market_event_to_json},
@@ -679,6 +682,7 @@ struct SimulationSymbolState {
     adaptive_relief_micro_bps: i64,
     adaptive_relief_pico_bps: i64,
     working: Option<WorkingOrder>,
+    last_taker_at_ms: Option<u64>,
     position: i64,
     average_entry_ticks: i64,
     realized_pnl_ticks: i64,
@@ -766,6 +770,7 @@ pub struct SimulationSummary {
     pub fees_ticks: i64,
     pub net_pnl_ticks: i64,
     pub maker_fee_ppm: i64,
+    pub taker_fee_ppm: i64,
     pub unrealized_valuation_complete: bool,
     pub current_absolute_position: i64,
     pub peak_absolute_position: i64,
@@ -1019,6 +1024,7 @@ pub struct MetricsSnapshot {
     pub portfolio_drawdown: Option<PortfolioDrawdownSnapshot>,
     pub calendar_snapshot: String,
     pub maker_fee_source: String,
+    pub taker_fee_source: String,
     pub funding_model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capital_usdt_ticks: Option<i64>,
@@ -1061,6 +1067,7 @@ pub struct SimulationEngine {
     dynamic_capital_refresh_ms: u64,
     last_dynamic_capital_update_ms: u64,
     causal_ledger: CausalLedger,
+    emergency_policy: EmergencyExecutionPolicy,
 }
 
 impl SimulationEngine {
@@ -1123,6 +1130,7 @@ impl SimulationEngine {
                         adaptive_relief_micro_bps: 0,
                         adaptive_relief_pico_bps: 0,
                         working: None,
+                        last_taker_at_ms: None,
                         position: 0,
                         average_entry_ticks: 0,
                         realized_pnl_ticks: 0,
@@ -1186,12 +1194,22 @@ impl SimulationEngine {
             dynamic_capital_refresh_ms: 60_000,
             last_dynamic_capital_update_ms: 0,
             causal_ledger: CausalLedger::default(),
+            emergency_policy: EmergencyExecutionPolicy::default(),
         })
     }
 
     pub fn with_realism(mut self, realism: crate::backtest::realism::RealisticFillModel) -> Self {
         self.realism = realism;
         self
+    }
+
+    pub fn with_emergency_execution_policy(
+        mut self,
+        policy: EmergencyExecutionPolicy,
+    ) -> Result<Self, SimulationError> {
+        policy.validate().map_err(SimulationError::InvalidConfig)?;
+        self.emergency_policy = policy;
+        Ok(self)
     }
 
     pub fn with_live_risk_gates(mut self) -> Self {
@@ -1658,6 +1676,7 @@ impl SimulationEngine {
                 },
                 quantity: position.checked_abs().unwrap_or(i64::MAX),
                 post_only: true,
+                reduce_only: true,
             });
             if let Some(intent) = desired {
                 records.extend(self.place_symbol(&symbol, intent, timestamp_ms, true, None));
@@ -1763,6 +1782,7 @@ impl SimulationEngine {
                 .saturating_add(funding_pnl_ticks)
                 .saturating_sub(fees_ticks),
             maker_fee_ppm: self.fee_ppm,
+            taker_fee_ppm: self.emergency_policy.taker_fee_ppm,
             unrealized_valuation_complete,
             current_absolute_position,
             peak_absolute_position: self.peak_absolute_position,
@@ -2144,7 +2164,9 @@ impl SimulationEngine {
                 .as_ref()
                 .map(PortfolioDrawdownGuard::snapshot),
             calendar_snapshot: "sse-hkex-2026".to_owned(),
-            maker_fee_source: "binance_usdm_base_maker_schedule".to_owned(),
+            maker_fee_source: "binance_tradfi_perps_promo_regular_vip1_maker_0bps".to_owned(),
+            taker_fee_source: "binance_tradfi_perps_promo_regular_vip1_taker_40bps_no_bnb"
+                .to_owned(),
             funding_model: "m8_exact_mark_settlement_plus_strategy_funding_controller".to_owned(),
             capital_usdt_ticks: self.capital_usdt_ticks,
             capital_usdt: self.capital_usdt_ticks.map(|capital| {
@@ -2759,6 +2781,9 @@ impl SimulationEngine {
                         state,
                         timestamp_ms,
                         self.quantity_scale,
+                        self.emergency_policy,
+                        self.fee_ppm,
+                        self.max_mark_index_gap_bps,
                     );
                     (desired, true, state.working.is_some(), exit_reason)
                 }
@@ -3087,10 +3112,99 @@ impl SimulationEngine {
         reduce_only: bool,
         decision_id: Option<u64>,
     ) -> Vec<SimulationRecord> {
-        if !intent.post_only || intent.price <= 0 || intent.quantity <= 0 {
+        if !intent.is_admissible_shape() {
             return Vec::new();
         }
         let client_id = self.next_client_id;
+        if intent.is_emergency_taker() {
+            if !reduce_only {
+                self.reject_entry("execution_taker_not_reduce_only");
+                return Vec::new();
+            }
+            let Some(book) = self.states.get(symbol).and_then(|state| state.book) else {
+                self.reject_entry("execution_taker_invalid_book");
+                return Vec::new();
+            };
+            let crosses = match intent.side {
+                Side::Buy => intent.price >= book.ask_price_ticks,
+                Side::Sell => intent.price <= book.bid_price_ticks,
+            };
+            if !crosses {
+                self.reject_entry("execution_taker_not_aggressive");
+                return Vec::new();
+            }
+            let position = self.states[symbol].position;
+            if (intent.side == Side::Buy && position >= 0)
+                || (intent.side == Side::Sell && position <= 0)
+            {
+                self.reject_entry("execution_taker_not_reducing");
+                return Vec::new();
+            }
+            let quantity = intent
+                .quantity
+                .min(position.checked_abs().unwrap_or(i64::MAX));
+            let fill_price = if intent.side == Side::Buy {
+                book.ask_price_ticks
+            } else {
+                book.bid_price_ticks
+            };
+            {
+                let state = self.states.get_mut(symbol).expect("symbol state exists");
+                apply_position_fill(
+                    state,
+                    intent.side,
+                    fill_price,
+                    quantity,
+                    self.emergency_policy.taker_fee_ppm,
+                    self.quantity_scale,
+                );
+                state.last_taker_at_ms = Some(timestamp_ms);
+            }
+            self.order_count = self.order_count.saturating_add(1);
+            self.fill_count = self.fill_count.saturating_add(1);
+            self.filled_quantity = self.filled_quantity.saturating_add(quantity);
+            let state = self.states.get(symbol).expect("symbol state exists");
+            return vec![
+                self.record(
+                    symbol,
+                    state,
+                    timestamp_ms,
+                    RecordFields {
+                        kind: "order_placed",
+                        decision_id,
+                        client_id: Some(client_id),
+                        side: Some(intent.side),
+                        price_ticks: Some(intent.price),
+                        quantity: Some(quantity),
+                        order_age_ms: Some(0),
+                        queue_ahead_quantity: Some(0),
+                        quote_distance_bps: Some(0),
+                        detail: Some("adaptive emergency reduce-only taker IOC"),
+                    },
+                ),
+                self.record(
+                    symbol,
+                    state,
+                    timestamp_ms,
+                    RecordFields {
+                        kind: "fill",
+                        decision_id,
+                        client_id: Some(client_id),
+                        side: Some(intent.side),
+                        price_ticks: Some(fill_price),
+                        quantity: Some(quantity),
+                        order_age_ms: Some(0),
+                        queue_ahead_quantity: Some(0),
+                        quote_distance_bps: Some(0),
+                        detail: Some("adaptive emergency taker IOC fill"),
+                    },
+                ),
+            ];
+        }
+        if !intent.post_only {
+            self.reject_entry("execution_maker_validation");
+            return Vec::new();
+        }
         self.next_client_id = self.next_client_id.saturating_add(1);
         let state = self.states.get_mut(symbol).expect("symbol state exists");
         let Some(book) = state.book else {
@@ -3556,6 +3670,7 @@ fn m9_intent_for_state(
             price: book.bid_price_ticks,
             quantity: decision.quantity,
             post_only: true,
+            reduce_only: false,
         }),
         M9Action::SellMaker => Some(OrderIntent {
             symbol: state.symbol_id,
@@ -3563,6 +3678,7 @@ fn m9_intent_for_state(
             price: book.ask_price_ticks,
             quantity: decision.quantity,
             post_only: true,
+            reduce_only: false,
         }),
         M9Action::ReduceBuy => Some(OrderIntent {
             symbol: state.symbol_id,
@@ -3570,6 +3686,7 @@ fn m9_intent_for_state(
             price: book.bid_price_ticks,
             quantity: decision.quantity,
             post_only: true,
+            reduce_only: false,
         }),
         M9Action::ReduceSell => Some(OrderIntent {
             symbol: state.symbol_id,
@@ -3577,6 +3694,7 @@ fn m9_intent_for_state(
             price: book.ask_price_ticks,
             quantity: decision.quantity,
             post_only: true,
+            reduce_only: false,
         }),
         M9Action::NoAction => None,
     };
@@ -3613,6 +3731,9 @@ fn maker_exit_intent_for_state(
     state: &SimulationSymbolState,
     timestamp_ms: u64,
     quantity_scale: u32,
+    emergency_policy: EmergencyExecutionPolicy,
+    fee_ppm: i64,
+    max_mark_index_gap_bps: i64,
 ) -> (Option<OrderIntent>, &'static str) {
     let Some(position_quantity) = state.position.checked_abs() else {
         return (None, "maker_exit_position_overflow");
@@ -3646,6 +3767,65 @@ fn maker_exit_intent_for_state(
     ) else {
         return (None, "maker_exit_plan_invalid");
     };
+    let calibration = state
+        .calibration
+        .snapshot(ppm_to_pico_bps(fee_ppm.saturating_mul(2)))
+        .calibration;
+    let maker_estimated_time_ms = calibration
+        .map(|value| value.fill_horizon_ms)
+        .unwrap_or_default();
+    let maker_confidence_bps = calibration
+        .map(|value| value.fill_hazard_bps.clamp(0, 10_000) as u16)
+        .unwrap_or(10_000);
+    let mark_index_gap_bps = match (state.mark_price_ticks, state.index_price_ticks) {
+        (Some(mark), Some(index)) if mark > 0 && index > 0 => Some(bps_between(mark, index)),
+        _ => None,
+    };
+    let maker_remaining_quantity = state
+        .working
+        .map(|order| order.remaining_quantity)
+        .unwrap_or(position_quantity);
+    let taker_input = AdaptiveTakerInput {
+        now_ms: timestamp_ms,
+        deadline_ms: plan.hard_deadline_ms(),
+        position: state.position,
+        maker_remaining_quantity,
+        maker_estimated_time_ms,
+        maker_confidence_bps,
+        bid_price_ticks: book.bid_price_ticks,
+        ask_price_ticks: book.ask_price_ticks,
+        bid_quantity: book.bid_quantity,
+        ask_quantity: book.ask_quantity,
+        market_age_ms: timestamp_ms.saturating_sub(state.last_mark_time_ms),
+        book_age_ms: timestamp_ms.saturating_sub(state.last_book_event_at_ms),
+        remote_state_known: !state.last_mark_time_ms.eq(&0),
+        anchor_valid: state.anchor.valid_at(timestamp_ms, u64::MAX),
+        mark_index_gap_bps,
+        max_mark_index_gap_bps,
+        volatility_bps: state.ewma_abs_return_bps,
+        last_taker_at_ms: state.last_taker_at_ms,
+    };
+    if let AdaptiveTakerDecision::Submit(decision) =
+        decide_adaptive_taker(emergency_policy, taker_input)
+    {
+        return (
+            Some(OrderIntent::emergency_reduce_only_taker(
+                state.symbol_id,
+                decision.side,
+                decision.price_ticks,
+                decision.quantity,
+            )),
+            match decision.trigger {
+                crate::execution::TakerTrigger::MakerCannotMeetDeadline => {
+                    "adaptive_emergency_taker_maker_deadline"
+                }
+                crate::execution::TakerTrigger::WaitingCostExceedsTakerCost => {
+                    "adaptive_emergency_taker_waiting_cost"
+                }
+            },
+        );
+    }
+
     let working = match state.working {
         None => ExitWorkingOrder::None,
         Some(order) if order.cancel_requested_at_ms.is_some() => ExitWorkingOrder::Pending,
@@ -3691,6 +3871,7 @@ fn maker_exit_intent_for_state(
                 price: order.price_ticks,
                 quantity: order.remaining_quantity,
                 post_only: true,
+                reduce_only: false,
             }),
             "maker_exit_keep_working",
         ),

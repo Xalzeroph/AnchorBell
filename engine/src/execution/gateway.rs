@@ -4,6 +4,7 @@ pub struct ExchangeOrder {
     pub price: i64,
     pub quantity: i64,
     pub post_only: bool,
+    pub reduce_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,7 +26,7 @@ pub struct SimulationGateway;
 
 impl ExecutionGateway for SimulationGateway {
     fn submit(&self, order: ExchangeOrder) -> GatewayResult {
-        if order.post_only {
+        if order.post_only || (order.reduce_only && !order.post_only) {
             GatewayResult::Accepted
         } else {
             GatewayResult::Rejected

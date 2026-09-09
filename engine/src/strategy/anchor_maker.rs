@@ -52,6 +52,7 @@ impl AnchorMakerStrategy {
                 price: bid,
                 quantity,
                 post_only: true,
+                reduce_only: false,
             })
         } else if deviation_numerator >= threshold_numerator {
             Some(OrderIntent {
@@ -60,6 +61,7 @@ impl AnchorMakerStrategy {
                 price: ask,
                 quantity,
                 post_only: true,
+                reduce_only: false,
             })
         } else {
             None
@@ -76,6 +78,7 @@ impl AnchorMakerStrategy {
                 price: price.0,
                 quantity,
                 post_only: true,
+                reduce_only: false,
             }),
             SignalDecision::SellMaker { price, quantity } => Some(OrderIntent {
                 symbol: input.symbol,
@@ -83,6 +86,7 @@ impl AnchorMakerStrategy {
                 price: price.0,
                 quantity,
                 post_only: true,
+                reduce_only: false,
             }),
             SignalDecision::Blocked(_) => None,
         }

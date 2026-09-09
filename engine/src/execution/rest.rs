@@ -102,6 +102,33 @@ pub struct BinanceMakerOrderRequest {
     pub reduce_only: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinanceEmergencyReduceOnlyTakerRequest {
+    pub symbol: String,
+    pub side: Side,
+    pub price: String,
+    pub quantity: String,
+    pub client_order_id: String,
+}
+
+impl BinanceEmergencyReduceOnlyTakerRequest {
+    fn validate(&self) -> Result<(), BinanceRestError> {
+        if !valid_symbol(&self.symbol) {
+            return Err(BinanceRestError::InvalidOrderRequest("symbol"));
+        }
+        if !valid_positive_decimal(&self.price) {
+            return Err(BinanceRestError::InvalidOrderRequest("price"));
+        }
+        if !valid_positive_decimal(&self.quantity) {
+            return Err(BinanceRestError::InvalidOrderRequest("quantity"));
+        }
+        if !valid_client_order_id(&self.client_order_id) {
+            return Err(BinanceRestError::InvalidOrderRequest("client_order_id"));
+        }
+        Ok(())
+    }
+}
+
 impl BinanceMakerOrderRequest {
     fn validate(&self) -> Result<(), BinanceRestError> {
         if !valid_symbol(&self.symbol) {
@@ -451,6 +478,57 @@ impl BinanceRestClient {
         {
             return Err(BinanceRestError::InvalidOrderResponse(
                 "maker order semantics",
+            ));
+        }
+        Ok(response)
+    }
+
+    pub async fn place_emergency_reduce_only_taker(
+        &self,
+        credentials: &BinanceCredentials,
+        request: BinanceEmergencyReduceOnlyTakerRequest,
+        timestamp_ms: u64,
+        recv_window_ms: u64,
+    ) -> Result<BinanceOrderResponse, BinanceRestError> {
+        request.validate()?;
+        let expected_symbol = request.symbol.clone();
+        let expected_client_order_id = request.client_order_id.clone();
+        let expected_side = match request.side {
+            Side::Buy => "BUY",
+            Side::Sell => "SELL",
+        };
+        let mut params = BTreeMap::new();
+        params.insert("newClientOrderId".into(), request.client_order_id);
+        params.insert("price".into(), request.price);
+        params.insert("quantity".into(), request.quantity);
+        params.insert("side".into(), expected_side.into());
+        params.insert("symbol".into(), request.symbol);
+        params.insert("timeInForce".into(), "IOC".into());
+        params.insert("type".into(), "LIMIT".into());
+        params.insert("newOrderRespType".into(), "RESULT".into());
+        params.insert("reduceOnly".into(), "true".into());
+        let body = self
+            .execute_signed(
+                Method::POST,
+                "/fapi/v1/order",
+                params,
+                credentials,
+                timestamp_ms,
+                recv_window_ms,
+                true,
+            )
+            .await?;
+        let response = serde_json::from_slice::<BinanceOrderResponse>(&body)
+            .map_err(|_| BinanceRestError::Decode)?;
+        if response.symbol != expected_symbol
+            || response.client_order_id != expected_client_order_id
+            || response.side != expected_side
+            || response.time_in_force != "IOC"
+            || response.order_type != "LIMIT"
+            || !response.reduce_only
+        {
+            return Err(BinanceRestError::InvalidOrderResponse(
+                "emergency taker order semantics",
             ));
         }
         Ok(response)

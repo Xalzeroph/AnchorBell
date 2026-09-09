@@ -172,7 +172,9 @@ impl ExperimentPlan {
             }
             if !matches!(
                 experiment.execution_overlay.as_str(),
-                "maker_only" | "emergency_reduce_only_taker"
+                "maker_only"
+                    | "emergency_reduce_only_taker"
+                    | "adaptive_emergency_reduce_only_taker"
             ) {
                 return Err("experiment execution overlay is unsupported");
             }

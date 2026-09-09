@@ -336,7 +336,7 @@ fn parse_args() -> Result<Args, String> {
     let mut requested_quantity = 1;
     let mut max_mark_index_gap_bps = 50;
     let mut max_anchor_age_ms = 0;
-    let mut fee_ppm = 200;
+    let mut fee_ppm = 0;
     let mut queue_ahead = 0;
     let mut trade_through = 0;
     let mut market_to_decision_ms = 0;

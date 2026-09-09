@@ -14,9 +14,10 @@ use std::{
 
 use anchorbell_engine::{
     execution::{
-        BinanceCredentials, BinanceEnvironment, BinanceMakerOrderRequest, BinanceRestClient,
-        BinanceUserDataStream, DeploymentConfig, ExecutionSupervisor, GateDecision,
-        SessionCheckpoint, Side, SupervisorConfig, SupervisorState, UserDataEvent,
+        BinanceCredentials, BinanceEmergencyReduceOnlyTakerRequest, BinanceEnvironment,
+        BinanceMakerOrderRequest, BinanceRestClient, BinanceUserDataStream, DeploymentConfig,
+        ExecutionSupervisor, GateDecision, SessionCheckpoint, Side, SupervisorConfig,
+        SupervisorState, UserDataEvent,
     },
     market::{
         binance::{BinanceMarketEvent, BookTicker, MarkPrice},
@@ -83,7 +84,7 @@ struct WorkingOrder {
 }
 
 const SHADOW_SCHEMA_VERSION: u32 = 1;
-const SHADOW_FEE_PPM: i64 = 200;
+const SHADOW_FEE_PPM: i64 = 0;
 
 #[derive(Debug, serde::Serialize)]
 struct ShadowRecordLine<'a> {
@@ -873,6 +874,7 @@ async fn run(args: Args) -> Result<i32, String> {
                                                 quantity: local.position_ticks.unsigned_abs()
                                                     .min(i64::MAX as u64) as i64,
                                                 post_only: true,
+                                                reduce_only: true,
                                             };
                                             order_sequence = order_sequence.saturating_add(1);
                                             let order = place_order(PlaceOrderRequest {
@@ -1387,22 +1389,47 @@ async fn place_order(request: PlaceOrderRequest<'_>) -> Result<WorkingOrder, Str
         reduce_only,
     } = request;
     let client_order_id = format!("anchorbell-{}-{}", now, sequence);
-    let _response = client
-        .place_maker_order(
-            credentials,
-            BinanceMakerOrderRequest {
-                symbol: symbol.to_owned(),
-                side: intent.side,
-                price: format_ticks(intent.price, price_scale),
-                quantity: format_ticks(intent.quantity, quantity_scale),
-                client_order_id: client_order_id.clone(),
-                reduce_only,
-            },
-            client.server_time_ms().await.map_err(|e| e.to_string())?,
-            RECV_WINDOW_MS,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+    let server_time = client.server_time_ms().await.map_err(|e| e.to_string())?;
+    if intent.is_emergency_taker() {
+        if !reduce_only {
+            return Err("emergency taker intent must be reduce-only".to_owned());
+        }
+        let _response = client
+            .place_emergency_reduce_only_taker(
+                credentials,
+                BinanceEmergencyReduceOnlyTakerRequest {
+                    symbol: symbol.to_owned(),
+                    side: intent.side,
+                    price: format_ticks(intent.price, price_scale),
+                    quantity: format_ticks(intent.quantity, quantity_scale),
+                    client_order_id: client_order_id.clone(),
+                },
+                server_time,
+                RECV_WINDOW_MS,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+    } else {
+        if !intent.post_only {
+            return Err("non-maker intent missing adaptive taker authorization".to_owned());
+        }
+        let _response = client
+            .place_maker_order(
+                credentials,
+                BinanceMakerOrderRequest {
+                    symbol: symbol.to_owned(),
+                    side: intent.side,
+                    price: format_ticks(intent.price, price_scale),
+                    quantity: format_ticks(intent.quantity, quantity_scale),
+                    client_order_id: client_order_id.clone(),
+                    reduce_only,
+                },
+                server_time,
+                RECV_WINDOW_MS,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     Ok(WorkingOrder {
         client_order_id,
         side: intent.side,
