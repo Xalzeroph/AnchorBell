@@ -4049,6 +4049,7 @@ fn entry_restriction_reason(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn maker_exit_intent_for_state(
     symbol: &str,
     state: &SimulationSymbolState,

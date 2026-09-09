@@ -146,6 +146,7 @@ struct ShadowSimulation {
 }
 
 impl ShadowSimulation {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         run_id: &str,
         shadow_dir: &Path,
@@ -1560,7 +1561,7 @@ fn spawn_market(
         profile.connect_timeout_ms,
         profile.read_timeout_ms,
         args.proxy.clone(),
-        reconnect.clone(),
+        reconnect,
         args.max_subscriptions_per_shard,
     )
     .map_err(|e| format!("{e:?}"))?;

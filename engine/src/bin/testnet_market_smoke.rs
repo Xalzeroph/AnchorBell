@@ -9,10 +9,7 @@ async fn main() {
     let symbol = std::env::var("ANCHORBELL_TESTNET_SYMBOL").unwrap_or_else(|_| "BTCUSDT".into());
     let subscription = BinanceSubscription::new(symbol).expect("valid symbol");
     let config = BinanceMarketConfig {
-        market_ws_base: BinanceEnvironment::Testnet
-            .endpoints()
-            .market_ws_base
-            .into(),
+        market_ws_base: BinanceEnvironment::Testnet.endpoints().market_ws_base,
         subscriptions: vec![subscription],
         // Mark-price streams commonly expose eight decimal places; normalize both feeds to it.
         price_scale: std::env::var("ANCHORBELL_PRICE_SCALE")

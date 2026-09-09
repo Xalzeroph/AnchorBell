@@ -148,7 +148,7 @@ async fn run(args: Args) -> Result<i32, String> {
         BinanceSubscription::new(&args.symbol).map_err(|error| format!("{error:?}"))?;
     let endpoints = args.environment.endpoints();
     let public_config = BinanceMarketConfig {
-        market_ws_base: endpoints.public_market_ws_base.into(),
+        market_ws_base: endpoints.public_market_ws_base,
         subscriptions: vec![subscription.clone().book_ticker_only()],
         price_scale: args.price_scale,
         quantity_scale: args.quantity_scale,
@@ -162,7 +162,7 @@ async fn run(args: Args) -> Result<i32, String> {
         },
     };
     let market_config = BinanceMarketConfig {
-        market_ws_base: endpoints.market_ws_base.into(),
+        market_ws_base: endpoints.market_ws_base,
         subscriptions: vec![subscription.market_reference_and_trades()],
         price_scale: args.price_scale,
         quantity_scale: args.quantity_scale,
