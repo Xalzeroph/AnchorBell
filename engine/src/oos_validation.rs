@@ -313,15 +313,18 @@ mod tests {
             fold("s2", true, 1.0, 0.3, 2.5),
             fold("s3", true, -8.0, 0.1, 4.0),
         ];
-        let result = evaluate_robust_candidate(&folds, RobustSelectionConstraints {
-            min_oos_folds: 3,
-            min_stress_folds: 3,
-            min_trades_per_oos_fold: 10,
-            max_oos_drawdown_pct: 5.0,
-            max_stress_drawdown_pct: 10.0,
-            max_stress_loss_bps: 50.0,
-            min_stress_survival_ppm: 666_667,
-        });
+        let result = evaluate_robust_candidate(
+            &folds,
+            RobustSelectionConstraints {
+                min_oos_folds: 3,
+                min_stress_folds: 3,
+                min_trades_per_oos_fold: 10,
+                max_oos_drawdown_pct: 5.0,
+                max_stress_drawdown_pct: 10.0,
+                max_stress_loss_bps: 50.0,
+                min_stress_survival_ppm: 666_667,
+            },
+        );
         assert!(result.eligible);
         assert_eq!(result.reason, "eligible");
         assert_eq!(result.stress_survival_ppm, 1_000_000);
@@ -337,15 +340,18 @@ mod tests {
             fold("s2", true, 0.0, 0.1, 2.0),
             fold("s3", true, 0.0, 0.1, 2.0),
         ];
-        let result = evaluate_robust_candidate(&folds, RobustSelectionConstraints {
-            min_oos_folds: 3,
-            min_stress_folds: 3,
-            min_trades_per_oos_fold: 10,
-            max_oos_drawdown_pct: 5.0,
-            max_stress_drawdown_pct: 10.0,
-            max_stress_loss_bps: 50.0,
-            min_stress_survival_ppm: 666_667,
-        });
+        let result = evaluate_robust_candidate(
+            &folds,
+            RobustSelectionConstraints {
+                min_oos_folds: 3,
+                min_stress_folds: 3,
+                min_trades_per_oos_fold: 10,
+                max_oos_drawdown_pct: 5.0,
+                max_stress_drawdown_pct: 10.0,
+                max_stress_loss_bps: 50.0,
+                min_stress_survival_ppm: 666_667,
+            },
+        );
         assert!(!result.eligible);
         assert_eq!(result.reason, "lower_quartile_return_not_positive");
     }
