@@ -1,11 +1,13 @@
 use std::{collections::BTreeSet, env, fs, path::PathBuf, process};
 
 use anchorbell_engine::{
+    oos_validation::{
+        merge_fold_bundles, validate_candidate_fold_coverage, OosFoldBundle, OosFoldMetrics,
+    },
     promotion_policy::{
         compare_risk_adjusted_candidates, RiskAdjustedCandidateEvaluation,
         RiskAdjustedPromotionPolicy,
     },
-    oos_validation::{merge_fold_bundles, validate_candidate_fold_coverage, OosFoldBundle, OosFoldMetrics},
 };
 use serde::{Deserialize, Serialize};
 
@@ -42,8 +44,8 @@ enum SelectionSource {
 
 fn main() {
     let (source, policy_path) = parse_args().unwrap_or_else(|message| fail(message));
-    let policy = RiskAdjustedPromotionPolicy::load(&policy_path)
-        .unwrap_or_else(|message| fail(message));
+    let policy =
+        RiskAdjustedPromotionPolicy::load(&policy_path).unwrap_or_else(|message| fail(message));
 
     let candidates = match source {
         SelectionSource::Input(input) => {
@@ -68,7 +70,10 @@ fn main() {
             merge_fold_bundles(&bundles)
                 .unwrap_or_else(|reason| fail(format!("cannot merge fold bundles: {reason}")))
                 .into_iter()
-                .map(|(candidate_id, folds)| CandidateInput { candidate_id, folds })
+                .map(|(candidate_id, folds)| CandidateInput {
+                    candidate_id,
+                    folds,
+                })
                 .collect()
         }
     };
@@ -109,9 +114,7 @@ fn main() {
     let result = SelectionOutput {
         methodology_id: "anchorbell-oos-risk-adjusted-selector-v2",
         policy_id: policy.policy_id.clone(),
-        policy_digest: policy
-            .digest()
-            .unwrap_or_else(|message| fail(message)),
+        policy_digest: policy.digest().unwrap_or_else(|message| fail(message)),
         best_candidate_id,
         candidates: evaluated,
     };
