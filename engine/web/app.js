@@ -34,7 +34,8 @@ function runtimeFor(mode) { return runtimes[mode || currentMode] || { mode: mode
 function formatAge(ms) { const s = Math.max(0, Math.floor(ms / 1000)); const h = Math.floor(s / 3600); const m = Math.floor((s % 3600) / 60); return h ? h + "h " + m + "m" : m + "m " + (s % 60) + "s"; }
 function updateRuntimeCards() {
   const r = runtimeFor(); const running = r.status === "running"; const meta = modeMeta[currentMode];
-  $("runtimeModeLabel").textContent = meta.label; $("runtimeModeHint").textContent = running ? "独立进程运行中" : (r.last_message || "未启动");
+  const sourceHint = r.source === "systemd_batch" ? "systemd 批处理 · 只读观测" : "独立进程运行中";
+  $("runtimeModeLabel").textContent = meta.label; $("runtimeModeHint").textContent = running ? sourceHint : (r.last_message || "未启动");
   $("runtimeStatus").textContent = running ? "运行中" : (r.status === "exited" ? "已退出" : "已停止"); $("runtimeStatus").className = running ? "running" : "";
   $("runtimePid").textContent = r.pid ? "PID " + r.pid : "等待启动"; $("runtimeRunDir").textContent = r.run_dir ? r.run_dir.split(/[\\/]/).pop() : "—"; $("runtimeRunDir").title = r.run_dir || "";
   $("runtimeLastMessage").textContent = r.last_message || "每次启动自动隔离"; const since = Number(r.started_at_ms || 0);
@@ -54,9 +55,12 @@ async function refreshModeData() { if (logTimer) clearTimeout(logTimer); if (cur
 
 async function refreshSimulationMetrics() { try { renderSimulationMetrics(await api("/api/metrics/simulation")); } catch (_) {} }
 function renderSimulationMetrics(data) {
-  const s = data.summary || {}; $("simulationNetPnl").textContent = signed(s.net_pnl_ticks); $("simulationFills").textContent = number(s.fill_count) + " / " + number(s.order_count); $("simulationFillHint").textContent = "成交量 " + number(s.filled_quantity) + " · 事件 " + number(s.event_count);
+  const s = data.summary || {}; const source = data.source === "systemd_batch" ? "systemd 批处理" : "控制台子进程";
+  const gates = Object.entries(s.gate_rejections || {}).sort((a, b) => Number(b[1]) - Number(a[1])).slice(0, 2).map(([k, v]) => k + " " + number(v)).join(" · ");
+  $("simulationNetPnl").textContent = signed(s.net_pnl_ticks); $("simulationFills").textContent = number(s.fill_count) + " / " + number(s.order_count); $("simulationFillHint").textContent = "成交量 " + number(s.filled_quantity) + " · 事件 " + number(s.event_count) + (gates ? " · 门禁 " + gates : "");
   $("simulationRejected").textContent = number(s.rejected_entries); $("simulationPosition").textContent = number(s.current_absolute_position); $("simulationFlatHint").textContent = s.flat_at_end ? "当前无持仓/挂单" : number(s.working_orders) + " 个挂单";
-  $("simulationUpdated").textContent = "更新 " + new Date(Number(data.observed_at_ms || Date.now())).toLocaleTimeString() + " · 历史 " + (data.history || []).length;
+  const run = data.run_id ? " · " + data.run_id : ""; const experiment = data.experiment_id ? " · " + data.experiment_id : "";
+  $("simulationUpdated").textContent = "更新 " + new Date(Number(data.observed_at_ms || Date.now())).toLocaleTimeString() + " · " + source + experiment + run + " · 历史 " + (data.history || []).length;
   renderSimulationPnl(data.history || []); renderSymbolBars(data.symbols || []);
   $("simulationRows").innerHTML = (data.symbols || []).map((x) => { const win = x.fills ? (Number(x.winning_fills || 0) / Number(x.fills) * 100).toFixed(1) + "%" : "—"; return "<tr><td>" + escapeHtml(x.symbol) + "<small>" + escapeHtml(x.calendar_state || "") + "</small></td><td>" + signed(x.net_pnl_ticks) + "</td><td>" + signed(x.market_pnl_ticks) + "</td><td>" + signed(x.strategy_pnl_ticks) + "</td><td>" + signed(x.funding_pnl_ticks) + "</td><td>" + signed(x.fees_ticks) + "</td><td>" + win + "</td><td>" + number(x.position) + "</td></tr>"; }).join("") || "<tr><td colspan='8'>尚未收到标的指标</td></tr>";
 }

@@ -307,14 +307,29 @@ async fn platform_response(state: &DashboardState) -> (u16, &'static str, Vec<u8
 }
 
 async fn runtimes_response(state: &DashboardState) -> (u16, &'static str, Vec<u8>) {
+    let external = external_batch_observation();
     let mut runtimes = state.runtimes.lock().await;
+    let local_simulation = mode_snapshot("simulation", &mut runtimes.simulation);
+    let simulation = if local_simulation
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("stopped")
+        == "stopped"
+    {
+        external
+            .as_ref()
+            .map(external_batch_runtime_snapshot)
+            .unwrap_or(local_simulation)
+    } else {
+        local_simulation
+    };
     json_response(
         200,
         json!({
             "ok": true,
             "modes": [
                 mode_snapshot("live", &mut runtimes.live),
-                mode_snapshot("simulation", &mut runtimes.simulation),
+                simulation,
                 mode_snapshot("backtest", &mut runtimes.backtest),
             ]
         }),
@@ -769,6 +784,132 @@ async fn stop_runtime(body: Vec<u8>, state: &DashboardState) -> (u16, &'static s
     )
 }
 
+fn external_batch_root() -> Option<PathBuf> {
+    env::var_os("ANCHORBELL_BATCH_ROOT")
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+}
+
+fn read_json_file(path: &Path) -> Option<Value> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| serde_json::from_str(&contents).ok())
+}
+
+fn latest_external_batch() -> Option<(PathBuf, Value)> {
+    let root = external_batch_root()?;
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(root).ok()?.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(manifest) = read_json_file(&path.join("run-manifest.json")) else {
+            continue;
+        };
+        let created_at_ms = manifest
+            .pointer("/simulation/created_at_ms")
+            .and_then(Value::as_u64)
+            .or_else(|| manifest.get("created_at_ms").and_then(Value::as_u64))
+            .unwrap_or_default();
+        candidates.push((created_at_ms, path, manifest));
+    }
+    candidates.sort_by_key(|candidate| candidate.0);
+    candidates.pop().map(|(_, path, manifest)| (path, manifest))
+}
+
+fn external_batch_observation() -> Option<Value> {
+    let (run_dir, manifest) = latest_external_batch()?;
+    let status = read_json_file(&run_dir.join("run-status.json"));
+    let experiment_ids: Vec<String> = manifest
+        .get("spec_labels")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    let experiment_id = experiment_ids
+        .iter()
+        .find(|id| run_dir.join(id).join("metrics.json").is_file())
+        .cloned()
+        .or_else(|| {
+            fs::read_dir(&run_dir)
+                .ok()?
+                .flatten()
+                .map(|entry| entry.path())
+                .find(|path| path.join("metrics.json").is_file())
+                .and_then(|path| path.file_name()?.to_str().map(str::to_owned))
+        })?;
+    let metrics_path = run_dir.join(&experiment_id).join("metrics.json");
+    let mut metrics = read_json_file(&metrics_path)?;
+    let Value::Object(object) = &mut metrics else {
+        return None;
+    };
+    let simulation = manifest.get("simulation");
+    let run_id = status
+        .as_ref()
+        .and_then(|value| value.get("run_id"))
+        .and_then(Value::as_str)
+        .or_else(|| simulation.and_then(|value| value.get("run_id")).and_then(Value::as_str))
+        .unwrap_or_default();
+    let batch_status = status
+        .as_ref()
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let started_at_ms = status
+        .as_ref()
+        .and_then(|value| value.get("started_at_ms"))
+        .and_then(Value::as_u64)
+        .or_else(|| simulation.and_then(|value| value.get("created_at_ms")).and_then(Value::as_u64));
+    let build_identity = status
+        .as_ref()
+        .and_then(|value| value.get("build_identity"))
+        .and_then(Value::as_str)
+        .or_else(|| simulation.and_then(|value| value.get("build_identity")).and_then(Value::as_str));
+    object.insert("source".to_owned(), json!("systemd_batch"));
+    object.insert("batch_status".to_owned(), json!(batch_status));
+    object.insert("run_id".to_owned(), json!(run_id));
+    object.insert("run_dir".to_owned(), json!(run_dir.display().to_string()));
+    object.insert("experiment_id".to_owned(), json!(experiment_id));
+    object.insert("available_experiments".to_owned(), json!(experiment_ids));
+    object.insert("started_at_ms".to_owned(), json!(started_at_ms));
+    object.insert("build_identity".to_owned(), json!(build_identity));
+    object.insert("observed_at_ms".to_owned(), json!(now_ms()));
+    Some(metrics)
+}
+
+fn external_batch_runtime_snapshot(observation: &Value) -> Value {
+    let batch_status = observation
+        .get("batch_status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let status = match batch_status {
+        "running" => "running",
+        "completed" | "failed" => "exited",
+        _ => "unknown",
+    };
+    let output_path = observation
+        .get("run_dir")
+        .and_then(Value::as_str)
+        .and_then(|path| observation.get("experiment_id").and_then(Value::as_str).map(|id| {
+            PathBuf::from(path).join(id).join("metrics.json").display().to_string()
+        }));
+    json!({
+        "mode": "simulation",
+        "status": status,
+        "source": "systemd_batch",
+        "pid": Value::Null,
+        "run_dir": observation.get("run_dir"),
+        "output_path": output_path,
+        "stdout_path": Value::Null,
+        "stderr_path": Value::Null,
+        "started_at_ms": observation.get("started_at_ms"),
+        "last_message": format!("systemd 批处理 · {} · {}", batch_status, observation.get("run_id").and_then(Value::as_str).unwrap_or("")),
+    })
+}
+
 async fn runtime_metrics(mode: &str, state: &DashboardState) -> (u16, &'static str, Vec<u8>) {
     let path = {
         let runtimes = state.runtimes.lock().await;
@@ -779,25 +920,30 @@ async fn runtime_metrics(mode: &str, state: &DashboardState) -> (u16, &'static s
             _ => None,
         }
     };
-    let Some(path) = path else {
-        return json_response(
-            404,
-            json!({"ok": false, "message": format!("{mode} 尚未启动")}),
-        );
-    };
-    match fs::read_to_string(&path) {
-        Ok(contents) => match serde_json::from_str::<Value>(&contents) {
-            Ok(value) => json_response(200, value),
+    if let Some(path) = path {
+        return match fs::read_to_string(&path) {
+            Ok(contents) => match serde_json::from_str::<Value>(&contents) {
+                Ok(value) => json_response(200, value),
+                Err(error) => json_response(
+                    503,
+                    json!({"ok": false, "message": format!("指标正在写入：{error}")}),
+                ),
+            },
             Err(error) => json_response(
                 503,
-                json!({"ok": false, "message": format!("指标正在写入：{error}")}),
+                json!({"ok": false, "message": format!("尚无 {mode} 指标：{error}")}),
             ),
-        },
-        Err(error) => json_response(
-            503,
-            json!({"ok": false, "message": format!("尚无 {mode} 指标：{error}")}),
-        ),
+        };
     }
+    if mode == "simulation" {
+        if let Some(observation) = external_batch_observation() {
+            return json_response(200, observation);
+        }
+    }
+    json_response(
+        404,
+        json!({"ok": false, "message": format!("{mode} 尚未启动")}),
+    )
 }
 
 async fn runtime_logs(mode: &str, state: &DashboardState) -> (u16, &'static str, Vec<u8>) {
@@ -811,6 +957,21 @@ async fn runtime_logs(mode: &str, state: &DashboardState) -> (u16, &'static str,
         };
         (runtime.stdout_path.clone(), runtime.stderr_path.clone())
     };
+    if mode == "simulation" && stdout_path.is_none() && stderr_path.is_none() {
+        if let Some(observation) = external_batch_observation() {
+            let stdout = serde_json::to_string_pretty(&observation).unwrap_or_default();
+            return json_response(
+                200,
+                json!({
+                    "ok": true,
+                    "mode": mode,
+                    "source": "systemd_batch",
+                    "stdout": stdout,
+                    "stderr": "",
+                }),
+            );
+        }
+    }
     let read_tail = |path: Option<PathBuf>| -> String {
         let Some(path) = path else {
             return String::new();
