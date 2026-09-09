@@ -959,6 +959,33 @@ fn external_batch_observation() -> Option<Value> {
     Some(metrics)
 }
 
+fn compact_value(value: &Value, depth: usize) -> Value {
+    if depth > 12 {
+        return json!("[depth limited]");
+    }
+    match value {
+        Value::Object(object) => {
+            let mut compact = serde_json::Map::new();
+            for (key, child) in object {
+                compact.insert(key.clone(), compact_value(child, depth + 1));
+            }
+            Value::Object(compact)
+        }
+        Value::Array(values) => {
+            const MAX_ITEMS: usize = 64;
+            if values.len() <= MAX_ITEMS {
+                return Value::Array(values.iter().map(|child| compact_value(child, depth + 1)).collect());
+            }
+            let mut compact = Vec::with_capacity(MAX_ITEMS + 1);
+            compact.push(json!({"_truncated_items": values.len() - MAX_ITEMS}));
+            compact.extend(values.iter().take(MAX_ITEMS / 2).map(|child| compact_value(child, depth + 1)));
+            compact.extend(values.iter().rev().take(MAX_ITEMS / 2).rev().map(|child| compact_value(child, depth + 1)));
+            Value::Array(compact)
+        }
+        _ => value.clone(),
+    }
+}
+
 async fn runs_response() -> (u16, &'static str, Vec<u8>) {
     let Some(root) = external_batch_root() else {
         return json_response(200, json!({
@@ -1011,10 +1038,10 @@ async fn runs_response() -> (u16, &'static str, Vec<u8>) {
                     continue;
                 }
                 let metrics = read_json_file(&run_dir.join(id).join("metrics.json"));
-                let symbols = metrics.as_ref()
-                    .and_then(|v| v.get("symbols"))
-                    .cloned()
-                    .unwrap_or_else(|| json!([]));
+                let symbols = compact_value(
+                    metrics.as_ref().and_then(|v| v.get("symbols")).unwrap_or(&Value::Null),
+                    0,
+                );
                 let history = downsample_history(metrics.as_ref().and_then(|v| v.get("history")));
                 methods.push(json!({
                     "id": id,
@@ -1044,8 +1071,8 @@ async fn runs_response() -> (u16, &'static str, Vec<u8>) {
                 .unwrap_or(Value::Null),
             "methods": methods,
             "market_data": manifest.as_ref().and_then(|v| v.get("index_anchor_conversions")).cloned().unwrap_or_else(|| json!({})),
-            "manifest": manifest.unwrap_or_else(|| json!({})),
-            "index": index.unwrap_or_else(|| json!({})),
+            "manifest": compact_value(manifest.as_ref().unwrap_or(&Value::Null), 0),
+            "index": compact_value(index.as_ref().unwrap_or(&Value::Null), 0),
         }));
     }
     runs.sort_by_key(|run| run.get("created_at_ms").and_then(Value::as_u64).unwrap_or_default());
