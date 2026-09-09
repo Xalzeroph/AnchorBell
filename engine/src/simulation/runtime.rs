@@ -81,6 +81,8 @@ impl AnchorSnapshot {
 pub enum SimulationPolicyVariant {
     M0Fixed,
     M1AdaptiveRisk,
+    /// Permanent production core: M1 adaptive risk plus proven safety overlays.
+    CoreV1,
     M2Microstructure,
     M3FillAware,
     M4Statistical,
@@ -92,6 +94,8 @@ pub enum SimulationPolicyVariant {
     M7EvidenceGated,
     /// M7 plus funding-aware carry/avoid/tolerate/exit control.
     M8FundingAware,
+    /// M8 without its funding controller, used only for a valid funding ablation.
+    M8FundingDisabled,
     /// M8 funding control plus deadline-constrained causal residual DRO-MPC.
     M9DeadlineCausalDroMpc,
 }
@@ -101,6 +105,7 @@ impl SimulationPolicyVariant {
         match self {
             Self::M0Fixed => "m0_fixed",
             Self::M1AdaptiveRisk => "m1_adaptive_risk",
+            Self::CoreV1 => "core_v1",
             Self::M2Microstructure => "m2_microstructure",
             Self::M3FillAware => "m3_fill_aware",
             Self::M4Statistical => "m4_statistical",
@@ -108,36 +113,90 @@ impl SimulationPolicyVariant {
             Self::M6DynamicCapital => "m6_dynamic_capital",
             Self::M7EvidenceGated => "m7_evidence_gated",
             Self::M8FundingAware => "m8_funding_aware",
+            Self::M8FundingDisabled => "m8_funding_disabled",
             Self::M9DeadlineCausalDroMpc => "m9_deadline_causal_dro_mpc",
         }
     }
 
     fn uses_microstructure(self) -> bool {
-        self >= Self::M2Microstructure
+        matches!(
+            self,
+            Self::M2Microstructure
+                | Self::M3FillAware
+                | Self::M4Statistical
+                | Self::M5Robust
+                | Self::M6DynamicCapital
+                | Self::M7EvidenceGated
+                | Self::M8FundingAware
+                | Self::M8FundingDisabled
+                | Self::M9DeadlineCausalDroMpc
+        )
     }
 
     fn uses_fill_gate(self) -> bool {
-        self >= Self::M3FillAware
+        matches!(
+            self,
+            Self::M3FillAware
+                | Self::M4Statistical
+                | Self::M5Robust
+                | Self::M6DynamicCapital
+                | Self::M7EvidenceGated
+                | Self::M8FundingAware
+                | Self::M8FundingDisabled
+                | Self::M9DeadlineCausalDroMpc
+        )
     }
 
     fn uses_statistical_term(self) -> bool {
-        self >= Self::M4Statistical
+        matches!(
+            self,
+            Self::M4Statistical
+                | Self::M5Robust
+                | Self::M6DynamicCapital
+                | Self::M7EvidenceGated
+                | Self::M8FundingAware
+                | Self::M8FundingDisabled
+                | Self::M9DeadlineCausalDroMpc
+        )
     }
 
     fn uses_tail_guard(self) -> bool {
-        self >= Self::M5Robust
+        matches!(
+            self,
+            Self::CoreV1
+                | Self::M5Robust
+                | Self::M6DynamicCapital
+                | Self::M7EvidenceGated
+                | Self::M8FundingAware
+                | Self::M8FundingDisabled
+                | Self::M9DeadlineCausalDroMpc
+        )
     }
 
     fn uses_dynamic_capital(self) -> bool {
-        self >= Self::M6DynamicCapital
+        matches!(
+            self,
+            Self::M6DynamicCapital
+                | Self::M7EvidenceGated
+                | Self::M8FundingAware
+                | Self::M8FundingDisabled
+                | Self::M9DeadlineCausalDroMpc
+        )
     }
 
     fn uses_evidence_gate(self) -> bool {
-        self >= Self::M7EvidenceGated
+        matches!(
+            self,
+            Self::CoreV1
+                | Self::M7EvidenceGated
+                | Self::M8FundingAware
+                | Self::M8FundingDisabled
+                | Self::M9DeadlineCausalDroMpc
+        )
     }
 
     fn uses_funding_controller(self) -> bool {
-        self >= Self::M8FundingAware
+        matches!(self, Self::M8FundingAware | Self::M9DeadlineCausalDroMpc)
     }
 }
 
@@ -1209,7 +1268,7 @@ impl SimulationEngine {
             .collect();
         Ok(Self {
             strategy: AnchorMakerStrategy::new(entry_threshold_bps, 0),
-            strategy_variant: SimulationPolicyVariant::M4Statistical,
+            strategy_variant: SimulationPolicyVariant::CoreV1,
             max_position,
             requested_quantity,
             max_mark_index_gap_bps,

@@ -757,4 +757,20 @@ mod walkforward_regression_tests {
         ));
         assert!(validate_calibration_seed_horizon(&seeds, 101).is_ok());
     }
+
+    #[test]
+    fn core_v1_capabilities_are_explicit_and_funding_ablation_is_isolated() {
+        assert!(SimulationPolicyVariant::CoreV1.uses_tail_guard());
+        assert!(SimulationPolicyVariant::CoreV1.uses_evidence_gate());
+        assert!(!SimulationPolicyVariant::CoreV1.uses_microstructure());
+        assert!(!SimulationPolicyVariant::CoreV1.uses_fill_gate());
+        assert!(!SimulationPolicyVariant::CoreV1.uses_statistical_term());
+        assert!(!SimulationPolicyVariant::CoreV1.uses_dynamic_capital());
+        assert!(!SimulationPolicyVariant::CoreV1.uses_funding_controller());
+
+        assert!(SimulationPolicyVariant::M8FundingAware.uses_funding_controller());
+        assert!(SimulationPolicyVariant::M8FundingDisabled.uses_tail_guard());
+        assert!(SimulationPolicyVariant::M8FundingDisabled.uses_evidence_gate());
+        assert!(!SimulationPolicyVariant::M8FundingDisabled.uses_funding_controller());
+    }
 }

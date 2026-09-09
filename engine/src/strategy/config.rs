@@ -205,7 +205,7 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../config/anchorbell-simulation.json");
         let profile = StrategyProfile::load(path).unwrap();
         let plan = profile.experiment_plan().unwrap();
-        assert_eq!(plan.experiments.len(), 11);
+        assert_eq!(plan.experiments.len(), 1);
         assert!(plan.runtime_specs_with_ablations().is_ok());
     }
 

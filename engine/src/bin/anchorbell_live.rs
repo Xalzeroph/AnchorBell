@@ -177,7 +177,7 @@ impl ShadowSimulation {
         )
         .map_err(|error| format!("shadow simulation config rejected: {error}"))?
         .with_live_risk_gates()
-        .with_strategy_variant(SimulationPolicyVariant::M4Statistical)
+        .with_strategy_variant(SimulationPolicyVariant::CoreV1)
         .with_fee_schedule_source(profile.fee_schedule.source.clone())
         .with_price_scale(args.price_scale)
         .with_execution_filters(execution_filters.clone())
@@ -186,7 +186,7 @@ impl ShadowSimulation {
             "schema_version": SHADOW_SCHEMA_VERSION,
             "run_id": run_id,
             "mode": "live_shadow_simulation",
-            "strategy_variant": SimulationPolicyVariant::M4Statistical.label(),
+            "strategy_variant": SimulationPolicyVariant::CoreV1.label(),
             "market_event_source": "live_binance_public",
             "execution": "simulation_only",
             "fee_ppm": maker_fee_ppm,
@@ -700,7 +700,7 @@ async fn run(args: Args) -> Result<i32, String> {
             "event": "live_shadow_simulation_started",
             "run_id": run_id,
             "path": shadow_dir,
-            "strategy_variant": SimulationPolicyVariant::M4Statistical.label(),
+            "strategy_variant": SimulationPolicyVariant::CoreV1.label(),
             "execution": "simulation_only",
         })
     );
