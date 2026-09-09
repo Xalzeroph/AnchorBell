@@ -95,6 +95,8 @@ pub struct BinanceSymbolMetadata {
     pub status: String,
     #[serde(rename = "contractType")]
     pub contract_type: String,
+    #[serde(rename = "underlyingType", default)]
+    pub underlying_type: Option<String>,
     #[serde(rename = "baseAsset")]
     pub base_asset: String,
     #[serde(rename = "quoteAsset")]
@@ -1359,6 +1361,7 @@ mod tests {
             symbol: "CXMTUSDT".into(),
             status: "TRADING".into(),
             contract_type: "TRADIFI_PERPETUAL".into(),
+            underlying_type: None,
             base_asset: "CXMT".into(),
             quote_asset: "USDT".into(),
             margin_asset: "USDT".into(),

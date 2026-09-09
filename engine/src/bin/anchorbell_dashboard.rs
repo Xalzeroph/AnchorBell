@@ -15,8 +15,8 @@ use anchorbell_engine::{
         DeploymentConfigError, PersistentCredentialStore, Side,
     },
     market::{
-        BinanceMarketConfig, BinanceMarketStream, BinanceSubscription, PublicMarketMetadataClient,
-        ReconnectPolicy,
+        BinanceMarketConfig, BinanceMarketStream, BinanceSubscription, InstrumentRegistryConfig,
+        InstrumentRegistrySnapshot, PublicMarketMetadataClient, ReconnectPolicy,
     },
     platform::{HealthSnapshot, RuntimeProfile, SystemRegistry, SystemRole},
     strategy::{instrument_for, EquityRegion, StrategyProfile},
@@ -269,6 +269,7 @@ async fn route(request: HttpRequest, state: DashboardState) -> (u16, &'static st
             include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/web/app.js")),
         ),
         ("GET", "/api/status") => json_response(200, status_response(&state).await),
+        ("GET", "/api/instruments") => instruments_response(&state).await,
         ("GET", "/api/platform") => platform_response(&state).await,
         ("GET", "/health") => probe_response("health", 200),
         ("GET", "/live") => probe_response("liveness", 200),
@@ -1025,6 +1026,43 @@ fn deployment_error(error: DeploymentConfigError) -> (u16, &'static str, Vec<u8>
         DeploymentConfigError::LiveOrdersNotExplicitlyEnabled => "Production 真实订单缺少确认",
     };
     json_response(400, json!({"ok": false, "message": message}))
+}
+
+async fn instruments_response(state: &DashboardState) -> (u16, &'static str, Vec<u8>) {
+    let (environment, proxy) = {
+        let session = state.session.lock().await;
+        (session.config.environment, session.proxy.clone())
+    };
+    let registry_config = match InstrumentRegistryConfig::embedded() {
+        Ok(config) => config,
+        Err(error) => {
+            return json_response(500, json!({"ok": false, "message": error.to_string()}))
+        }
+    };
+    let client = match PublicMarketMetadataClient::new(
+        environment.endpoints().rest_base,
+        proxy.as_deref(),
+    ) {
+        Ok(client) => client,
+        Err(error) => {
+            return json_response(400, json!({"ok": false, "message": error.to_string()}))
+        }
+    };
+    let exchange_info = match client.exchange_info().await {
+        Ok(exchange_info) => exchange_info,
+        Err(error) => {
+            return json_response(502, json!({"ok": false, "message": error.to_string()}))
+        }
+    };
+    let snapshot = InstrumentRegistrySnapshot::from_exchange_info(exchange_info, &registry_config);
+    json_response(
+        200,
+        json!({
+            "ok": true,
+            "environment": environment.to_string(),
+            "registry": snapshot,
+        }),
+    )
 }
 
 async fn metadata_check(state: &DashboardState) -> (u16, &'static str, Vec<u8>) {

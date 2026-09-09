@@ -10,6 +10,8 @@ pub mod connection;
 pub mod freshness;
 #[path = "market/fx.rs"]
 pub mod fx;
+#[path = "market/instrument_registry.rs"]
+pub mod instrument_registry;
 #[path = "market/live.rs"]
 pub mod live;
 #[path = "market/metadata.rs"]
@@ -25,6 +27,11 @@ pub use capability::{CapabilityGateError, MarketCapabilityGate};
 pub use connection::{ConnectionAction, ConnectionState, ConnectionSupervisor, ReconnectPolicy};
 pub use freshness::{FreshnessClass, FreshnessPolicy, FreshnessState};
 pub use fx::{BinanceC2cFxClient, BinanceC2cFxPoller, FxError, FxPollerConfig, FxQuote, FxUpdate};
+pub use instrument_registry::{
+    AssetClass, InstrumentClassification, InstrumentRegistryConfig, InstrumentRegistryError,
+    InstrumentRegistrySnapshot, ManagedInstrument, MarketRegion,
+    INSTRUMENT_REGISTRY_SCHEMA_VERSION,
+};
 pub use live::{BinanceMarketConfig, BinanceMarketFeed, BinanceMarketStream, MarketStreamError};
 pub use metadata::{
     BinanceBookTickerSnapshot, BinanceDepthSnapshot, BinanceExecutionFilters,

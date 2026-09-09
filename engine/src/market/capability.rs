@@ -109,6 +109,7 @@ mod tests {
                 symbol: symbol.into(),
                 status: "TRADING".into(),
                 contract_type: "TRADIFI_PERPETUAL".into(),
+                underlying_type: None,
                 base_asset: symbol.trim_end_matches("USDT").into(),
                 quote_asset: "USDT".into(),
                 margin_asset: "USDT".into(),
