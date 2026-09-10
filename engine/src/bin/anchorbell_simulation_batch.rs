@@ -466,7 +466,15 @@ fn main() {
                 let now_ms = timestamp_ms();
                 let _ = health.halted("simulation.runtime", now_ms, &reason).await;
                 let _ = registry.fail(&run_id, reason.clone(), now_ms);
-                fail(format!("batch execution failed: {reason}"));
+                eprintln!("batch execution failed: {reason}");
+                // Exit 2 is reserved for the storage floor so systemd does
+                // not spin while the host is unsafe. Recoverable market and
+                // feed failures use exit 1 and are restarted by the unit.
+                process::exit(if reason.contains("simulation storage safety stop") {
+                    2
+                } else {
+                    1
+                });
             }
         };
         heartbeat_task.abort();
