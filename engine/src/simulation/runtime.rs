@@ -1048,6 +1048,7 @@ pub struct SymbolMetrics {
     pub entry_block_reason: String,
     pub data_quality: DataQualityStatus,
     pub mark_age_ms: Option<u64>,
+    pub book_age_ms: Option<u64>,
     pub bid_price_ticks: Option<i64>,
     pub ask_price_ticks: Option<i64>,
     pub anchor_price_ticks: i64,
@@ -1833,9 +1834,10 @@ impl SimulationEngine {
         records
     }
 
-    /// Cancels all working quotes and submits reduce-only maker orders for
-    /// residual positions. It never fabricates a fill: callers must continue
-    /// feeding market events until the returned orders actually fill.
+    /// Cancels all working quotes and submits a bounded reduce-only IOC for
+    /// residual positions. The IOC is capped by the configured participation
+    /// limit and current opposing depth; it never fabricates liquidity. Any
+    /// remaining position is deliberately reported as a failed settlement.
     pub fn flatten_all(&mut self, timestamp_ms: u64, detail: &str) -> Vec<SimulationRecord> {
         let mut records = self.cancel_all(timestamp_ms, detail);
         let symbols = self.states.keys().cloned().collect::<Vec<_>>();
@@ -1844,18 +1846,10 @@ impl SimulationEngine {
             if position == 0 {
                 continue;
             }
-            let desired = self.states[&symbol].book.map(|book| OrderIntent {
-                symbol: self.states[&symbol].symbol_id,
-                side: if position > 0 { Side::Sell } else { Side::Buy },
-                price: if position > 0 {
-                    book.ask_price_ticks
-                } else {
-                    book.bid_price_ticks
-                },
-                quantity: position.checked_abs().unwrap_or(i64::MAX),
-                post_only: true,
-                reduce_only: true,
-            });
+            let desired = force_reduce_only_taker_intent(
+                &self.states[&symbol],
+                self.emergency_policy,
+            );
             if let Some(intent) = desired {
                 records.extend(self.place_symbol(&symbol, intent, timestamp_ms, true, None));
             } else {
@@ -1874,7 +1868,9 @@ impl SimulationEngine {
                         order_age_ms: None,
                         queue_ahead_quantity: None,
                         quote_distance_bps: None,
-                        detail: Some("reduce-only maker flatten requires a valid book"),
+                        detail: Some(
+                            "reduce-only shutdown IOC requires valid opposing depth and participation capacity",
+                        ),
                     },
                 ));
             }
@@ -1882,8 +1878,8 @@ impl SimulationEngine {
         records
     }
 
-    /// Normal shutdown boundary: cancel, request maker-only flattening, and
-    /// return a settlement that explicitly distinguishes flat, pending, and
+    /// Normal shutdown boundary: cancel, request bounded reduce-only flattening,
+    /// and return a settlement that explicitly distinguishes flat, pending, and
     /// unflattened residual states.
     pub fn shutdown(&mut self, timestamp_ms: u64, detail: &str) -> FinalSettlement {
         let flatten_requested = self.states.values().any(|state| state.position != 0);
@@ -2178,6 +2174,10 @@ impl SimulationEngine {
                     self.last_event_at_ms
                         .saturating_sub(state.last_mark_time_ms)
                 });
+                let book_age_ms = (state.last_book_event_at_ms > 0).then(|| {
+                    self.last_event_at_ms
+                        .saturating_sub(state.last_book_event_at_ms)
+                });
                 let reference_ticks = fair_value
                     .map(|estimate| estimate.price.0)
                     .unwrap_or(state.anchor.close_price_ticks);
@@ -2305,6 +2305,7 @@ impl SimulationEngine {
                     entry_block_reason: labels.1.to_owned(),
                     data_quality,
                     mark_age_ms,
+                    book_age_ms,
                     bid_price_ticks,
                     ask_price_ticks,
                     anchor_price_ticks: state.anchor.close_price_ticks,
@@ -2991,6 +2992,7 @@ impl SimulationEngine {
                         self.max_mark_index_gap_bps,
                         state.funding_interval_hours,
                         self.funding_lead_ms,
+                        strategy_variant.uses_tail_guard(),
                     );
                     (desired, true, state.working.is_some(), exit_reason)
                 }
@@ -3231,8 +3233,8 @@ impl SimulationEngine {
                 symbol,
                 decision_reason,
                 "strategy_risk_gate",
-                None,
-                None,
+                rejection_threshold_bps(self, symbol, timestamp_ms, requested_quantity, max_position),
+                rejection_observed_edge_bps(self, symbol),
                 timestamp_ms,
             );
             if has_working {
@@ -3335,6 +3337,24 @@ impl SimulationEngine {
         decision_id: Option<u64>,
     ) -> Vec<SimulationRecord> {
         if let Some(filters) = self.execution_filters.get(symbol).copied() {
+            match filters.normalize_price(
+                intent.price,
+                intent.side == Side::Buy,
+                intent.post_only,
+            ) {
+                Ok(price) => intent.price = price,
+                Err(reason) => {
+                    self.reject_entry_structured(
+                        symbol,
+                        reason,
+                        "binance_exchange_filters",
+                        Some(filters.price_tick),
+                        Some(intent.price),
+                        timestamp_ms,
+                    );
+                    return Vec::new();
+                }
+            }
             let mark_price_ticks = self
                 .states
                 .get(symbol)
@@ -4060,6 +4080,7 @@ fn maker_exit_intent_for_state(
     max_mark_index_gap_bps: i64,
     funding_interval_hours: u32,
     funding_lead_ms: u64,
+    tail_guard_enabled: bool,
 ) -> (Option<OrderIntent>, &'static str) {
     let Some(position_quantity) = state.position.checked_abs() else {
         return (None, "maker_exit_position_overflow");
@@ -4113,9 +4134,17 @@ fn maker_exit_intent_for_state(
         .working
         .map(|order| order.remaining_quantity)
         .unwrap_or(position_quantity);
+    // Tail-risk reduction is an immediate risk action. Reusing the normal
+    // deadline would allow a stale maker quote to keep a large position open
+    // while the market is already in the reduce-only band.
+    let emergency_deadline_ms = if tail_guard_enabled && m5_tail_reduce_only(state) {
+        Some(timestamp_ms)
+    } else {
+        plan.hard_deadline_ms()
+    };
     let taker_input = AdaptiveTakerInput {
         now_ms: timestamp_ms,
-        deadline_ms: plan.hard_deadline_ms(),
+        deadline_ms: emergency_deadline_ms,
         position: state.position,
         maker_remaining_quantity,
         maker_estimated_time_ms,
@@ -4127,7 +4156,10 @@ fn maker_exit_intent_for_state(
         market_age_ms: timestamp_ms.saturating_sub(state.last_mark_time_ms),
         book_age_ms: timestamp_ms.saturating_sub(state.last_book_event_at_ms),
         remote_state_known: !state.last_mark_time_ms.eq(&0),
-        anchor_valid: state.anchor.valid_at(timestamp_ms, u64::MAX),
+        // An anchor is required for opening risk, but never for reducing a
+        // confirmed position. Blocking the emergency path on an expired
+        // reference would turn stale-data protection into residual exposure.
+        anchor_valid: state.anchor.close_price_ticks > 0,
         mark_index_gap_bps,
         max_mark_index_gap_bps,
         volatility_bps: state.ewma_abs_return_bps,
@@ -4210,6 +4242,62 @@ fn maker_exit_intent_for_state(
         MakerExitDecision::Trading => (None, "maker_exit_not_in_window"),
         MakerExitDecision::Blocked(_) => (None, "maker_exit_blocked"),
     }
+}
+
+fn force_reduce_only_taker_intent(
+    state: &SimulationSymbolState,
+    policy: EmergencyExecutionPolicy,
+) -> Option<OrderIntent> {
+    let position_quantity = state.position.checked_abs()?;
+    let book = state.book?;
+    if position_quantity == 0
+        || book.bid_price_ticks <= 0
+        || book.ask_price_ticks <= book.bid_price_ticks
+    {
+        return None;
+    }
+    let opposing_depth = if state.position > 0 {
+        book.bid_quantity
+    } else {
+        book.ask_quantity
+    };
+    if opposing_depth <= 0 || policy.max_participation_bps == 0 {
+        return None;
+    }
+    let participation_quantity = (i128::from(opposing_depth)
+        * i128::from(policy.max_participation_bps)
+        / 10_000)
+    .clamp(0, i128::from(i64::MAX)) as i64;
+    let quantity = position_quantity.min(participation_quantity);
+    if quantity <= 0 {
+        return None;
+    }
+    let aggressive_price = |price: i64, buy: bool| {
+        let delta = (i128::from(price) * i128::from(policy.max_slippage_bps) / 10_000)
+            .clamp(1, i128::from(i64::MAX)) as i64;
+        if buy {
+            price.saturating_add(delta)
+        } else {
+            price.saturating_sub(delta).max(1)
+        }
+    };
+    let (side, price) = if state.position > 0 {
+        (
+            Side::Sell,
+            aggressive_price(book.bid_price_ticks, false),
+        )
+    } else {
+        (
+            Side::Buy,
+            aggressive_price(book.ask_price_ticks, true),
+        )
+    };
+    Some(OrderIntent::emergency_reduce_only_taker(
+        state.symbol_id,
+        side,
+        price,
+        quantity,
+    ))
 }
 
 pub fn event_time_ms(event: &BinanceMarketEvent) -> u64 {
@@ -4427,6 +4515,42 @@ fn data_quality_for(
         return DataQualityStatus::Missing;
     }
     DataQualityStatus::Fresh
+}
+
+fn rejection_threshold_bps(
+    engine: &SimulationEngine,
+    symbol: &str,
+    timestamp_ms: u64,
+    requested_quantity: i64,
+    max_position: i64,
+) -> Option<i64> {
+    let state = engine.states.get(symbol)?;
+    dynamic_threshold_for(
+        state,
+        engine.strategy_variant,
+        engine.strategy.entry_threshold_bps,
+        engine.fee_ppm,
+        requested_quantity,
+        max_position,
+        timestamp_ms,
+    )
+    .map(|threshold| scale_threshold_non_fee(threshold, engine.threshold_scale_ppm))
+    .and_then(AdaptiveThreshold::required_pico_bps)
+    .map(|required| {
+        pico_bps_to_bps(required.saturating_sub(state.adaptive_relief_pico_bps))
+    })
+}
+
+fn rejection_observed_edge_bps(
+    engine: &SimulationEngine,
+    symbol: &str,
+) -> Option<i64> {
+    let state = engine.states.get(symbol)?;
+    let book = state.book?;
+    let fair_value = fair_value_for_state(state)?.price.0;
+    let buy = edge_pico_bps(fair_value, book.bid_price_ticks).unwrap_or(0);
+    let sell = edge_pico_bps(book.ask_price_ticks, fair_value).unwrap_or(0);
+    Some(pico_bps_to_bps(buy.max(sell).max(0)))
 }
 
 fn edge_pico_bps(numerator_price: i64, denominator_price: i64) -> Option<i64> {

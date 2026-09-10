@@ -148,6 +148,37 @@ impl BinanceExecutionFilters {
 }
 
 impl BinanceScaledExecutionFilters {
+    /// Normalize a limit price to the exchange tick in a direction that keeps
+    /// the order's execution intent intact. Passive buys/sells are rounded
+    /// toward the book; aggressive reduce-only orders are rounded toward the
+    /// taker side. This prevents a valid signal from becoming a rejected order
+    /// solely because an arithmetic price was between two exchange ticks.
+    pub fn normalize_price(
+        self,
+        requested_price_ticks: i64,
+        is_buy: bool,
+        post_only: bool,
+    ) -> Result<i64, &'static str> {
+        if requested_price_ticks <= 0 || self.price_tick <= 0 {
+            return Err("exchange_price_rule_invalid");
+        }
+        let remainder = requested_price_ticks % self.price_tick;
+        let price = if remainder == 0 {
+            requested_price_ticks
+        } else if post_only == is_buy {
+            requested_price_ticks.saturating_sub(remainder)
+        } else {
+            requested_price_ticks.saturating_add(self.price_tick - remainder)
+        };
+        if price < self.min_price_ticks {
+            return Err("exchange_price_below_min");
+        }
+        if price > self.max_price_ticks {
+            return Err("exchange_price_above_max");
+        }
+        Ok(price)
+    }
+
     /// Returns the exchange-admissible quantity closest to the requested
     /// quantity without exceeding the caller's risk capacity.  If the
     /// configured quantity is below MIN_NOTIONAL, the quantity is increased
@@ -1682,6 +1713,19 @@ mod tests {
         assert_eq!(filters.quantity_step, "0.01");
         assert_eq!(filters.min_notional, "5");
         assert_eq!(filters.multiplier_up, "1.03");
+    }
+
+    #[test]
+    fn scaled_filters_round_prices_without_losing_order_intent() {
+        let filters = metadata()
+            .execution_filters()
+            .unwrap()
+            .scaled(8, 8)
+            .unwrap();
+        assert_eq!(filters.normalize_price(827_850_001, true, true), Ok(827_850_000));
+        assert_eq!(filters.normalize_price(827_850_001, false, true), Ok(827_850_100));
+        assert_eq!(filters.normalize_price(827_850_001, true, false), Ok(827_850_100));
+        assert_eq!(filters.normalize_price(827_850_001, false, false), Ok(827_850_000));
     }
 
     #[test]

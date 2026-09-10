@@ -715,7 +715,7 @@ fn threshold_status_explains_warmup_and_uses_a_conservative_prior() {
 }
 
 #[test]
-fn shutdown_requests_reduce_only_flatten_without_faking_a_fill() {
+fn shutdown_uses_bounded_reduce_only_flatten_and_reports_flat() {
     let mut engine = engine();
     feed(
         &mut engine,
@@ -732,12 +732,12 @@ fn shutdown_requests_reduce_only_flatten_without_faking_a_fill() {
     assert_eq!(engine.summary().current_absolute_position, 3);
     let settlement = engine.shutdown(4, "test shutdown");
     assert!(settlement.flatten_requested);
-    assert_eq!(settlement.summary.current_absolute_position, 3);
-    assert_eq!(settlement.settlement_status, "flatten_orders_working");
+    assert_eq!(settlement.summary.current_absolute_position, 0);
+    assert_eq!(settlement.settlement_status, "flat");
     assert!(settlement
         .records
         .iter()
-        .any(|record| record.kind == "order_placed"));
+        .any(|record| record.kind == "fill"));
 }
 
 #[cfg(test)]

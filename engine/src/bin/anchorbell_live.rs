@@ -1787,6 +1787,11 @@ async fn place_order(request: PlaceOrderRequest<'_>) -> Result<WorkingOrder, Str
         mark_price_ticks,
         maximum_quantity,
     } = request;
+    intent.price = execution_filters
+        .normalize_price(intent.price, intent.side == Side::Buy, intent.post_only)
+        .map_err(|reason| {
+            format!("Binance exchange price gate rejected order for {symbol}: {reason}")
+        })?;
     intent.quantity = execution_filters
         .normalize_quantity(
             intent.quantity,
