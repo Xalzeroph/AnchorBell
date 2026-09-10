@@ -248,7 +248,10 @@ pub(super) fn dynamic_threshold_for(
     .threshold
 }
 
-pub(super) fn scale_threshold_non_fee(threshold: AdaptiveThreshold, scale_ppm: i64) -> AdaptiveThreshold {
+pub(super) fn scale_threshold_non_fee(
+    threshold: AdaptiveThreshold,
+    scale_ppm: i64,
+) -> AdaptiveThreshold {
     let scale = |value: i64| {
         (i128::from(value) * i128::from(scale_ppm.clamp(0, 1_000_000)) / 1_000_000)
             .clamp(0, i128::from(i64::MAX)) as i64
@@ -712,7 +715,11 @@ pub(super) fn core_v1_margin_scaled_quantity(
 /// A marginal edge receives 25% of the admissible quote, while an edge far
 /// above its causal hurdle approaches 100%. The function is deterministic,
 /// monotone in edge, and never increases the quantity supplied by admission.
-pub(super) fn fractional_edge_quantity(edge_pico_bps: i64, hurdle_pico_bps: i64, quantity: i64) -> i64 {
+pub(super) fn fractional_edge_quantity(
+    edge_pico_bps: i64,
+    hurdle_pico_bps: i64,
+    quantity: i64,
+) -> i64 {
     if edge_pico_bps <= 0 || hurdle_pico_bps <= 0 || quantity <= 0 {
         return quantity.max(0);
     }
@@ -867,7 +874,11 @@ pub(super) fn liquidity_ratio_bps(quantity: i64, bid_quantity: i64, ask_quantity
     ))
 }
 
-pub(super) fn liquidity_penalty_pico_bps(quantity: i64, bid_quantity: i64, ask_quantity: i64) -> i64 {
+pub(super) fn liquidity_penalty_pico_bps(
+    quantity: i64,
+    bid_quantity: i64,
+    ask_quantity: i64,
+) -> i64 {
     let participation_pico_bps = liquidity_ratio_pico_bps(quantity, bid_quantity, ask_quantity);
     if participation_pico_bps <= 1_000 * PICO_BPS_SCALE {
         0
@@ -998,7 +1009,11 @@ pub(super) fn calendar_state_for(symbol: &str, timestamp_ms: u64) -> &'static st
     }
 }
 
-pub(super) fn simulation_anchor_usable(symbol: &str, anchor_observed_at_ms: u64, now_ms: u64) -> bool {
+pub(super) fn simulation_anchor_usable(
+    symbol: &str,
+    anchor_observed_at_ms: u64,
+    now_ms: u64,
+) -> bool {
     if anchor_observed_at_ms == 0 || !anchor_reference_allowed(symbol, anchor_observed_at_ms) {
         return false;
     }
@@ -1151,4 +1166,3 @@ pub(super) fn simulation_session_allows_entry(symbol: &str, timestamp_ms: u64) -
         VenueSessionState::Closed | VenueSessionState::MiddayBreak
     )
 }
-
