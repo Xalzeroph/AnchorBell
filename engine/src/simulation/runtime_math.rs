@@ -928,6 +928,7 @@ pub(super) fn fill_probability_bps(quantity: i64, bid_quantity: i64, ask_quantit
 /// first-passage queue model. It is not called a calibrated probability; it
 /// prevents a top-of-book ratio from implying 95% fill likelihood while a
 /// large queue is visibly ahead of us.
+#[cfg(test)]
 pub(super) fn queue_aware_fill_probability_bps(
     quantity: i64,
     bid_quantity: i64,
@@ -1019,6 +1020,7 @@ pub(super) fn empirical_fill_probability_lcb_bps_for_side(
 /// minimum is a robust intersection of two different information sources:
 /// neither a favorable book snapshot nor a short run of fills can overrule a
 /// materially worse observed lower bound.
+#[cfg(test)]
 pub(super) fn effective_fill_probability_bps(
     state: &SimulationSymbolState,
     queue_probability_bps: u16,
@@ -1140,7 +1142,7 @@ fn conservative_markout_upper_from_samples(
     ewma.max(conservative)
 }
 
-fn wilson_upper_probability_bps(successes: u64, trials: u64) -> i64 {
+pub(super) fn wilson_upper_probability_bps(successes: u64, trials: u64) -> i64 {
     if trials == 0 {
         return 0;
     }
