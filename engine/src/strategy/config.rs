@@ -11,6 +11,14 @@ fn default_market_event_queue_capacity() -> usize {
     1_048_576
 }
 
+fn default_portfolio_drawdown_soft_bps() -> i64 {
+    0
+}
+
+fn default_portfolio_drawdown_hard_bps() -> i64 {
+    0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FeeScheduleConfig {
     pub maker_fee_ppm: i64,
@@ -69,6 +77,10 @@ pub struct StrategyProfile {
     pub max_position: i64,
     pub requested_quantity: i64,
     pub max_mark_index_gap_bps: i64,
+    #[serde(default = "default_portfolio_drawdown_soft_bps")]
+    pub portfolio_drawdown_soft_bps: i64,
+    #[serde(default = "default_portfolio_drawdown_hard_bps")]
+    pub portfolio_drawdown_hard_bps: i64,
     pub max_anchor_age_ms: u64,
     pub funding_lead_ms: u64,
     pub fee_ppm: i64,
@@ -122,6 +134,14 @@ impl StrategyProfile {
                 self.schema_version
             ));
         }
+        if self.default_strategy_variant.eq_ignore_ascii_case("core_v1")
+            && self.threshold_scale_ppm < 1_000_000
+        {
+            return Err(
+                "CORE_V1 threshold_scale_ppm cannot be below 1000000; evidence gates may not be relaxed"
+                    .into(),
+            );
+        }
         if self.policy_id.trim().is_empty()
             || self.experiment_plan_id.trim().is_empty()
             || self.default_strategy_variant.trim().is_empty()
@@ -149,6 +169,13 @@ impl StrategyProfile {
             || self.max_position <= 0
             || self.requested_quantity <= 0
             || self.max_mark_index_gap_bps < 0
+            || self.portfolio_drawdown_soft_bps < 0
+            || self.portfolio_drawdown_hard_bps < 0
+            || (self.portfolio_drawdown_soft_bps == 0
+                && self.portfolio_drawdown_hard_bps != 0)
+            || (self.portfolio_drawdown_soft_bps != 0
+                && self.portfolio_drawdown_hard_bps <= self.portfolio_drawdown_soft_bps)
+            || self.portfolio_drawdown_hard_bps > 10_000
             || self.fee_ppm < 0
             || self.quantity_scale > 18
             || self.price_scale > 18
@@ -249,6 +276,8 @@ mod tests {
             max_position: 1,
             requested_quantity: 1,
             max_mark_index_gap_bps: 1,
+            portfolio_drawdown_soft_bps: 0,
+            portfolio_drawdown_hard_bps: 0,
             max_anchor_age_ms: 1,
             funding_lead_ms: 1,
             fee_ppm: 1,

@@ -79,6 +79,8 @@ pub struct SimulationBatchConfig {
     pub max_position: i64,
     pub requested_quantity: i64,
     pub max_mark_index_gap_bps: i64,
+    pub portfolio_drawdown_soft_bps: i64,
+    pub portfolio_drawdown_hard_bps: i64,
     pub max_anchor_age_ms: u64,
     pub fee_ppm: i64,
     pub fee_schedule: FeeScheduleConfig,
@@ -448,6 +450,26 @@ fn build_engine(
     .with_funding_lead_ms(config.funding_lead_ms)
     .with_market_context(config.market_id.clone())
     .with_method_context(spec.label.clone());
+    if config.portfolio_drawdown_soft_bps != 0 || config.portfolio_drawdown_hard_bps != 0 {
+        let capital = config
+            .position_allocations
+            .as_ref()
+            .map(|allocations| {
+                allocations
+                    .values()
+                    .map(|allocation| allocation.budget_usdt_ticks)
+                    .sum::<i64>()
+            })
+            .filter(|capital| *capital > 0)
+            .ok_or(SimulationError::InvalidConfig(
+                "portfolio drawdown guard requires allocated capital",
+            ))?;
+        engine = engine.with_portfolio_drawdown_limits_bps(
+            capital,
+            config.portfolio_drawdown_soft_bps,
+            config.portfolio_drawdown_hard_bps,
+        )?;
+    }
     engine.restore_calibration_states(calibration_seeds);
     if let Some(allocations) = config.position_allocations.clone() {
         engine = engine.with_position_allocations(allocations)?;
@@ -465,6 +487,13 @@ fn validate(config: &SimulationBatchConfig) -> Result<(), SimulationError> {
         || config.funding_lead_ms == 0
         || config.max_subscriptions_per_shard == 0
         || config.market_event_queue_capacity == 0
+        || config.portfolio_drawdown_soft_bps < 0
+        || config.portfolio_drawdown_hard_bps < 0
+        || (config.portfolio_drawdown_soft_bps == 0
+            && config.portfolio_drawdown_hard_bps != 0)
+        || (config.portfolio_drawdown_soft_bps != 0
+            && config.portfolio_drawdown_hard_bps <= config.portfolio_drawdown_soft_bps)
+        || config.portfolio_drawdown_hard_bps > 10_000
     {
         return Err(SimulationError::InvalidConfig(
             "batch execution requires symbols, specs, and shard capacity",
@@ -582,6 +611,8 @@ pub async fn run(
         "market_id": config.market_id,
         "entry_threshold_bps": config.entry_threshold_bps,
         "threshold_scale_ppm": config.threshold_scale_ppm,
+        "portfolio_drawdown_soft_bps": config.portfolio_drawdown_soft_bps,
+        "portfolio_drawdown_hard_bps": config.portfolio_drawdown_hard_bps,
         "fee_ppm": config.fee_ppm,
         "fee_schedule": config.fee_schedule,
         "anchor_source": crate::simulation::engine::INDEX_ANCHOR_SOURCE,

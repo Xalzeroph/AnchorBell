@@ -415,6 +415,8 @@ fn main() {
             max_position: profile.max_position,
             requested_quantity: profile.requested_quantity,
             max_mark_index_gap_bps: profile.max_mark_index_gap_bps,
+            portfolio_drawdown_soft_bps: profile.portfolio_drawdown_soft_bps,
+            portfolio_drawdown_hard_bps: profile.portfolio_drawdown_hard_bps,
             max_anchor_age_ms: profile.max_anchor_age_ms,
             fee_ppm: profile.fee_ppm,
             fee_schedule: profile.fee_schedule.clone(),
