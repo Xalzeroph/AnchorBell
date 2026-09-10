@@ -758,6 +758,30 @@ fn cross_symbol_concentration_penalty_is_smooth_and_preserves_reductions() {
 }
 
 #[test]
+fn adverse_markout_upper_bound_is_finite_sample_conservative() {
+    let mut engine = engine();
+    let state = engine.states.get_mut("CXMTUSDT").expect("test symbol");
+    assert_eq!(conservative_adverse_markout_pico_bps(state), 0);
+
+    for index in 0..8 {
+        state.calibration.observe_markout(
+            index + 1,
+            if index < 4 {
+                20 * PICO_BPS_SCALE
+            } else {
+                0
+            },
+        );
+    }
+    let state = engine.states.get("CXMTUSDT").expect("test symbol");
+    let upper = conservative_adverse_markout_pico_bps(state);
+    assert!(upper > 0);
+    assert!(upper >= state.ewma_adverse_markout_pico_bps);
+    assert!(wilson_upper_probability_bps(4, 8) > 5_000);
+    assert_eq!(wilson_upper_probability_bps(0, 0), 0);
+}
+
+#[test]
 fn symbol_drawdown_overlay_scales_before_hard_stop() {
     let mut engine = engine()
         .with_portfolio_drawdown_limits_bps(10_000, 500, 800)
