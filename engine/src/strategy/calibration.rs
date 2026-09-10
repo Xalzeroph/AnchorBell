@@ -2,8 +2,8 @@ use super::m9::M9Calibration;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
-pub const CALIBRATION_SCHEMA_VERSION: u32 = 2;
-pub const CALIBRATION_MODEL_VERSION: &str = "m9-data-driven-calibration-v2";
+pub const CALIBRATION_SCHEMA_VERSION: u32 = 3;
+pub const CALIBRATION_MODEL_VERSION: &str = "m9-data-driven-calibration-v3-wilson";
 const ROLLING_WINDOW_CAPACITY: usize = 4096;
 /// Common effective-sample scale used in calibration reports. Individual
 /// evidence streams have different natural frequencies, so readiness is based
@@ -14,6 +14,8 @@ const MIN_REVERSION_SAMPLES: u64 = 8;
 const MIN_ORDER_LIFECYCLE_SAMPLES: u64 = 30;
 const MIN_FILL_PARTICIPATION_SAMPLES: u64 = 10;
 const MIN_MARKOUT_SAMPLES: u64 = 10;
+const MIN_FILL_TRIALS: u64 = 30;
+const MIN_FILL_EVENTS: u64 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -55,6 +57,12 @@ pub struct CalibrationState {
     pub orders_placed: u64,
     pub completed_orders: u64,
     pub fill_events: u64,
+    /// Bounded event timestamps used for a genuinely rolling fill-rate
+    /// estimate. The aggregate counters above remain for audit totals.
+    #[serde(default)]
+    pub order_placed_times_ms: VecDeque<u64>,
+    #[serde(default)]
+    pub fill_times_ms: VecDeque<u64>,
     pub reversion_events: u64,
     pub return_abs_pico_bps: VecDeque<i64>,
     pub spread_pico_bps: VecDeque<i64>,
@@ -78,6 +86,8 @@ impl CalibrationState {
             orders_placed: 0,
             completed_orders: 0,
             fill_events: 0,
+            order_placed_times_ms: VecDeque::new(),
+            fill_times_ms: VecDeque::new(),
             reversion_events: 0,
             return_abs_pico_bps: VecDeque::new(),
             spread_pico_bps: VecDeque::new(),
@@ -155,22 +165,24 @@ impl CalibrationState {
         }
         self.touch(time);
         self.orders_placed = self.orders_placed.saturating_add(1);
+        Self::push(&mut self.order_placed_times_ms, time);
     }
 
-    pub fn observe_fill(&mut self, time: u64, placed_at: u64, quantity: i64, displayed_depth: i64) {
+    pub fn observe_fill(&mut self, time: u64, _placed_at: u64, quantity: i64, displayed_depth: i64) {
         if self.frozen {
             return;
         }
         self.touch(time);
         self.fill_events = self.fill_events.saturating_add(1);
+        Self::push(&mut self.fill_times_ms, time);
         if displayed_depth > 0 && quantity > 0 {
             let participation = (i128::from(quantity) * 10_000 / i128::from(displayed_depth))
                 .clamp(0, 10_000) as i64;
             Self::push(&mut self.fill_participation_bps, participation);
         }
-        if time >= placed_at {
-            Self::push(&mut self.order_wait_ms, time.saturating_sub(placed_at));
-        }
+        // A fill is an intermediate order state. Waiting time is sampled once
+        // at terminality; recording it here as well biased the median and the
+        // effective sample count toward partially filled orders.
     }
 
     pub fn observe_order_terminal(&mut self, time: u64, placed_at: u64) {
@@ -227,26 +239,45 @@ impl CalibrationSnapshot {
             .min(residual_count);
         let reversion_samples = state.reversion_half_life_ms.len() as u64;
         let order_lifecycle_samples = state.order_wait_ms.len() as u64;
+        let fill_trials = rolling_count(&state.order_placed_times_ms, state.orders_placed);
+        let fill_events = rolling_count(&state.fill_times_ms, state.fill_events);
         let fill_participation_samples = state.fill_participation_bps.len() as u64;
         let markout_samples = state.adverse_markout_pico_bps.len() as u64;
         let scaled = |count: u64, required: u64| {
             count.saturating_mul(MIN_CALIBRATION_EFFECTIVE_SAMPLE_SIZE) / required.max(1)
         };
-        let effective = [
+        let count_effective = [
             scaled(market_samples, MIN_MARKET_SAMPLES),
             scaled(reversion_samples, MIN_REVERSION_SAMPLES),
             scaled(order_lifecycle_samples, MIN_ORDER_LIFECYCLE_SAMPLES),
             scaled(fill_participation_samples, MIN_FILL_PARTICIPATION_SAMPLES),
             scaled(markout_samples, MIN_MARKOUT_SAMPLES),
+            scaled(fill_trials, MIN_FILL_TRIALS),
+            scaled(fill_events, MIN_FILL_EVENTS),
         ]
         .into_iter()
         .min()
         .unwrap_or(0);
+        // Consecutive observations from one market regime are not iid. Apply
+        // a Newey-West-style first-lag effective-sample correction to the
+        // count floor, using only information already in the causal window.
+        let serial_effective = [
+            serial_effective_sample_size(&state.return_abs_pico_bps),
+            serial_effective_sample_size(&state.spread_pico_bps),
+            serial_effective_sample_size(&state.residual_abs_pico_bps),
+        ]
+        .into_iter()
+        .min()
+        .unwrap_or(0);
+        let effective = count_effective.min(serial_effective);
         let component_history_ready = market_samples >= MIN_MARKET_SAMPLES
             && reversion_samples >= MIN_REVERSION_SAMPLES
             && order_lifecycle_samples >= MIN_ORDER_LIFECYCLE_SAMPLES
             && fill_participation_samples >= MIN_FILL_PARTICIPATION_SAMPLES
-            && markout_samples >= MIN_MARKOUT_SAMPLES;
+            && markout_samples >= MIN_MARKOUT_SAMPLES
+            && fill_trials >= MIN_FILL_TRIALS
+            && fill_events >= MIN_FILL_EVENTS
+            && effective >= MIN_CALIBRATION_EFFECTIVE_SAMPLE_SIZE;
         let mut missing = Vec::new();
         if residual.is_none() {
             missing.push("residual");
@@ -266,8 +297,14 @@ impl CalibrationSnapshot {
         if participation.is_none() {
             missing.push("fill_participation");
         }
-        if state.fill_events == 0 {
+        if fill_events == 0 {
             missing.push("fill_events");
+        }
+        if fill_trials < MIN_FILL_TRIALS {
+            missing.push("fill_trials");
+        }
+        if fill_events < MIN_FILL_EVENTS {
+            missing.push("fill_event_samples");
         }
         if market_samples < MIN_MARKET_SAMPLES {
             missing.push("market_samples");
@@ -293,13 +330,13 @@ impl CalibrationSnapshot {
         let uncertainty_pico = residual_mad
             .saturating_add(spread.map(|(_, mad)| mad).unwrap_or(0))
             .saturating_add(markout.map(|(_, mad)| mad).unwrap_or(0));
-        let denominator = state.orders_placed.saturating_add(state.completed_orders);
-        let fill_hazard = if denominator > 0 {
-            (i128::from(state.fill_events) * 10_000 / i128::from(denominator)).clamp(0, 10_000)
-                as i64
-        } else {
-            0
-        };
+        // One placed order is one Bernoulli trial. Terminal events are not
+        // extra trials, and partial fills cannot create more than one success
+        // for this order-level hazard proxy. Use a 95% Wilson lower bound so a
+        // small favourable sample cannot manufacture a high M9 fill rate.
+        let fill_successes = fill_events.min(fill_trials);
+        let fill_hazard_mle = probability_bps(fill_successes, fill_trials);
+        let fill_hazard = wilson_lower_bound_bps(fill_successes, fill_trials);
         let null_weight = if residual_count > 0 {
             (10_000_i128 - i128::from(state.reversion_events) * 10_000 / i128::from(residual_count))
                 .clamp(0, 10_000) as i64
@@ -393,10 +430,24 @@ impl CalibrationSnapshot {
             "fill_hazard",
             fill_hazard,
             "probability_bps",
-            state.fill_events,
+            fill_trials,
             0,
             &["order_lifecycle"],
         );
+        if let Some(parameter) = parameters.last_mut() {
+            parameter.estimator = "rolling_wilson_lower_95pct".to_owned();
+        }
+        add(
+            "fill_hazard_mle",
+            fill_hazard_mle,
+            "probability_bps",
+            fill_trials,
+            0,
+            &["order_lifecycle"],
+        );
+        if let Some(parameter) = parameters.last_mut() {
+            parameter.estimator = "rolling_binomial_mle".to_owned();
+        }
         add(
             "null_random_walk_weight",
             null_weight,
@@ -509,6 +560,71 @@ fn robust_stats(samples: &VecDeque<i64>) -> Option<(i64, i64)> {
         .collect::<VecDeque<_>>();
     Some((center, median(&deviations)?))
 }
+
+fn rolling_count(samples: &VecDeque<u64>, fallback: u64) -> u64 {
+    if samples.is_empty() {
+        // Older snapshots are rejected by the v3 schema, but this fallback
+        // keeps hand-built states and unit fixtures deterministic.
+        fallback
+    } else {
+        samples.len() as u64
+    }
+}
+
+fn serial_effective_sample_size(samples: &VecDeque<i64>) -> u64 {
+    let count = samples.len() as u64;
+    if samples.len() < 2 {
+        return count;
+    }
+    let mean = samples.iter().map(|value| *value as f64).sum::<f64>() / samples.len() as f64;
+    let centered = samples
+        .iter()
+        .map(|value| *value as f64 - mean)
+        .collect::<Vec<_>>();
+    let variance = centered.iter().map(|value| value * value).sum::<f64>();
+    if variance <= f64::EPSILON {
+        return count;
+    }
+    let lag_one = centered[1..]
+        .iter()
+        .zip(&centered[..centered.len() - 1])
+        .map(|(left, right)| left * right)
+        .sum::<f64>()
+        / variance;
+    if lag_one <= 0.0 {
+        return count;
+    }
+    let rho = lag_one.clamp(0.0, 0.99);
+    let inflation = ((1.0 + rho) / (1.0 - rho)).max(1.0);
+    ((count as f64 / inflation).floor() as u64).max(1)
+}
+
+fn probability_bps(successes: u64, trials: u64) -> i64 {
+    if trials == 0 {
+        return 0;
+    }
+    (u128::from(successes.min(trials)) * 10_000 / u128::from(trials)) as i64
+}
+
+/// Wilson score lower bound for a binomial probability at z=1.96, evaluated
+/// in floating point only at the reporting boundary. The control path uses
+/// the resulting integer bps value, which is monotone and conservative for
+/// the finite samples available to the challenger.
+fn wilson_lower_bound_bps(successes: u64, trials: u64) -> i64 {
+    if trials == 0 {
+        return 0;
+    }
+    let n = trials as f64;
+    let p = successes.min(trials) as f64 / n;
+    let z = 1.96_f64;
+    let z2 = z * z;
+    let denominator = 1.0 + z2 / n;
+    let center = p + z2 / (2.0 * n);
+    let margin = z * (p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt();
+    ((center - margin) / denominator * 10_000.0)
+        .floor()
+        .clamp(0.0, 10_000.0) as i64
+}
 fn pico_to_bps_ceil(value: i64) -> i64 {
     if value <= 0 {
         return 0;
@@ -520,6 +636,7 @@ fn pico_to_bps_ceil(value: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     #[test]
     fn insufficient_history_is_explicit_and_replayable() {
         let state = CalibrationState::new("TESTUSDT");
@@ -582,6 +699,56 @@ mod tests {
         let snapshot = state.snapshot(2_000_000_000_000);
         assert_eq!(snapshot.status, CalibrationStatus::Calibrated);
         assert!(snapshot.effective_sample_size >= MIN_CALIBRATION_EFFECTIVE_SAMPLE_SIZE);
+    }
+
+    #[test]
+    fn fill_hazard_uses_orders_as_trials_and_has_a_finite_sample_lower_bound() {
+        let mut state = CalibrationState::new("TESTUSDT");
+        for time in 1..=30 {
+            state.observe_market(
+                time,
+                Some(2_000_000_000_000),
+                Some(1_000_000_000_000),
+                Some(8_000_000_000_000),
+            );
+        }
+        for index in 0..30 {
+            let placed_at = 100 + index * 3;
+            state.observe_order_placed(placed_at);
+            if index < 10 {
+                state.observe_fill(placed_at + 1, placed_at, 10, 100);
+            }
+            state.observe_order_terminal(placed_at + 1, placed_at);
+            state.observe_markout(placed_at + 2, 1_000_000_000_000);
+        }
+        let snapshot = state.snapshot(0);
+        let hazard = snapshot
+            .parameters
+            .iter()
+            .find(|parameter| parameter.parameter_name == "fill_hazard")
+            .expect("wilson parameter");
+        let mle = snapshot
+            .parameters
+            .iter()
+            .find(|parameter| parameter.parameter_name == "fill_hazard_mle")
+            .expect("mle parameter");
+        assert_eq!(mle.value, probability_bps(10, 30));
+        assert!(hazard.value < mle.value);
+        assert_eq!(hazard.estimator, "rolling_wilson_lower_95pct");
+        assert_eq!(snapshot.calibration.unwrap().fill_hazard_bps, hazard.value);
+    }
+
+    #[test]
+    fn serial_correlation_reduces_effective_information_but_alternation_does_not() {
+        let persistent = (0..64).map(|value| value as i64).collect::<VecDeque<_>>();
+        let alternating = (0..64)
+            .map(|value| if value % 2 == 0 { 1 } else { 0 })
+            .collect::<VecDeque<_>>();
+        assert!(serial_effective_sample_size(&persistent) < persistent.len() as u64);
+        assert_eq!(
+            serial_effective_sample_size(&alternating),
+            alternating.len() as u64
+        );
     }
 
     #[test]
