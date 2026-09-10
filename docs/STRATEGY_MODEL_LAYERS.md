@@ -58,7 +58,7 @@ resize an order.
 | L4 | Funding/deadline flatten | M8 funding overlay and earliest deadline | `m8.rs`, runtime, `flatten.rs` | Event-time funding uncertainty and deadline-constrained control |
 | L5 | PnL/accounting | Realized, unrealized, funding, fees and strategy alpha | runtime, `execution/pnl.rs` | Strict attribution: market beta versus execution residual |
 | L5 | Lifecycle/reconciliation | Order state, position truth and recovery | `execution/reconciliation.rs`, `recovery.rs` | Unknown-state monotonic risk reduction |
-| L5 | Flat completion | End-of-run flatness and residual exposure alarm | runtime, `flatten.rs` | Completion as a hard terminal condition, not a report field |
+| L5 | Flat completion | End-of-run flatness and residual exposure alarm | runtime, `flatten.rs` | Completion as a hard terminal condition, not a report field; unknown maker fill confidence fails closed and residual flatten attempts are explicit |
 | L6 | Method lineage | Core, challenger, ablation and overlay identities | `method_catalog.rs`, `experiment_plan.rs` | Paired event-tape comparisons with immutable lineage |
 | L6 | Calibration/OOS | Rolling calibration and independent folds | `calibration.rs`, `oos_validation.rs` | Hierarchical shrinkage, block dependence and finite-sample bounds |
 | L6 | Stress/promotion | Candidate selection and promotion barriers | `promotion_policy.rs` | Worst-fold and tail-survival constraints before ranking |

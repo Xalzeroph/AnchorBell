@@ -816,6 +816,11 @@ fn trend_conflict_sizing_is_monotone_and_bounded() {
 }
 
 #[test]
+fn unknown_maker_fill_calibration_is_not_treated_as_perfect() {
+    assert_eq!(calibrated_maker_confidence_bps(None), 0);
+}
+
+#[test]
 fn reversion_evidence_uses_lower_bound_and_never_inflates_early_size() {
     let mut engine = engine();
     let state = engine.states.get_mut("CXMTUSDT").expect("test symbol");

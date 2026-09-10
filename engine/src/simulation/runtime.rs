@@ -2031,6 +2031,28 @@ impl SimulationEngine {
                 force_reduce_only_taker_intent(&self.states[&symbol], self.emergency_policy);
             if let Some(intent) = desired {
                 records.extend(self.place_symbol(&symbol, intent, timestamp_ms, true, None));
+                if self.states[&symbol].position != 0 {
+                    let state = self.states.get(&symbol).expect("symbol state exists");
+                    records.push(self.record(
+                        &symbol,
+                        state,
+                        timestamp_ms,
+                        RecordFields {
+                            kind: "flatten_unavailable",
+                            decision_id: None,
+                            client_id: None,
+                            side: None,
+                            price_ticks: None,
+                            quantity: Some(state.position.checked_abs().unwrap_or(i64::MAX)),
+                            order_age_ms: None,
+                            queue_ahead_quantity: None,
+                            quote_distance_bps: None,
+                            detail: Some(
+                                "reduce-only flatten attempted but residual position remains",
+                            ),
+                        },
+                    ));
+                }
             } else {
                 let state = self.states.get(&symbol).expect("symbol state exists");
                 records.push(self.record(
@@ -3221,6 +3243,7 @@ impl SimulationEngine {
                         timestamp_ms,
                         self.quantity_scale,
                         self.emergency_policy,
+                        self.execution_filters.get(symbol).copied(),
                         self.fee_ppm,
                         self.max_mark_index_gap_bps,
                         state.funding_interval_hours,
@@ -4433,6 +4456,7 @@ fn maker_exit_intent_for_state(
     timestamp_ms: u64,
     quantity_scale: u32,
     emergency_policy: EmergencyExecutionPolicy,
+    execution_filters: Option<BinanceScaledExecutionFilters>,
     fee_ppm: i64,
     max_mark_index_gap_bps: i64,
     funding_interval_hours: u32,
@@ -4480,9 +4504,7 @@ fn maker_exit_intent_for_state(
     let maker_estimated_time_ms = calibration
         .map(|value| value.fill_horizon_ms)
         .unwrap_or_default();
-    let maker_confidence_bps = calibration
-        .map(|value| value.fill_hazard_bps.clamp(0, 10_000) as u16)
-        .unwrap_or(10_000);
+    let maker_confidence_bps = calibrated_maker_confidence_bps(calibration);
     let mark_index_gap_bps = match (state.mark_price_ticks, state.index_price_ticks) {
         (Some(mark), Some(index)) if mark > 0 && index > 0 => Some(bps_between(mark, index)),
         _ => None,
@@ -4553,6 +4575,33 @@ fn maker_exit_intent_for_state(
             reduce_only: order.reduce_only,
         },
     };
+    let constraints = execution_filters
+        .map(|filters| ExitConstraints {
+            min_price: filters.min_price_ticks,
+            max_price: filters.max_price_ticks,
+            price_tick: filters.price_tick,
+            min_quantity: filters.min_quantity_units,
+            max_quantity: position_quantity.min(filters.max_quantity_units),
+            quantity_step: filters.quantity_step,
+            min_notional: filters.min_notional_price_ticks,
+            quantity_scale,
+            observed_at_ms: timestamp_ms,
+            max_age_ms: 0,
+        })
+        .or_else(|| {
+            Some(ExitConstraints {
+                min_price: 1,
+                max_price: i64::MAX,
+                price_tick: 1,
+                min_quantity: 1,
+                max_quantity: position_quantity,
+                quantity_step: 1,
+                min_notional: 1,
+                quantity_scale,
+                observed_at_ms: timestamp_ms,
+                max_age_ms: 0,
+            })
+        });
     let decision = decide_maker_exit(MakerExitInput {
         symbol: state.symbol_id,
         position: state.position,
@@ -4565,18 +4614,7 @@ fn maker_exit_intent_for_state(
             ask: book.ask_price_ticks,
             observed_at_ms: state.last_book_event_at_ms,
         }),
-        constraints: Some(ExitConstraints {
-            min_price: 1,
-            max_price: i64::MAX,
-            price_tick: 1,
-            min_quantity: 1,
-            max_quantity: position_quantity,
-            quantity_step: 1,
-            min_notional: 1,
-            quantity_scale,
-            observed_at_ms: timestamp_ms,
-            max_age_ms: binance_runtime_config().operational.max_signal_age_ms,
-        }),
+        constraints,
         working,
     });
     match decision {
@@ -4599,6 +4637,12 @@ fn maker_exit_intent_for_state(
         MakerExitDecision::Trading => (None, "maker_exit_not_in_window"),
         MakerExitDecision::Blocked(_) => (None, "maker_exit_blocked"),
     }
+}
+
+fn calibrated_maker_confidence_bps(calibration: Option<M9Calibration>) -> u16 {
+    calibration
+        .map(|value| value.fill_hazard_bps.clamp(0, 10_000) as u16)
+        .unwrap_or(0)
 }
 
 fn force_reduce_only_taker_intent(
