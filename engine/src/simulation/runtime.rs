@@ -4995,8 +4995,8 @@ fn m5_scaled_quantity(stress: i64, requested_quantity: i64) -> i64 {
     // relative to the old policy at the reduce-only boundary.
     let span = M5_TAIL_REDUCE_ONLY_BPS - M5_TAIL_CAUTION_BPS;
     let remaining = M5_TAIL_REDUCE_ONLY_BPS - stress;
-    let scale_bps = 2_500_i128
-        + i128::from(remaining.max(0)) * 7_500_i128 / i128::from(span.max(1));
+    let scale_bps =
+        2_500_i128 + i128::from(remaining.max(0)) * 7_500_i128 / i128::from(span.max(1));
     let scaled = i128::from(requested_quantity) * scale_bps / 10_000_i128;
     scaled
         .clamp(1, i128::from(requested_quantity))

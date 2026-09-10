@@ -489,8 +489,7 @@ fn validate(config: &SimulationBatchConfig) -> Result<(), SimulationError> {
         || config.market_event_queue_capacity == 0
         || config.portfolio_drawdown_soft_bps < 0
         || config.portfolio_drawdown_hard_bps < 0
-        || (config.portfolio_drawdown_soft_bps == 0
-            && config.portfolio_drawdown_hard_bps != 0)
+        || (config.portfolio_drawdown_soft_bps == 0 && config.portfolio_drawdown_hard_bps != 0)
         || (config.portfolio_drawdown_soft_bps != 0
             && config.portfolio_drawdown_hard_bps <= config.portfolio_drawdown_soft_bps)
         || config.portfolio_drawdown_hard_bps > 10_000

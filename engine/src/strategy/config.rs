@@ -134,7 +134,9 @@ impl StrategyProfile {
                 self.schema_version
             ));
         }
-        if self.default_strategy_variant.eq_ignore_ascii_case("core_v1")
+        if self
+            .default_strategy_variant
+            .eq_ignore_ascii_case("core_v1")
             && self.threshold_scale_ppm < 1_000_000
         {
             return Err(
@@ -171,8 +173,7 @@ impl StrategyProfile {
             || self.max_mark_index_gap_bps < 0
             || self.portfolio_drawdown_soft_bps < 0
             || self.portfolio_drawdown_hard_bps < 0
-            || (self.portfolio_drawdown_soft_bps == 0
-                && self.portfolio_drawdown_hard_bps != 0)
+            || (self.portfolio_drawdown_soft_bps == 0 && self.portfolio_drawdown_hard_bps != 0)
             || (self.portfolio_drawdown_soft_bps != 0
                 && self.portfolio_drawdown_hard_bps <= self.portfolio_drawdown_soft_bps)
             || self.portfolio_drawdown_hard_bps > 10_000

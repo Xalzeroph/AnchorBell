@@ -692,10 +692,16 @@ fn liquidity_controls_are_continuous_and_monotonic() {
 fn tail_quantity_scaling_is_continuous_monotone_and_bounded() {
     let requested = 10_000;
     assert_eq!(m5_scaled_quantity(0, requested), requested);
-    assert_eq!(m5_scaled_quantity(M5_TAIL_CAUTION_BPS, requested), requested);
+    assert_eq!(
+        m5_scaled_quantity(M5_TAIL_CAUTION_BPS, requested),
+        requested
+    );
     assert!(m5_scaled_quantity(36, requested) < requested);
     assert!(m5_scaled_quantity(36, requested) > m5_scaled_quantity(59, requested));
-    assert_eq!(m5_scaled_quantity(M5_TAIL_REDUCE_ONLY_BPS, requested), 2_500);
+    assert_eq!(
+        m5_scaled_quantity(M5_TAIL_REDUCE_ONLY_BPS, requested),
+        2_500
+    );
     assert_eq!(m5_scaled_quantity(M5_TAIL_HALT_BPS, requested), 0);
     for stress in M5_TAIL_CAUTION_BPS..=M5_TAIL_HALT_BPS {
         let quantity = m5_scaled_quantity(stress, requested);
