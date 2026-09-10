@@ -454,12 +454,11 @@ fn build_engine(
         let capital = config
             .position_allocations
             .as_ref()
-            .map(|allocations| {
+            .and_then(|allocations| {
                 allocations.values().try_fold(0_i64, |total, allocation| {
                     total.checked_add(allocation.budget_usdt_ticks)
                 })
             })
-            .flatten()
             .filter(|capital| *capital > 0)
             .ok_or(SimulationError::InvalidConfig(
                 "portfolio drawdown guard requires allocated capital",

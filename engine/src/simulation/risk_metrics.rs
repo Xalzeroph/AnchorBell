@@ -187,8 +187,7 @@ fn hac_variance_multiplier(returns: &[f64]) -> f64 {
         return 1.0;
     }
     let bandwidth = ((returns.len() as f64).sqrt() as usize)
-        .max(1)
-        .min(20)
+        .clamp(1, 20)
         .min(returns.len() - 1);
     let mut multiplier = 1.0_f64;
     for lag in 1..=bandwidth {

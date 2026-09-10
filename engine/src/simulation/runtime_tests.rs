@@ -723,19 +723,19 @@ fn tail_quantity_scaling_is_continuous_monotone_and_bounded() {
 
 #[test]
 fn fractional_edge_sizing_is_conservative_and_monotone() {
-    let hurdle = 100 * PICO_BPS_SCALE as i64;
+    let hurdle = 100 * PICO_BPS_SCALE;
     let quantity = 10_000;
     assert_eq!(
         fractional_edge_quantity(hurdle, hurdle, quantity),
         quantity / 4
     );
-    let marginal = fractional_edge_quantity(101 * PICO_BPS_SCALE as i64, hurdle, quantity);
-    let strong = fractional_edge_quantity(400 * PICO_BPS_SCALE as i64, hurdle, quantity);
+    let marginal = fractional_edge_quantity(101 * PICO_BPS_SCALE, hurdle, quantity);
+    let strong = fractional_edge_quantity(400 * PICO_BPS_SCALE, hurdle, quantity);
     assert!(marginal < strong);
     assert!(strong < quantity);
     assert!(marginal >= quantity / 4);
     assert_eq!(
-        fractional_edge_quantity(10 * PICO_BPS_SCALE as i64, hurdle, quantity),
+        fractional_edge_quantity(10 * PICO_BPS_SCALE, hurdle, quantity),
         0
     );
 }
