@@ -738,6 +738,26 @@ fn fractional_edge_sizing_is_conservative_and_monotone() {
 }
 
 #[test]
+fn cross_symbol_concentration_penalty_is_smooth_and_preserves_reductions() {
+    let flat = cross_symbol_concentration_scaled_quantity(0, 0, Side::Buy, 10_000);
+    let concentrated =
+        cross_symbol_concentration_scaled_quantity(10_000, 0, Side::Buy, 10_000);
+    let more_concentrated =
+        cross_symbol_concentration_scaled_quantity(30_000, 0, Side::Buy, 10_000);
+    assert_eq!(flat, 10_000);
+    assert!(concentrated < flat);
+    assert!(more_concentrated < concentrated);
+    assert_eq!(
+        cross_symbol_concentration_scaled_quantity(30_000, -10, Side::Buy, 10_000),
+        10_000
+    );
+    assert_eq!(
+        cross_symbol_concentration_scaled_quantity(30_000, 10, Side::Sell, 10_000),
+        10_000
+    );
+}
+
+#[test]
 fn symbol_drawdown_overlay_scales_before_hard_stop() {
     let mut engine = engine()
         .with_portfolio_drawdown_limits_bps(10_000, 500, 800)
