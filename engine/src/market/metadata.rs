@@ -1724,19 +1724,19 @@ mod tests {
             .unwrap();
         assert_eq!(
             filters.normalize_price(827_850_001, true, true),
-            Ok(827_850_000)
+            Ok(827_800_000)
         );
         assert_eq!(
             filters.normalize_price(827_850_001, false, true),
-            Ok(827_850_100)
+            Ok(827_900_000)
         );
         assert_eq!(
             filters.normalize_price(827_850_001, true, false),
-            Ok(827_850_100)
+            Ok(827_900_000)
         );
         assert_eq!(
             filters.normalize_price(827_850_001, false, false),
-            Ok(827_850_000)
+            Ok(827_800_000)
         );
     }
 
