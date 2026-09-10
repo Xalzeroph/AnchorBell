@@ -778,6 +778,23 @@ struct SimulationSymbolState {
     ewma_abs_return_pico_bps: i64,
     ewma_spread_pico_bps: i64,
     ewma_signed_return_pico_bps: i64,
+    /// Signed fair-value residual (fair value minus mid) used as the causal
+    /// direction of the mean-reversion hypothesis.
+    ewma_signed_residual_pico_bps: i64,
+    /// Signed EWMA of residual absolute changes. Positive values mean the
+    /// dislocation is expanding away from zero; negative values mean it is
+    /// contracting toward zero.
+    ewma_residual_drift_pico_bps: i64,
+    /// Signed EWMA of the residual level change. Positive values indicate
+    /// drift toward the positive residual regime; negative values indicate
+    /// drift toward the negative residual regime.
+    ewma_signed_residual_drift_pico_bps: i64,
+    /// EWMA sign persistence in [-1e6, 1e6]. Positive persistence means the
+    /// residual remains on one side of zero; negative persistence means it
+    /// crosses zero, which is evidence against a persistent regime.
+    ewma_residual_persistence_ppm: i64,
+    last_residual_pico_bps: Option<i64>,
+    last_residual_dynamics_time_ms: Option<u64>,
     near_miss_count: u64,
     adaptive_relief_bps: i64,
     adaptive_relief_micro_bps: i64,
@@ -988,6 +1005,7 @@ const MIN_MARKOUT_FEEDBACK_SAMPLES: usize = 8;
 const TREND_PRIOR_OBSERVATIONS: i128 = 32;
 const TREND_CONFLICT_CAP_PICO_BPS: i64 = 75 * PICO_BPS_SCALE;
 const MIN_EVIDENCE_SCALE_PPM: i64 = 250_000;
+const RESIDUAL_REGIME_CAP_PICO_BPS: i64 = 75 * PICO_BPS_SCALE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SimulationRiskState {
@@ -1086,6 +1104,19 @@ pub struct SymbolMetrics {
     /// Signed EWMA return used to distinguish mean-reversion from a moving
     /// dislocation. Positive values indicate upward pressure.
     pub ewma_signed_return_pico_bps: i64,
+    /// Signed fair-value residual (fair value minus mid), in pico-bps.
+    pub ewma_signed_residual_pico_bps: i64,
+    /// Positive values indicate residual expansion away from zero; negative
+    /// values indicate contraction toward zero.
+    pub ewma_residual_drift_pico_bps: i64,
+    /// Signed direction drift of the residual level, in pico-bps.
+    pub ewma_signed_residual_drift_pico_bps: i64,
+    /// Serial persistence of the residual sign in parts per million. It is
+    /// shrunk toward zero during the causal warm-up period.
+    pub ewma_residual_persistence_ppm: i64,
+    /// Conservative residual-regime risk score used by Core V1 sizing.
+    pub residual_regime_risk_pico_bps: i64,
+    pub residual_regime_scale_ppm: i64,
     /// Directional persistence after shrinkage toward a zero-trend prior.
     pub trend_persistence_bps: i64,
     pub buy_trend_conflict_pico_bps: i64,
@@ -1290,6 +1321,12 @@ impl SimulationEngine {
                         ewma_abs_return_pico_bps: 0,
                         ewma_spread_pico_bps: 0,
                         ewma_signed_return_pico_bps: 0,
+                        ewma_signed_residual_pico_bps: 0,
+                        ewma_residual_drift_pico_bps: 0,
+                        ewma_signed_residual_drift_pico_bps: 0,
+                        ewma_residual_persistence_ppm: 0,
+                        last_residual_pico_bps: None,
+                        last_residual_dynamics_time_ms: None,
                         ewma_adverse_markout_micro_bps: 0,
                         ewma_adverse_markout_pico_bps: 0,
                         evaluated_markouts: 0,
@@ -2531,6 +2568,17 @@ impl SimulationEngine {
                     ewma_abs_return_pico_bps: state.ewma_abs_return_pico_bps,
                     ewma_spread_pico_bps: state.ewma_spread_pico_bps,
                     ewma_signed_return_pico_bps: state.ewma_signed_return_pico_bps,
+                    ewma_signed_residual_pico_bps: state.ewma_signed_residual_pico_bps,
+                    ewma_residual_drift_pico_bps: state.ewma_residual_drift_pico_bps,
+                    ewma_signed_residual_drift_pico_bps:
+                        state.ewma_signed_residual_drift_pico_bps,
+                    ewma_residual_persistence_ppm: state.ewma_residual_persistence_ppm,
+                    residual_regime_risk_pico_bps: residual_regime_risk_pico_bps(
+                        state,
+                        Side::Buy,
+                    )
+                    .max(residual_regime_risk_pico_bps(state, Side::Sell)),
+                    residual_regime_scale_ppm: residual_regime_scale_ppm(state),
                     trend_persistence_bps: trend_persistence_bps(state),
                     buy_trend_conflict_pico_bps: trend_conflict_pico_bps(state, Side::Buy),
                     sell_trend_conflict_pico_bps: trend_conflict_pico_bps(state, Side::Sell),
@@ -2769,6 +2817,11 @@ impl SimulationEngine {
                 spread_pico_bps,
                 residual_pico_bps_for_state(state),
             );
+            observe_residual_dynamics(
+                state,
+                ticker.event_time_ms,
+                residual_pico_bps_for_state(state),
+            );
         } else {
             return Vec::new();
         }
@@ -2844,6 +2897,7 @@ impl SimulationEngine {
             state.mark_price_ticks = Some(mark.mark_price.0);
             state.index_price_ticks = Some(mark.index_price.0);
             let residual = residual_pico_bps_for_state(state);
+            observe_residual_dynamics(state, mark.event_time_ms, residual);
             state
                 .calibration
                 .observe_market(mark.event_time_ms, return_sample, None, residual);
@@ -5338,6 +5392,113 @@ fn directional_trend_conflict_pico_bps(
         .clamp(0, i128::from(TREND_CONFLICT_CAP_PICO_BPS)) as i64
 }
 
+/// Update the causal residual state once per event-time observation. The
+/// residual is fair value minus mid, so its signed level identifies the
+/// direction of the hypothesised reversion, its signed first difference
+/// identifies directional drift, and its absolute first difference identifies
+/// whether the dislocation is expanding or contracting. Sign persistence is
+/// an online serial-dependence proxy; it is intentionally kept separate from
+/// the level so a long-lived but shrinking residual is not confused with a
+/// new adverse regime.
+fn observe_residual_dynamics(
+    state: &mut SimulationSymbolState,
+    event_time_ms: u64,
+    residual: Option<i64>,
+) {
+    let Some(residual) = residual else { return };
+    if state
+        .last_residual_dynamics_time_ms
+        .is_some_and(|previous| event_time_ms <= previous)
+    {
+        return;
+    }
+    state.ewma_signed_residual_pico_bps = ewma_signed_scaled(
+        state.ewma_signed_residual_pico_bps,
+        residual,
+    );
+    if let Some(previous) = state.last_residual_pico_bps {
+        let previous_abs = previous.unsigned_abs().min(i64::MAX as u64) as i64;
+        let residual_abs = residual.unsigned_abs().min(i64::MAX as u64) as i64;
+        let signed_change = residual.saturating_sub(previous);
+        let absolute_change = residual_abs.saturating_sub(previous_abs);
+        state.ewma_signed_residual_drift_pico_bps = ewma_signed_scaled(
+            state.ewma_signed_residual_drift_pico_bps,
+            signed_change,
+        );
+        state.ewma_residual_drift_pico_bps = ewma_signed_scaled(
+            state.ewma_residual_drift_pico_bps,
+            absolute_change,
+        );
+        let persistence_sample = if previous == 0 || residual == 0 {
+            0
+        } else if previous.signum() == residual.signum() {
+            1_000_000
+        } else {
+            -1_000_000
+        };
+        state.ewma_residual_persistence_ppm = ewma_signed_scaled(
+            state.ewma_residual_persistence_ppm,
+            persistence_sample,
+        );
+    }
+    state.last_residual_pico_bps = Some(residual);
+    state.last_residual_dynamics_time_ms = Some(event_time_ms);
+}
+
+/// Conservative upper risk score for the residual regime. The score combines
+/// three online signals: expansion away from zero, drift in the direction
+/// adverse to the candidate quote, and same-sign serial persistence. Every
+/// component is normalized by the observed residual/return scale and shrunk
+/// by the causal observation count. This is a continuous risk budget, not an
+/// assertion that a regime has statistically changed.
+fn residual_regime_risk_pico_bps(state: &SimulationSymbolState, side: Side) -> i64 {
+    let observations = state.calibration.residual_abs_pico_bps.len() as i128;
+    if observations <= 0 {
+        return 0;
+    }
+    let scale = i128::from(
+        state
+            .ewma_signed_residual_pico_bps
+            .unsigned_abs()
+            .min(i64::MAX as u64)
+            .max(state.ewma_abs_return_pico_bps.unsigned_abs().min(i64::MAX as u64))
+            .max(PICO_BPS_SCALE as u64) as i64,
+    );
+    let expansion = i128::from(state.ewma_residual_drift_pico_bps.max(0));
+    let directional_drift = match side {
+        Side::Buy => state.ewma_signed_residual_drift_pico_bps.max(0),
+        Side::Sell => state.ewma_signed_residual_drift_pico_bps.saturating_neg().max(0),
+    };
+    let drift = i128::from(expansion.max(directional_drift));
+    if drift <= 0 {
+        return 0;
+    }
+    let persistence = i128::from(state.ewma_residual_persistence_ppm.max(0));
+    let persistence_factor = (500_000_i128 + persistence / 2).clamp(0, 1_000_000);
+    let raw = drift
+        .saturating_mul(i128::from(RESIDUAL_REGIME_CAP_PICO_BPS))
+        .checked_div(scale)
+        .unwrap_or(i128::from(RESIDUAL_REGIME_CAP_PICO_BPS))
+        .clamp(0, i128::from(RESIDUAL_REGIME_CAP_PICO_BPS));
+    raw.saturating_mul(persistence_factor)
+        .checked_div(1_000_000)
+        .unwrap_or(0)
+        .saturating_mul(observations)
+        .checked_div(observations + TREND_PRIOR_OBSERVATIONS)
+        .unwrap_or(0)
+        .clamp(0, i128::from(RESIDUAL_REGIME_CAP_PICO_BPS)) as i64
+}
+
+fn residual_regime_scale_ppm(state: &SimulationSymbolState) -> i64 {
+    let risk = residual_regime_risk_pico_bps(state, Side::Buy)
+        .max(residual_regime_risk_pico_bps(state, Side::Sell));
+    let cap = i128::from(RESIDUAL_REGIME_CAP_PICO_BPS.max(1));
+    (1_000_000_i128
+        - (i128::from(risk) * i128::from(1_000_000 - MIN_EVIDENCE_SCALE_PPM) / cap))
+    .clamp(i128::from(MIN_EVIDENCE_SCALE_PPM), 1_000_000)
+    as i64
+}
+
 /// Lower confidence bound for the probability that a residual observation is
 /// followed by a causal halving event. This is deliberately a lower bound:
 /// scarce or serially dependent reversion evidence cannot create size.
@@ -5548,9 +5709,13 @@ fn core_v1_margin_scaled_quantity(
     };
     let edge_scaled_quantity = fractional_edge_quantity(edge, hurdle, intent.quantity);
     let evidence_scale = reversion_evidence_scale_ppm(state);
-    (i128::from(edge_scaled_quantity) * i128::from(evidence_scale)
+    let evidence_scaled = (i128::from(edge_scaled_quantity) * i128::from(evidence_scale)
         / i128::from(1_000_000_i64))
-        .clamp(1, i128::from(edge_scaled_quantity)) as i64
+        .clamp(1, i128::from(edge_scaled_quantity)) as i64;
+    residual_regime_scaled_quantity(
+        residual_regime_risk_pico_bps(state, intent.side),
+        evidence_scaled,
+    )
 }
 
 /// Fractional-Kelly-inspired sizing without claiming a return distribution.
@@ -5633,6 +5798,22 @@ fn fill_probability_scaled_quantity(fill_probability_bps: u16, quantity: i64) ->
     let probability = i128::from(fill_probability_bps.min(10_000));
     let scale_ppm = i128::from(MIN_EVIDENCE_SCALE_PPM)
         + (1_000_000_i128 - i128::from(MIN_EVIDENCE_SCALE_PPM)) * probability / 10_000;
+    (i128::from(quantity) * scale_ppm / 1_000_000_i128)
+        .clamp(1, i128::from(quantity)) as i64
+}
+
+/// Convert residual-regime risk into a continuous inventory budget. The
+/// floor matches the existing evidence-aware sizing floor: uncertain regime
+/// state can reduce a new quote to a probe, but it cannot silently create a
+/// hard entry gate or interfere with reduce-only cleanup.
+fn residual_regime_scaled_quantity(risk_pico_bps: i64, quantity: i64) -> i64 {
+    if quantity <= 0 || risk_pico_bps <= 0 {
+        return quantity.max(0);
+    }
+    let risk = i128::from(risk_pico_bps.min(RESIDUAL_REGIME_CAP_PICO_BPS));
+    let cap = i128::from(RESIDUAL_REGIME_CAP_PICO_BPS.max(1));
+    let scale_ppm = 1_000_000_i128
+        - risk * i128::from(1_000_000 - MIN_EVIDENCE_SCALE_PPM) / cap;
     (i128::from(quantity) * scale_ppm / 1_000_000_i128)
         .clamp(1, i128::from(quantity)) as i64
 }

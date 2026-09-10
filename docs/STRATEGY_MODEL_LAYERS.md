@@ -43,10 +43,10 @@ resize an order.
 | L0 | Anchor and calendar truth | External close, FX, session and flatten deadlines | `reference_authority.rs`, `calendar.rs`, `historical.rs` | Immutable closure episodes and region-specific clocks |
 | L1 | Fair-value fusion | Anchor/index/mark/mid reference estimate | `strategy/reference_model.rs` | Robust weighted fusion with dispersion-aware confidence |
 | L1 | Regime state | Calm, normal, stressed, dislocated and transition states | reference model + runtime | Hysteresis, persistence and state-transition penalties |
-| L1 | Residual dynamics | Residual magnitude, drift, reversion and half-life | `calibration.rs`, runtime | Causal robust state-space / mean-reversion evidence |
+| L1 | Residual dynamics | Residual magnitude, drift, reversion and half-life | `calibration.rs`, runtime; signed residual EWMA, absolute expansion, sign persistence and regime-risk sizing | Causal robust state-space / mean-reversion evidence |
 | L1 | Execution feedback | Markout, fill hazard, queue and latency observations | `calibration.rs`, runtime | Wilson bounds, tail quantiles, serial-effective samples |
 | L2 | Edge signal | Anchor-relative executable buy/sell edge | `signal_policy.rs`, `anchor_maker.rs` | Net-edge after uncertainty, adverse selection and deadline cost |
-| L2 | Directional microstructure | Queue imbalance and trend conflict by side | `signal_policy.rs`, runtime | Side-specific robust conflict model and peer-region factor |
+| L2 | Directional microstructure | Queue imbalance and trend conflict by side | `signal_policy.rs`, runtime; residual direction drift is side-aware | Side-specific robust conflict model and peer-region factor |
 | L2 | Evidence admission | F7 evidence gate and explainable rejection | runtime, observability | Graded data/risk/evidence states; never relax on raw order count |
 | L3 | Quote construction | Maker-first price and post-only intent | `quote_engine.rs`, `maker_exit.rs` | Quote distance as a constrained optimization variable |
 | L3 | Queue/fill model | Queue ahead, trade-through and fill probability | `backtest_realism.rs`, runtime; queue probability now continuously sizes Core V1 | Censored survival / competing-risk treatment of partial fills |
@@ -62,7 +62,7 @@ resize an order.
 | L6 | Method lineage | Core, challenger, ablation and overlay identities | `method_catalog.rs`, `experiment_plan.rs` | Paired event-tape comparisons with immutable lineage |
 | L6 | Calibration/OOS | Rolling calibration and independent folds | `calibration.rs`, `oos_validation.rs` | Hierarchical shrinkage, block dependence and finite-sample bounds |
 | L6 | Stress/promotion | Candidate selection and promotion barriers | `promotion_policy.rs` | Worst-fold and tail-survival constraints before ranking |
-| L6 | Audit/dashboard | Rejection reasons, delay, book, funding and per-symbol metrics | `observability.rs`, `engine/web`; empirical fill LCB exposed in `SymbolMetrics` | Schema-driven views; every metric carries source/time/version |
+| L6 | Audit/dashboard | Rejection reasons, delay, book, funding and per-symbol metrics | `observability.rs`, `engine/web`; empirical fill LCB and residual-regime fields exposed in `SymbolMetrics` | Schema-driven views; every metric carries source/time/version |
 
 Total coverage: **7 layers, 26 modules**. No strategy decision is considered
 complete until it has a path through all applicable L0-L5 modules and an L6
@@ -79,8 +79,10 @@ The implementation order is causal and conservative:
    one-sided bounds, block/bootstrap-style fold separation, and tail/ES
    metrics. IID assumptions are not permitted for event-driven data.
 3. **Regime and residual process:** finite-state regime transitions with
-   hysteresis; signed residual drift, reversion evidence, and adverse
-   selection as separate causal processes.
+   hysteresis; signed residual drift, absolute expansion, sign-persistence
+   and reversion evidence as separate causal processes. The Core V1 budget
+   applies a sample-shrunk continuous scale; it does not turn uncertain
+   residual dynamics into an unlogged hard gate.
 4. **Hierarchical cross-section:** symbol estimates shrink toward their
    region factor only when peer observations are present; a single symbol
    cannot set the portfolio's belief.

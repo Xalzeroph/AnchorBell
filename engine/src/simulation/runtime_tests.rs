@@ -816,6 +816,37 @@ fn trend_conflict_sizing_is_monotone_and_bounded() {
 }
 
 #[test]
+fn residual_regime_state_tracks_drift_persistence_and_expansion() {
+    let mut engine = engine();
+    let state = engine.states.get_mut("CXMTUSDT").expect("test symbol");
+    for index in 0..64 {
+        let residual = (10 + index as i64) * PICO_BPS_SCALE;
+        observe_residual_dynamics(state, index + 1, Some(residual));
+        state.calibration.residual_abs_pico_bps.push_back(residual);
+    }
+    assert!(state.ewma_signed_residual_pico_bps > 0);
+    assert!(state.ewma_signed_residual_drift_pico_bps > 0);
+    assert!(state.ewma_residual_drift_pico_bps > 0);
+    assert!(state.ewma_residual_persistence_ppm > 0);
+    assert!(residual_regime_risk_pico_bps(state, Side::Buy) > 0);
+    assert!(residual_regime_scale_ppm(state) < 1_000_000);
+}
+
+#[test]
+fn residual_regime_sizing_is_monotone_and_never_amplifies() {
+    let quantity = 10_000;
+    assert_eq!(residual_regime_scaled_quantity(0, quantity), quantity);
+    let mild = residual_regime_scaled_quantity(
+        RESIDUAL_REGIME_CAP_PICO_BPS / 4,
+        quantity,
+    );
+    let severe = residual_regime_scaled_quantity(RESIDUAL_REGIME_CAP_PICO_BPS, quantity);
+    assert!(mild < quantity);
+    assert!(severe <= mild);
+    assert!(severe >= quantity / 4);
+}
+
+#[test]
 fn unknown_maker_fill_calibration_is_not_treated_as_perfect() {
     assert_eq!(calibrated_maker_confidence_bps(None), 0);
 }
