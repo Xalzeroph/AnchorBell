@@ -1664,7 +1664,11 @@ mod tests {
 
     #[test]
     fn scaled_filters_project_to_discrete_feasible_quantity() {
-        let filters = metadata().execution_filters().unwrap().scaled(5, 2).unwrap();
+        let filters = metadata()
+            .execution_filters()
+            .unwrap()
+            .scaled(5, 2)
+            .unwrap();
         let price = filters.normalize_price(512345, true, true).unwrap();
         assert_eq!(price, 512300);
         assert_eq!(filters.normalize_quantity(1, price, 1_000, 2).unwrap(), 98);
