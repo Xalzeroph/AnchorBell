@@ -832,6 +832,21 @@ fn fill_probability_sizing_is_monotone_and_keeps_a_conservative_probe() {
 }
 
 #[test]
+fn empirical_fill_lower_bound_only_activates_after_lifecycle_floor() {
+    let mut engine = engine();
+    let state = engine.states.get_mut("CXMTUSDT").expect("test symbol");
+    assert_eq!(empirical_fill_probability_lcb_bps(state), None);
+    for index in 0..MIN_EMPIRICAL_FILL_TRIALS {
+        state
+            .calibration
+            .order_placed_times_ms
+            .push_back(index + 1);
+    }
+    assert_eq!(empirical_fill_probability_lcb_bps(state), Some(0));
+    assert_eq!(effective_fill_probability_bps(state, 9_500), 0);
+}
+
+#[test]
 fn reversion_evidence_uses_lower_bound_and_never_inflates_early_size() {
     let mut engine = engine();
     let state = engine.states.get_mut("CXMTUSDT").expect("test symbol");

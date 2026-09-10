@@ -62,7 +62,7 @@ resize an order.
 | L6 | Method lineage | Core, challenger, ablation and overlay identities | `method_catalog.rs`, `experiment_plan.rs` | Paired event-tape comparisons with immutable lineage |
 | L6 | Calibration/OOS | Rolling calibration and independent folds | `calibration.rs`, `oos_validation.rs` | Hierarchical shrinkage, block dependence and finite-sample bounds |
 | L6 | Stress/promotion | Candidate selection and promotion barriers | `promotion_policy.rs` | Worst-fold and tail-survival constraints before ranking |
-| L6 | Audit/dashboard | Rejection reasons, delay, book, funding and per-symbol metrics | `observability.rs`, `engine/web` | Schema-driven views; every metric carries source/time/version |
+| L6 | Audit/dashboard | Rejection reasons, delay, book, funding and per-symbol metrics | `observability.rs`, `engine/web`; empirical fill LCB exposed in `SymbolMetrics` | Schema-driven views; every metric carries source/time/version |
 
 Total coverage: **7 layers, 26 modules**. No strategy decision is considered
 complete until it has a path through all applicable L0-L5 modules and an L6

@@ -1117,6 +1117,9 @@ pub struct SymbolMetrics {
     pub liquidity_ratio_bps: Option<i64>,
     pub liquidity_penalty_bps: Option<i64>,
     pub liquidity_fill_probability_bps: Option<u16>,
+    /// Wilson lower bound of observed order-level fills. `None` means the
+    /// rolling lifecycle sample has not reached the minimum evidence floor.
+    pub empirical_fill_probability_lcb_bps: Option<u16>,
     pub fair_value_ticks: Option<i64>,
     pub fair_value_confidence_bps: Option<i64>,
     pub market_regime: Option<String>,
@@ -2563,6 +2566,7 @@ impl SimulationEngine {
                     liquidity_fill_probability_bps: state.book.map(|book| {
                         fill_probability_bps(quote_quantity, book.bid_quantity, book.ask_quantity)
                     }),
+                    empirical_fill_probability_lcb_bps: empirical_fill_probability_lcb_bps(state),
                     fair_value_ticks: fair_value.map(|estimate| estimate.price.0),
                     fair_value_confidence_bps: fair_value.map(|estimate| estimate.confidence_bps),
                     market_regime: fair_value.map(|estimate| estimate.regime.label().to_owned()),
@@ -3374,13 +3378,15 @@ impl SimulationEngine {
                         // gate. Without a side-specific hazard model, the more
                         // liquid side must not subsidise the less observable
                         // queue.
-                        let fill_probability_bps = queue_aware_fill_probability_bps(
+                        let queue_fill_probability_bps = queue_aware_fill_probability_bps(
                             quantity,
                             book.bid_quantity,
                             book.ask_quantity,
                             buy_queue_ahead,
                             sell_queue_ahead,
                         );
+                        let fill_probability_bps =
+                            effective_fill_probability_bps(state, queue_fill_probability_bps);
                         let (buy_pico_adverse_bps, sell_pico_adverse_bps) =
                             side_adverse_selection_pico_bps(book.bid_quantity, book.ask_quantity);
                         let buy_trend_conflict_pico_bps = if strategy_variant
@@ -5749,6 +5755,36 @@ fn queue_aware_fill_probability_bps(
     };
     side_probability(bid_quantity, buy_queue_ahead)
         .min(side_probability(ask_quantity, sell_queue_ahead)) as u16
+}
+
+const MIN_EMPIRICAL_FILL_TRIALS: u64 = 30;
+
+/// Returns a one-sided finite-sample lower confidence bound for the observed
+/// order-level fill rate. A partial fill still counts as a successful order,
+/// so this bound is intentionally optimistic about completion and conservative
+/// only about whether any execution opportunity exists. Before the lifecycle
+/// floor is reached, absence of evidence is reported as `None` rather than
+/// converted into a fabricated zero or perfect probability.
+fn empirical_fill_probability_lcb_bps(state: &SimulationSymbolState) -> Option<u16> {
+    let trials = state.calibration.order_placed_times_ms.len() as u64;
+    if trials < MIN_EMPIRICAL_FILL_TRIALS {
+        return None;
+    }
+    let successes = (state.calibration.fill_times_ms.len() as u64).min(trials);
+    Some(wilson_lower_probability_bps(successes, trials).clamp(0, 10_000) as u16)
+}
+
+/// Fuse model-based queue survival with observed lifecycle evidence. The
+/// minimum is a robust intersection of two different information sources:
+/// neither a favorable book snapshot nor a short run of fills can overrule a
+/// materially worse observed lower bound.
+fn effective_fill_probability_bps(
+    state: &SimulationSymbolState,
+    queue_probability_bps: u16,
+) -> u16 {
+    empirical_fill_probability_lcb_bps(state)
+        .map(|observed| queue_probability_bps.min(observed))
+        .unwrap_or(queue_probability_bps)
 }
 
 fn local_day(timestamp_ms: u64) -> u64 {
