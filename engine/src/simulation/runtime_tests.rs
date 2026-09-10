@@ -782,6 +782,29 @@ fn adverse_markout_upper_bound_is_finite_sample_conservative() {
 }
 
 #[test]
+fn trend_conflict_is_directional_and_shrunk_toward_zero() {
+    let mut engine = engine();
+    let state = engine.states.get_mut("CXMTUSDT").expect("test symbol");
+    assert_eq!(trend_conflict_pico_bps(state, Side::Buy), 0);
+
+    for index in 0..64 {
+        state
+            .calibration
+            .observe_market(index + 1, Some(PICO_BPS_SCALE), None, None);
+    }
+    state.ewma_abs_return_pico_bps = 10 * PICO_BPS_SCALE;
+    state.ewma_signed_return_pico_bps = -8 * PICO_BPS_SCALE;
+    let buy_conflict = trend_conflict_pico_bps(state, Side::Buy);
+    assert!(buy_conflict > 0);
+    assert_eq!(trend_conflict_pico_bps(state, Side::Sell), 0);
+    assert!((0..=10_000).contains(&trend_persistence_bps(state)));
+
+    state.ewma_signed_return_pico_bps = 8 * PICO_BPS_SCALE;
+    assert_eq!(trend_conflict_pico_bps(state, Side::Buy), 0);
+    assert!(trend_conflict_pico_bps(state, Side::Sell) > 0);
+}
+
+#[test]
 fn symbol_drawdown_overlay_scales_before_hard_stop() {
     let mut engine = engine()
         .with_portfolio_drawdown_limits_bps(10_000, 500, 800)

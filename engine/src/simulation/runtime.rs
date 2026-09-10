@@ -49,8 +49,7 @@ use crate::{
     strategy::{
         calendar::{calendar_for, EquitySessionCalendar},
         capital::{dynamic_weights, CapitalRiskInput},
-        decide_m9, decide_maker_exit, profile_for, side_adverse_selection_bps,
-        side_adverse_selection_pico_bps,
+        decide_m9, decide_maker_exit, profile_for, side_adverse_selection_pico_bps,
         universe::instrument_for,
         AdaptiveThreshold, AnchorCurrency, AnchorMakerStrategy, CalibrationSnapshot,
         CalibrationState, CalibrationStatus, DataQualityStatus, DualFlattenPlan, ExitBook, ExitConstraints,
@@ -778,6 +777,7 @@ struct SimulationSymbolState {
     ewma_spread_micro_bps: i64,
     ewma_abs_return_pico_bps: i64,
     ewma_spread_pico_bps: i64,
+    ewma_signed_return_pico_bps: i64,
     near_miss_count: u64,
     adaptive_relief_bps: i64,
     adaptive_relief_micro_bps: i64,
@@ -983,6 +983,10 @@ const THRESHOLD_PRIOR_SPREAD_PICO_BPS: i64 = 2 * PICO_BPS_SCALE;
 /// Do not infer a tail probability from a handful of fills. This is a policy
 /// sample floor, not an exchange/trading-rule constant.
 const MIN_MARKOUT_FEEDBACK_SAMPLES: usize = 8;
+/// Pseudo-observations for the zero-trend prior. A short burst of one-sided
+/// prints must not immediately veto a mean-reversion quote.
+const TREND_PRIOR_OBSERVATIONS: i128 = 32;
+const TREND_CONFLICT_CAP_PICO_BPS: i64 = 75 * PICO_BPS_SCALE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SimulationRiskState {
@@ -1078,6 +1082,15 @@ pub struct SymbolMetrics {
     pub ewma_spread_micro_bps: i64,
     pub ewma_abs_return_pico_bps: i64,
     pub ewma_spread_pico_bps: i64,
+    /// Signed EWMA return used to distinguish mean-reversion from a moving
+    /// dislocation. Positive values indicate upward pressure.
+    pub ewma_signed_return_pico_bps: i64,
+    /// Directional persistence after shrinkage toward a zero-trend prior.
+    pub trend_persistence_bps: i64,
+    pub buy_trend_conflict_pico_bps: i64,
+    pub sell_trend_conflict_pico_bps: i64,
+    pub buy_market_trend_conflict_pico_bps: i64,
+    pub sell_market_trend_conflict_pico_bps: i64,
     pub ewma_adverse_markout_bps: i64,
     pub ewma_adverse_markout_micro_bps: i64,
     pub ewma_adverse_markout_pico_bps: i64,
@@ -1270,6 +1283,7 @@ impl SimulationEngine {
                         ewma_spread_micro_bps: 0,
                         ewma_abs_return_pico_bps: 0,
                         ewma_spread_pico_bps: 0,
+                        ewma_signed_return_pico_bps: 0,
                         ewma_adverse_markout_micro_bps: 0,
                         ewma_adverse_markout_pico_bps: 0,
                         evaluated_markouts: 0,
@@ -1540,6 +1554,44 @@ impl SimulationEngine {
             })
             .fold(0_i128, |total, value| total.saturating_add(value))
             .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+    }
+
+    /// Robust market-region factor: the lower median of peer signed EWMAs is
+    /// used instead of a mean so one damaged symbol cannot contaminate the
+    /// whole group. It is only active with at least two observed peers.
+    fn market_trend_conflict_pico_bps(&self, symbol: &str, side: Side) -> i64 {
+        let Some(region) = profile_for(symbol).map(|profile| profile.region) else {
+            return 0;
+        };
+        let mut signed = Vec::new();
+        let mut volatility = Vec::new();
+        let mut observations = usize::MAX;
+        for (peer_symbol, state) in &self.states {
+            if profile_for(peer_symbol).map(|profile| profile.region) != Some(region) {
+                continue;
+            }
+            if state.calibration.return_abs_pico_bps.is_empty()
+                || state.ewma_abs_return_pico_bps <= 0
+            {
+                continue;
+            }
+            signed.push(state.ewma_signed_return_pico_bps);
+            volatility.push(state.ewma_abs_return_pico_bps);
+            observations = observations.min(state.calibration.return_abs_pico_bps.len());
+        }
+        if signed.len() < 2 || observations == 0 || observations == usize::MAX {
+            return 0;
+        }
+        signed.sort_unstable();
+        volatility.sort_unstable();
+        let group_signed = signed[(signed.len() - 1) / 2];
+        let group_volatility = volatility[(volatility.len() - 1) / 2];
+        directional_trend_conflict_pico_bps(
+            group_signed,
+            group_volatility,
+            observations,
+            side,
+        )
     }
 
     pub fn with_strategy_variant(mut self, variant: SimulationPolicyVariant) -> Self {
@@ -2450,6 +2502,14 @@ impl SimulationEngine {
                     ewma_spread_micro_bps: state.ewma_spread_micro_bps,
                     ewma_abs_return_pico_bps: state.ewma_abs_return_pico_bps,
                     ewma_spread_pico_bps: state.ewma_spread_pico_bps,
+                    ewma_signed_return_pico_bps: state.ewma_signed_return_pico_bps,
+                    trend_persistence_bps: trend_persistence_bps(state),
+                    buy_trend_conflict_pico_bps: trend_conflict_pico_bps(state, Side::Buy),
+                    sell_trend_conflict_pico_bps: trend_conflict_pico_bps(state, Side::Sell),
+                    buy_market_trend_conflict_pico_bps: self
+                        .market_trend_conflict_pico_bps(symbol, Side::Buy),
+                    sell_market_trend_conflict_pico_bps: self
+                        .market_trend_conflict_pico_bps(symbol, Side::Sell),
                     ewma_adverse_markout_bps: pico_bps_to_bps(state.ewma_adverse_markout_pico_bps),
                     ewma_adverse_markout_micro_bps: pico_bps_to_micro(
                         state.ewma_adverse_markout_pico_bps,
@@ -2716,8 +2776,16 @@ impl SimulationEngine {
                     let change_pico_bps =
                         (change.abs() * 10_000 * i128::from(PICO_BPS_SCALE) / i128::from(previous))
                             .clamp(0, i128::from(i64::MAX)) as i64;
+                    let signed_change_pico_bps =
+                        (change * 10_000 * i128::from(PICO_BPS_SCALE) / i128::from(previous))
+                            .clamp(i128::from(i64::MIN), i128::from(i64::MAX))
+                            as i64;
                     state.ewma_abs_return_pico_bps =
                         ewma_scaled(state.ewma_abs_return_pico_bps, change_pico_bps);
+                    state.ewma_signed_return_pico_bps = ewma_signed_scaled(
+                        state.ewma_signed_return_pico_bps,
+                        signed_change_pico_bps,
+                    );
                     state.ewma_abs_return_micro_bps =
                         pico_bps_to_micro(state.ewma_abs_return_pico_bps);
                     state.ewma_abs_return_bps = pico_bps_to_bps(state.ewma_abs_return_pico_bps);
@@ -3049,6 +3117,20 @@ impl SimulationEngine {
         let requested_quantity = self.symbol_risk_scaled_quantity(symbol, requested_quantity);
         let portfolio_inventory_imbalance_bps = self.portfolio_inventory_imbalance_bps();
         let strategy_variant = self.strategy_variant;
+        let market_buy_trend_conflict_pico_bps = if strategy_variant
+            == SimulationPolicyVariant::M0Fixed
+        {
+            0
+        } else {
+            self.market_trend_conflict_pico_bps(symbol, Side::Buy)
+        };
+        let market_sell_trend_conflict_pico_bps = if strategy_variant
+            == SimulationPolicyVariant::M0Fixed
+        {
+            0
+        } else {
+            self.market_trend_conflict_pico_bps(symbol, Side::Sell)
+        };
         let portfolio_drawdown_action = self.observe_portfolio_drawdown();
         self.update_adaptive_threshold_controller(
             symbol,
@@ -3271,10 +3353,36 @@ impl SimulationEngine {
                             buy_queue_ahead,
                             sell_queue_ahead,
                         );
-                        let (buy_micro_adverse_bps, sell_micro_adverse_bps) =
-                            side_adverse_selection_bps(book.bid_quantity, book.ask_quantity);
                         let (buy_pico_adverse_bps, sell_pico_adverse_bps) =
                             side_adverse_selection_pico_bps(book.bid_quantity, book.ask_quantity);
+                        let buy_trend_conflict_pico_bps = if strategy_variant
+                            == SimulationPolicyVariant::M0Fixed
+                        {
+                            0
+                        } else {
+                            trend_conflict_pico_bps(state, Side::Buy)
+                                .max(market_buy_trend_conflict_pico_bps)
+                        };
+                        let sell_trend_conflict_pico_bps = if strategy_variant
+                            == SimulationPolicyVariant::M0Fixed
+                        {
+                            0
+                        } else {
+                            trend_conflict_pico_bps(state, Side::Sell)
+                                .max(market_sell_trend_conflict_pico_bps)
+                        };
+                        let buy_adverse_pico_bps = (if strategy_variant.uses_microstructure() {
+                            buy_pico_adverse_bps
+                        } else {
+                            0
+                        })
+                        .saturating_add(buy_trend_conflict_pico_bps);
+                        let sell_adverse_pico_bps = (if strategy_variant.uses_microstructure() {
+                            sell_pico_adverse_bps
+                        } else {
+                            0
+                        })
+                        .saturating_add(sell_trend_conflict_pico_bps);
                         let fair_value = fair_value_for_state(state);
                         let signal_reference = fair_value
                             .map(|estimate| estimate.price.0)
@@ -3306,30 +3414,10 @@ impl SimulationEngine {
                                 .operational
                                 .default_inventory_skew_bps
                                 * PICO_BPS_SCALE,
-                            buy_adverse_selection_bps: if strategy_variant.uses_microstructure() {
-                                buy_micro_adverse_bps
-                            } else {
-                                0
-                            },
-                            sell_adverse_selection_bps: if strategy_variant.uses_microstructure() {
-                                sell_micro_adverse_bps
-                            } else {
-                                0
-                            },
-                            buy_adverse_selection_pico_bps: if strategy_variant
-                                .uses_microstructure()
-                            {
-                                buy_pico_adverse_bps
-                            } else {
-                                0
-                            },
-                            sell_adverse_selection_pico_bps: if strategy_variant
-                                .uses_microstructure()
-                            {
-                                sell_pico_adverse_bps
-                            } else {
-                                0
-                            },
+                            buy_adverse_selection_bps: pico_bps_to_bps(buy_adverse_pico_bps),
+                            sell_adverse_selection_bps: pico_bps_to_bps(sell_adverse_pico_bps),
+                            buy_adverse_selection_pico_bps: buy_adverse_pico_bps,
+                            sell_adverse_selection_pico_bps: sell_adverse_pico_bps,
                             fill_probability_bps,
                             confidence_bps: 10_000_i64
                                 .saturating_sub(fair_value_confidence_bps.saturating_mul(50))
@@ -5049,6 +5137,76 @@ fn ewma_scaled(previous: i64, sample: i64) -> i64 {
             / i128::from(1_000_000_i64))
         .clamp(0, i128::from(i64::MAX)) as i64
     }
+}
+
+fn ewma_signed_scaled(previous: i64, sample: i64) -> i64 {
+    if previous == 0 {
+        sample
+    } else {
+        ((i128::from(previous) * i128::from(EWMA_PREVIOUS_WEIGHT_PPM)
+            + i128::from(sample) * i128::from(EWMA_SAMPLE_WEIGHT_PPM))
+            / i128::from(1_000_000_i64))
+            .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+    }
+}
+
+/// Shrunk directional persistence in basis points. The ratio is analogous to
+/// a bounded signal-to-noise measure: signed drift divided by absolute move,
+/// then shrunk toward zero until enough causal observations accumulate.
+fn trend_persistence_bps(state: &SimulationSymbolState) -> i64 {
+    let signed = i128::from(state.ewma_signed_return_pico_bps.unsigned_abs());
+    let volatility = i128::from(state.ewma_abs_return_pico_bps.max(0));
+    let observations = state.calibration.return_abs_pico_bps.len() as i128;
+    if signed == 0 || volatility <= 0 || observations <= 0 {
+        return 0;
+    }
+    let raw_bps = (signed * 10_000 / volatility).clamp(0, 10_000);
+    (raw_bps * observations / (observations + TREND_PRIOR_OBSERVATIONS))
+        .clamp(0, 10_000) as i64
+}
+
+/// Directional penalty for a quote that fights the locally persistent move.
+/// The quadratic ratio `signed^2 / absolute` suppresses noisy sign flips while
+/// retaining a strong penalty for a coherent trend. A zero-trend prior avoids
+/// overreacting to the first few ticks; the cap keeps this a risk surcharge,
+/// never an arithmetic substitute for the hard market-data gates.
+fn trend_conflict_pico_bps(state: &SimulationSymbolState, side: Side) -> i64 {
+    directional_trend_conflict_pico_bps(
+        state.ewma_signed_return_pico_bps,
+        state.ewma_abs_return_pico_bps,
+        state.calibration.return_abs_pico_bps.len(),
+        side,
+    )
+}
+
+fn directional_trend_conflict_pico_bps(
+    signed_return_pico_bps: i64,
+    absolute_return_pico_bps: i64,
+    observations: usize,
+    side: Side,
+) -> i64 {
+    let signed = i128::from(signed_return_pico_bps);
+    let conflicts = match side {
+        Side::Buy => signed < 0,
+        Side::Sell => signed > 0,
+    };
+    let signed_abs = signed.abs();
+    let volatility = i128::from(absolute_return_pico_bps.max(0));
+    let observations = observations as i128;
+    if !conflicts || signed_abs <= 0 || volatility <= 0 || observations <= 0 {
+        return 0;
+    }
+    let quadratic_signal = signed_abs
+        .saturating_mul(signed_abs)
+        .checked_div(volatility)
+        .unwrap_or(i128::MAX);
+    let shrunk = quadratic_signal
+        .saturating_mul(observations)
+        .checked_div(observations + TREND_PRIOR_OBSERVATIONS)
+        .unwrap_or(i128::MAX);
+    shrunk
+        .saturating_mul(2)
+        .clamp(0, i128::from(TREND_CONFLICT_CAP_PICO_BPS)) as i64
 }
 
 fn ewma_micro(previous: i64, sample: i64) -> i64 {
