@@ -821,6 +821,17 @@ fn unknown_maker_fill_calibration_is_not_treated_as_perfect() {
 }
 
 #[test]
+fn fill_probability_sizing_is_monotone_and_keeps_a_conservative_probe() {
+    let quantity = 10_000;
+    let low = fill_probability_scaled_quantity(500, quantity);
+    let high = fill_probability_scaled_quantity(9_500, quantity);
+    assert!(low >= quantity / 4);
+    assert!(low < high);
+    assert!(high < quantity);
+    assert_eq!(fill_probability_scaled_quantity(10_000, quantity), quantity);
+}
+
+#[test]
 fn reversion_evidence_uses_lower_bound_and_never_inflates_early_size() {
     let mut engine = engine();
     let state = engine.states.get_mut("CXMTUSDT").expect("test symbol");

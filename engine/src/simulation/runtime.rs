@@ -3471,6 +3471,10 @@ impl SimulationEngine {
                                         );
                                     }
                                 }
+                                intent.quantity = fill_probability_scaled_quantity(
+                                    fill_probability_bps,
+                                    intent.quantity,
+                                );
                                 let trend_conflict = match intent.side {
                                     Side::Buy => trend_conflict_pico_bps(state, Side::Buy)
                                         .max(market_buy_trend_conflict_pico_bps),
@@ -5608,6 +5612,22 @@ fn trend_conflict_scaled_quantity(conflict_pico_bps: i64, quantity: i64) -> i64 
     let cap = i128::from(TREND_CONFLICT_CAP_PICO_BPS.max(1));
     let scale_bps = 10_000_i128 - 5_000_i128 * conflict / cap;
     (i128::from(quantity) * scale_bps / 10_000_i128)
+        .clamp(1, i128::from(quantity)) as i64
+}
+
+/// Convert the queue-survival estimate into a continuous execution-size
+/// budget. This is deliberately a size control rather than a new admission
+/// gate: low but non-zero fill probability keeps a small probe alive, while
+/// high probability recovers the full signal quantity. The affine map is
+/// monotone and uses the same conservative 25% floor as the evidence model.
+fn fill_probability_scaled_quantity(fill_probability_bps: u16, quantity: i64) -> i64 {
+    if quantity <= 0 {
+        return quantity.max(0);
+    }
+    let probability = i128::from(fill_probability_bps.min(10_000));
+    let scale_ppm = i128::from(MIN_EVIDENCE_SCALE_PPM)
+        + (1_000_000_i128 - i128::from(MIN_EVIDENCE_SCALE_PPM)) * probability / 10_000;
+    (i128::from(quantity) * scale_ppm / 1_000_000_i128)
         .clamp(1, i128::from(quantity)) as i64
 }
 
