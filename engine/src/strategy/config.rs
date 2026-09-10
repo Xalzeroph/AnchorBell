@@ -7,6 +7,10 @@ use std::{collections::BTreeSet, fs, path::Path};
 
 pub const STRATEGY_PROFILE_SCHEMA_VERSION: u16 = 1;
 
+fn default_market_event_queue_capacity() -> usize {
+    1_048_576
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FeeScheduleConfig {
     pub maker_fee_ppm: i64,
@@ -72,6 +76,8 @@ pub struct StrategyProfile {
     pub quantity_scale: u32,
     pub price_scale: u32,
     pub max_subscriptions_per_shard: usize,
+    #[serde(default = "default_market_event_queue_capacity")]
+    pub market_event_queue_capacity: usize,
     pub connect_timeout_ms: u64,
     pub read_timeout_ms: u64,
     pub metrics_refresh_ms: u64,
@@ -147,6 +153,7 @@ impl StrategyProfile {
             || self.quantity_scale > 18
             || self.price_scale > 18
             || self.max_subscriptions_per_shard == 0
+            || self.market_event_queue_capacity == 0
             || self.experiments.is_empty()
             || self.checkpoint_interval_ms == 0
             || self.max_stale_ms == 0
@@ -257,6 +264,7 @@ mod tests {
             quantity_scale: 1,
             price_scale: 1,
             max_subscriptions_per_shard: 1,
+            market_event_queue_capacity: 1_048_576,
             connect_timeout_ms: 1,
             read_timeout_ms: 1,
             metrics_refresh_ms: 1,

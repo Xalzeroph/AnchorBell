@@ -49,7 +49,6 @@ const RUN_STATUS_SCHEMA_VERSION: u16 = 1;
 const EXPERIMENT_INDEX_SCHEMA_VERSION: u16 = 1;
 const DISPLAY_HISTORY_CAPACITY: usize = 900;
 const RISK_HISTORY_CAPACITY: usize = 7_201;
-const MARKET_EVENT_CHANNEL_CAPACITY: usize = 65_536;
 
 #[derive(Debug, Clone)]
 pub struct SimulationBatchSpec {
@@ -94,6 +93,10 @@ pub struct SimulationBatchConfig {
     pub output_root: PathBuf,
     pub specs: Vec<SimulationBatchSpec>,
     pub max_subscriptions_per_shard: usize,
+    /// Bounded market ingress capacity. A full queue invalidates the run;
+    /// sizing it from the profile prevents transient Binance reconnect bursts
+    /// from being mistaken for a valid zero-trade result.
+    pub market_event_queue_capacity: usize,
     pub connect_timeout_ms: u64,
     pub read_timeout_ms: u64,
     pub metrics_refresh_ms: u64,
@@ -461,6 +464,7 @@ fn validate(config: &SimulationBatchConfig) -> Result<(), SimulationError> {
         || config.market_id.trim().is_empty()
         || config.funding_lead_ms == 0
         || config.max_subscriptions_per_shard == 0
+        || config.market_event_queue_capacity == 0
     {
         return Err(SimulationError::InvalidConfig(
             "batch execution requires symbols, specs, and shard capacity",
@@ -829,7 +833,7 @@ pub async fn run(
 
     let mut shard_tasks = tokio::task::JoinSet::new();
     let (event_tx, mut event_rx) =
-        mpsc::channel::<BinanceMarketEvent>(MARKET_EVENT_CHANNEL_CAPACITY);
+        mpsc::channel::<BinanceMarketEvent>(config.market_event_queue_capacity);
     let event_dropped = Arc::new(AtomicU64::new(0));
     let endpoints = config.environment.endpoints();
 
@@ -1596,7 +1600,7 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::{calibration_key, MARKET_EVENT_CHANNEL_CAPACITY};
+    use super::calibration_key;
     use tokio::sync::mpsc;
 
     #[tokio::test]
@@ -1607,7 +1611,6 @@ mod tests {
             sender.try_send(2),
             Err(mpsc::error::TrySendError::Full(2))
         ));
-        assert_eq!(MARKET_EVENT_CHANNEL_CAPACITY, 65_536);
     }
 
     #[test]

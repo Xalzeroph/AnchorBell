@@ -26,6 +26,7 @@
   "quantity_scale": 8,
   "price_scale": 8,
   "max_subscriptions_per_shard": 64,
+  "market_event_queue_capacity": 1048576,
   "connect_timeout_ms": 5000,
   "read_timeout_ms": 15000,
   "metrics_refresh_ms": 1000,

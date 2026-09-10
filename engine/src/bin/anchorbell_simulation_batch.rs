@@ -429,6 +429,7 @@ fn main() {
             output_root,
             specs,
             max_subscriptions_per_shard: profile.max_subscriptions_per_shard,
+            market_event_queue_capacity: profile.market_event_queue_capacity,
             connect_timeout_ms: profile.connect_timeout_ms,
             read_timeout_ms: profile.read_timeout_ms,
             metrics_refresh_ms: profile.metrics_refresh_ms,
