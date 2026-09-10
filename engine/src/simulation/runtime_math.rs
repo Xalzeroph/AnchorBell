@@ -635,9 +635,7 @@ pub(super) fn m5_tail_stress_pico(state: &SimulationSymbolState) -> i64 {
     // blocks every entry before the edge can be tested. Anchor validity and the
     // adaptive threshold already protect against stale/uncertain references;
     // M5 must measure only live-market stress and execution uncertainty.
-    volatility
-        .max(mark_index)
-        .max(spread)
+    volatility.max(mark_index).max(spread)
 }
 
 pub(super) fn m5_tail_stress_bps(state: &SimulationSymbolState) -> i64 {
