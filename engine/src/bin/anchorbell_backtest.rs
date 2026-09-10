@@ -468,6 +468,7 @@ fn parse_strategy_variant(value: &str) -> Result<SimulationPolicyVariant, String
     match value.trim().to_ascii_lowercase().as_str() {
         "m0" | "m0_fixed" | "fixed" => Ok(SimulationPolicyVariant::M0Fixed),
         "m1" | "m1_adaptive_risk" | "adaptive" => Ok(SimulationPolicyVariant::M1AdaptiveRisk),
+        "core" | "core_v1" | "production_core" => Ok(SimulationPolicyVariant::CoreV1),
         "m2" | "m2_microstructure" | "microstructure" => {
             Ok(SimulationPolicyVariant::M2Microstructure)
         }

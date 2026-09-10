@@ -47,6 +47,29 @@ macro_rules! register_method {
 }
 
 register_method!(
+    "CORE",
+    "core_v1",
+    "core_v1",
+    MethodLayer::Risk,
+    None,
+    SimulationPolicyVariant::CoreV1,
+    &[
+        "permanent_core",
+        "binance_safety",
+        "tail_risk_guard",
+        "evidence_circuit_breaker"
+    ],
+    &[
+        "adaptive_risk",
+        "exchange_filters",
+        "market_data_integrity",
+        "emergency_reduce_only"
+    ],
+    &[],
+    &[],
+    "simulation::runtime::core_v1"
+);
+register_method!(
     "M0",
     "m0",
     "m0_fixed",
@@ -220,7 +243,7 @@ pub fn resolve(key: &str, ablations: &[String]) -> Result<SimulationPolicyVarian
             .iter()
             .any(|ablation| ablation.eq_ignore_ascii_case("funding"))
     {
-        return Ok(SimulationPolicyVariant::M7EvidenceGated);
+        return Ok(SimulationPolicyVariant::M8FundingDisabled);
     }
 
     Ok(descriptor.variant)
@@ -233,15 +256,15 @@ mod tests {
     #[test]
     fn catalog_is_unique_and_resolves_aliases() {
         let values = all();
-        assert_eq!(values.len(), 10);
-        assert_eq!(values[0].id, "M0");
+        assert_eq!(values.len(), 11);
+        assert!(values.iter().any(|value| value.key == "core_v1"));
         assert_eq!(
             resolve("M9", &[]).unwrap(),
             SimulationPolicyVariant::M9DeadlineCausalDroMpc
         );
         assert_eq!(
             resolve("m8_funding_aware", &["funding".to_owned()]).unwrap(),
-            SimulationPolicyVariant::M7EvidenceGated
+            SimulationPolicyVariant::M8FundingDisabled
         );
     }
 

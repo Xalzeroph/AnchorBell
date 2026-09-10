@@ -7,6 +7,18 @@ use std::{collections::BTreeSet, fs, path::Path};
 
 pub const STRATEGY_PROFILE_SCHEMA_VERSION: u16 = 1;
 
+fn default_market_event_queue_capacity() -> usize {
+    1_048_576
+}
+
+fn default_portfolio_drawdown_soft_bps() -> i64 {
+    0
+}
+
+fn default_portfolio_drawdown_hard_bps() -> i64 {
+    0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FeeScheduleConfig {
     pub maker_fee_ppm: i64,
@@ -33,6 +45,16 @@ impl FeeScheduleConfig {
         }
         Ok(())
     }
+
+    pub fn validate_at(&self, now_ms: u64) -> Result<(), &'static str> {
+        self.validate()?;
+        if self.effective_from_ms > now_ms
+            || self.effective_until_ms.is_some_and(|until| now_ms >= until)
+        {
+            return Err("fee schedule is not effective at the current timestamp");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -40,6 +62,7 @@ pub struct StrategyProfile {
     pub schema_version: u16,
     pub policy_id: String,
     pub default_strategy_variant: String,
+    pub market_id: String,
     pub experiment_plan_id: String,
     pub universe_id: String,
     pub asset_class: AssetClass,
@@ -54,6 +77,10 @@ pub struct StrategyProfile {
     pub max_position: i64,
     pub requested_quantity: i64,
     pub max_mark_index_gap_bps: i64,
+    #[serde(default = "default_portfolio_drawdown_soft_bps")]
+    pub portfolio_drawdown_soft_bps: i64,
+    #[serde(default = "default_portfolio_drawdown_hard_bps")]
+    pub portfolio_drawdown_hard_bps: i64,
     pub max_anchor_age_ms: u64,
     pub funding_lead_ms: u64,
     pub fee_ppm: i64,
@@ -61,6 +88,8 @@ pub struct StrategyProfile {
     pub quantity_scale: u32,
     pub price_scale: u32,
     pub max_subscriptions_per_shard: usize,
+    #[serde(default = "default_market_event_queue_capacity")]
+    pub market_event_queue_capacity: usize,
     pub connect_timeout_ms: u64,
     pub read_timeout_ms: u64,
     pub metrics_refresh_ms: u64,
@@ -105,9 +134,20 @@ impl StrategyProfile {
                 self.schema_version
             ));
         }
+        if self
+            .default_strategy_variant
+            .eq_ignore_ascii_case("core_v1")
+            && self.threshold_scale_ppm < 1_000_000
+        {
+            return Err(
+                "CORE_V1 threshold_scale_ppm cannot be below 1000000; evidence gates may not be relaxed"
+                    .into(),
+            );
+        }
         if self.policy_id.trim().is_empty()
             || self.experiment_plan_id.trim().is_empty()
             || self.default_strategy_variant.trim().is_empty()
+            || self.market_id.trim().is_empty()
             || self.universe_id.trim().is_empty()
             || self.asset_class == AssetClass::Unknown
             || self.symbols.is_empty()
@@ -128,13 +168,21 @@ impl StrategyProfile {
         }
         if self.entry_threshold_bps < 0
             || self.threshold_scale_ppm <= 0
+            || self.threshold_scale_ppm > 1_000_000
             || self.max_position <= 0
             || self.requested_quantity <= 0
             || self.max_mark_index_gap_bps < 0
+            || self.portfolio_drawdown_soft_bps < 0
+            || self.portfolio_drawdown_hard_bps < 0
+            || (self.portfolio_drawdown_soft_bps == 0 && self.portfolio_drawdown_hard_bps != 0)
+            || (self.portfolio_drawdown_soft_bps != 0
+                && self.portfolio_drawdown_hard_bps <= self.portfolio_drawdown_soft_bps)
+            || self.portfolio_drawdown_hard_bps > 10_000
             || self.fee_ppm < 0
             || self.quantity_scale > 18
             || self.price_scale > 18
             || self.max_subscriptions_per_shard == 0
+            || self.market_event_queue_capacity == 0
             || self.experiments.is_empty()
             || self.checkpoint_interval_ms == 0
             || self.max_stale_ms == 0
@@ -205,7 +253,7 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../config/anchorbell-simulation.json");
         let profile = StrategyProfile::load(path).unwrap();
         let plan = profile.experiment_plan().unwrap();
-        assert_eq!(plan.experiments.len(), 11);
+        assert_eq!(plan.experiments.len(), 1);
         assert!(plan.runtime_specs_with_ablations().is_ok());
     }
 
@@ -215,6 +263,7 @@ mod tests {
             schema_version: STRATEGY_PROFILE_SCHEMA_VERSION,
             policy_id: "test".into(),
             default_strategy_variant: "m4".into(),
+            market_id: "binance_usdm_tradfi_perpetual".into(),
             experiment_plan_id: "test".into(),
             universe_id: "test".into(),
             asset_class: AssetClass::OrdinaryEquity,
@@ -229,6 +278,8 @@ mod tests {
             max_position: 1,
             requested_quantity: 1,
             max_mark_index_gap_bps: 1,
+            portfolio_drawdown_soft_bps: 0,
+            portfolio_drawdown_hard_bps: 0,
             max_anchor_age_ms: 1,
             funding_lead_ms: 1,
             fee_ppm: 1,
@@ -244,6 +295,7 @@ mod tests {
             quantity_scale: 1,
             price_scale: 1,
             max_subscriptions_per_shard: 1,
+            market_event_queue_capacity: 1_048_576,
             connect_timeout_ms: 1,
             read_timeout_ms: 1,
             metrics_refresh_ms: 1,
@@ -277,6 +329,15 @@ mod tests {
                 evidence_policy: "oos_required".into(),
             }],
         };
+        assert!(profile.validate().is_err());
+    }
+
+    #[test]
+    fn core_profile_cannot_relax_evidence_hurdle() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../config/anchorbell-simulation.json");
+        let mut profile = StrategyProfile::load(path).unwrap();
+        profile.threshold_scale_ppm = 999_999;
         assert!(profile.validate().is_err());
     }
 }

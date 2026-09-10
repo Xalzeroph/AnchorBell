@@ -44,6 +44,8 @@ fn engine() -> SimulationEngine {
     )
     .unwrap()
     .with_strategy_variant(SimulationPolicyVariant::M0Fixed)
+    .with_funding_intervals([("CXMTUSDT".to_owned(), 8)].into_iter().collect())
+    .with_funding_lead_ms(5 * 60 * 1_000)
 }
 
 fn feed(engine: &mut SimulationEngine, raw: &[u8]) -> Vec<SimulationRecord> {
@@ -687,6 +689,317 @@ fn liquidity_controls_are_continuous_and_monotonic() {
 }
 
 #[test]
+fn queue_aware_fill_proxy_penalizes_visible_queue_and_bounds_probability() {
+    let clear = queue_aware_fill_probability_bps(10, 100, 100, 0, 0);
+    let queued = queue_aware_fill_probability_bps(10, 100, 100, 1_000, 1_000);
+    assert!(clear > queued);
+    assert!((500..=9_500).contains(&queued));
+    assert_eq!(queue_aware_fill_probability_bps(0, 100, 100, 0, 0), 0);
+}
+
+#[test]
+fn tail_quantity_scaling_is_continuous_monotone_and_bounded() {
+    let requested = 10_000;
+    assert_eq!(m5_scaled_quantity(0, requested), requested);
+    assert_eq!(
+        m5_scaled_quantity(M5_TAIL_CAUTION_BPS, requested),
+        requested
+    );
+    assert!(m5_scaled_quantity(36, requested) < requested);
+    assert!(m5_scaled_quantity(36, requested) > m5_scaled_quantity(59, requested));
+    assert_eq!(
+        m5_scaled_quantity(M5_TAIL_REDUCE_ONLY_BPS, requested),
+        2_500
+    );
+    assert_eq!(m5_scaled_quantity(M5_TAIL_HALT_BPS, requested), 0);
+    for stress in M5_TAIL_CAUTION_BPS..=M5_TAIL_HALT_BPS {
+        let quantity = m5_scaled_quantity(stress, requested);
+        assert!((0..=requested).contains(&quantity));
+        if stress < M5_TAIL_HALT_BPS {
+            assert!(quantity > 0);
+        }
+    }
+}
+
+#[test]
+fn m5_tail_guard_does_not_double_count_closed_session_anchor_edge() {
+    let mut engine = engine().with_strategy_variant(SimulationPolicyVariant::CoreV1);
+    feed(
+        &mut engine,
+        br#"{"e":"markPriceUpdate","E":1,"s":"CXMTUSDT","p":"120","i":"120","T":1,"r":"0"}"#,
+    );
+    feed(
+        &mut engine,
+        br#"{"e":"bookTicker","u":1,"E":2,"T":2,"s":"CXMTUSDT","b":"120","B":"100","a":"120","A":"100"}"#,
+    );
+
+    let state = engine.states.get("CXMTUSDT").expect("symbol state");
+    assert_eq!(m5_tail_stress_bps(state), 0);
+    assert!(!m5_tail_reduce_only(state));
+}
+
+#[test]
+fn fractional_edge_sizing_is_conservative_and_monotone() {
+    let hurdle = 100 * PICO_BPS_SCALE;
+    let quantity = 10_000;
+    assert_eq!(
+        fractional_edge_quantity(hurdle, hurdle, quantity),
+        quantity / 4
+    );
+    let marginal = fractional_edge_quantity(101 * PICO_BPS_SCALE, hurdle, quantity);
+    let strong = fractional_edge_quantity(400 * PICO_BPS_SCALE, hurdle, quantity);
+    assert!(marginal < strong);
+    assert!(strong < quantity);
+    assert!(marginal >= quantity / 4);
+    assert_eq!(
+        fractional_edge_quantity(10 * PICO_BPS_SCALE, hurdle, quantity),
+        0
+    );
+}
+
+#[test]
+fn cross_symbol_concentration_penalty_is_smooth_and_preserves_reductions() {
+    let flat = cross_symbol_concentration_scaled_quantity(0, 0, Side::Buy, 10_000);
+    let concentrated = cross_symbol_concentration_scaled_quantity(10_000, 0, Side::Buy, 10_000);
+    let more_concentrated =
+        cross_symbol_concentration_scaled_quantity(30_000, 0, Side::Buy, 10_000);
+    assert_eq!(flat, 10_000);
+    assert!(concentrated < flat);
+    assert!(more_concentrated < concentrated);
+    assert_eq!(
+        cross_symbol_concentration_scaled_quantity(30_000, -10, Side::Buy, 10_000),
+        10_000
+    );
+    assert_eq!(
+        cross_symbol_concentration_scaled_quantity(30_000, 10, Side::Sell, 10_000),
+        10_000
+    );
+}
+
+#[test]
+fn adverse_markout_upper_bound_is_finite_sample_conservative() {
+    let mut engine = engine();
+    let state = engine.states.get_mut("CXMTUSDT").expect("test symbol");
+    assert_eq!(conservative_adverse_markout_pico_bps(state), 0);
+
+    for index in 0..8 {
+        state
+            .calibration
+            .observe_markout(index + 1, if index < 4 { 20 * PICO_BPS_SCALE } else { 0 });
+    }
+    let state = engine.states.get("CXMTUSDT").expect("test symbol");
+    let upper = conservative_adverse_markout_pico_bps(state);
+    assert!(upper > 0);
+    assert!(upper >= state.ewma_adverse_markout_pico_bps);
+    assert!(wilson_upper_probability_bps(4, 8) > 5_000);
+    assert_eq!(wilson_upper_probability_bps(0, 0), 0);
+}
+
+#[test]
+fn trend_conflict_is_directional_and_shrunk_toward_zero() {
+    let mut engine = engine();
+    let state = engine.states.get_mut("CXMTUSDT").expect("test symbol");
+    assert_eq!(trend_conflict_pico_bps(state, Side::Buy), 0);
+
+    for index in 0..64 {
+        state
+            .calibration
+            .observe_market(index + 1, Some(PICO_BPS_SCALE), None, None);
+    }
+    state.ewma_abs_return_pico_bps = 10 * PICO_BPS_SCALE;
+    state.ewma_signed_return_pico_bps = -8 * PICO_BPS_SCALE;
+    let buy_conflict = trend_conflict_pico_bps(state, Side::Buy);
+    assert!(buy_conflict > 0);
+    assert_eq!(trend_conflict_pico_bps(state, Side::Sell), 0);
+    assert!((0..=10_000).contains(&trend_persistence_bps(state)));
+
+    state.ewma_signed_return_pico_bps = 8 * PICO_BPS_SCALE;
+    assert_eq!(trend_conflict_pico_bps(state, Side::Buy), 0);
+    assert!(trend_conflict_pico_bps(state, Side::Sell) > 0);
+}
+
+#[test]
+fn trend_conflict_sizing_is_monotone_and_bounded() {
+    let quantity = 10_000;
+    assert_eq!(trend_conflict_scaled_quantity(0, quantity), quantity);
+    let mild = trend_conflict_scaled_quantity(10 * PICO_BPS_SCALE, quantity);
+    let severe = trend_conflict_scaled_quantity(TREND_CONFLICT_CAP_PICO_BPS, quantity);
+    assert!(mild < quantity);
+    assert!(severe <= mild);
+    assert!(severe >= quantity / 2);
+}
+
+#[test]
+fn residual_regime_state_tracks_drift_persistence_and_expansion() {
+    let mut engine = engine();
+    let state = engine.states.get_mut("CXMTUSDT").expect("test symbol");
+    for index in 0..64 {
+        let residual = (10 + index as i64) * PICO_BPS_SCALE;
+        observe_residual_dynamics(state, index + 1, Some(residual));
+        state.calibration.residual_abs_pico_bps.push_back(residual);
+    }
+    assert!(state.ewma_signed_residual_pico_bps > 0);
+    assert!(state.ewma_signed_residual_drift_pico_bps > 0);
+    assert!(state.ewma_residual_drift_pico_bps > 0);
+    assert!(state.ewma_residual_persistence_ppm > 0);
+    assert!(residual_regime_risk_pico_bps(state, Side::Buy) > 0);
+    assert!(residual_regime_scale_ppm(state) < 1_000_000);
+}
+
+#[test]
+fn residual_curvature_detects_accelerating_dislocation() {
+    let mut engine = engine();
+    let state = engine.states.get_mut("CXMTUSDT").expect("test symbol");
+    let mut residual = 2 * PICO_BPS_SCALE;
+    for index in 0..64 {
+        residual = residual.saturating_add((index as i64 + 1) * PICO_BPS_SCALE);
+        observe_residual_dynamics(state, index + 1, Some(residual));
+        state.calibration.residual_abs_pico_bps.push_back(residual);
+    }
+    assert!(state.ewma_residual_curvature_pico_bps > 0);
+    assert!(residual_regime_risk_pico_bps(state, Side::Buy) > 0);
+}
+
+#[test]
+fn directional_markout_bounds_do_not_mix_sides_after_warmup() {
+    let mut engine = engine();
+    let state = engine.states.get_mut("CXMTUSDT").expect("test symbol");
+    for index in 0..8 {
+        state
+            .calibration
+            .observe_directional_markout(index + 1, Side::Buy, 20 * PICO_BPS_SCALE);
+        state
+            .calibration
+            .observe_directional_markout(index + 100, Side::Sell, PICO_BPS_SCALE);
+    }
+    let buy = conservative_adverse_markout_pico_bps_for_side(state, Side::Buy);
+    let sell = conservative_adverse_markout_pico_bps_for_side(state, Side::Sell);
+    assert!(buy > sell);
+    assert!(sell > 0);
+}
+
+#[test]
+fn residual_regime_sizing_is_monotone_and_never_amplifies() {
+    let quantity = 10_000;
+    assert_eq!(residual_regime_scaled_quantity(0, quantity), quantity);
+    let mild = residual_regime_scaled_quantity(RESIDUAL_REGIME_CAP_PICO_BPS / 4, quantity);
+    let severe = residual_regime_scaled_quantity(RESIDUAL_REGIME_CAP_PICO_BPS, quantity);
+    assert!(mild < quantity);
+    assert!(severe <= mild);
+    assert!(severe >= quantity / 4);
+}
+
+#[test]
+fn unknown_maker_fill_calibration_is_not_treated_as_perfect() {
+    assert_eq!(calibrated_maker_confidence_bps(None), 0);
+}
+
+#[test]
+fn fill_probability_sizing_is_monotone_and_keeps_a_conservative_probe() {
+    let quantity = 10_000;
+    let low = fill_probability_scaled_quantity(500, quantity);
+    let high = fill_probability_scaled_quantity(9_500, quantity);
+    assert!(low >= quantity / 4);
+    assert!(low < high);
+    assert!(high < quantity);
+    assert_eq!(fill_probability_scaled_quantity(10_000, quantity), quantity);
+}
+
+#[test]
+fn directional_queue_probability_does_not_cross_subsidize_sides() {
+    let (buy, sell) = queue_aware_fill_probability_bps_by_side(10, 100, 100, 900, 0);
+    assert!(buy < sell);
+    assert_eq!(
+        queue_aware_fill_probability_bps(10, 100, 100, 900, 0),
+        buy.min(sell)
+    );
+}
+
+#[test]
+fn empirical_fill_lower_bound_only_activates_after_lifecycle_floor() {
+    let mut engine = engine();
+    let state = engine.states.get_mut("CXMTUSDT").expect("test symbol");
+    assert_eq!(empirical_fill_probability_lcb_bps(state), None);
+    for index in 0..MIN_EMPIRICAL_FILL_TRIALS {
+        state.calibration.order_placed_times_ms.push_back(index + 1);
+    }
+    assert_eq!(empirical_fill_probability_lcb_bps(state), Some(0));
+    assert_eq!(effective_fill_probability_bps(state, 9_500), 0);
+}
+
+#[test]
+fn empirical_fill_lower_bound_is_directional() {
+    let mut engine = engine();
+    let state = engine.states.get_mut("CXMTUSDT").expect("test symbol");
+    for index in 0..MIN_EMPIRICAL_FILL_TRIALS {
+        let buy_time = index + 1;
+        state
+            .calibration
+            .observe_order_placed_side(buy_time, Side::Buy);
+        state
+            .calibration
+            .observe_fill_side(buy_time + 1, Side::Buy, 10, 100);
+        let sell_time = index + 100;
+        state
+            .calibration
+            .observe_order_placed_side(sell_time, Side::Sell);
+    }
+    let buy = empirical_fill_probability_lcb_bps_for_side(state, Side::Buy).unwrap();
+    let sell = empirical_fill_probability_lcb_bps_for_side(state, Side::Sell).unwrap();
+    assert!(buy > sell);
+    let effective = effective_fill_probability_bps_by_side(state, (9_500, 9_500));
+    assert_eq!(effective.0, buy);
+    assert_eq!(effective.1, sell);
+}
+
+#[test]
+fn reversion_evidence_uses_lower_bound_and_never_inflates_early_size() {
+    let mut engine = engine();
+    let state = engine.states.get_mut("CXMTUSDT").expect("test symbol");
+    assert_eq!(reversion_evidence_lower_bps(state), 0);
+    assert_eq!(reversion_evidence_scale_ppm(state), MIN_EVIDENCE_SCALE_PPM);
+
+    for index in 0..32 {
+        state
+            .calibration
+            .residual_abs_pico_bps
+            .push_back((index as i64 + 1) * PICO_BPS_SCALE);
+    }
+    state.calibration.reversion_events = 0;
+    let no_evidence_scale = reversion_evidence_scale_ppm(state);
+    assert_eq!(no_evidence_scale, MIN_EVIDENCE_SCALE_PPM);
+
+    state.calibration.reversion_events = 31;
+    let strong_evidence = reversion_evidence_lower_bps(state);
+    assert!(strong_evidence > 0);
+    assert!(reversion_evidence_scale_ppm(state) > no_evidence_scale);
+    assert!(reversion_evidence_scale_ppm(state) <= 1_000_000);
+}
+
+#[test]
+fn symbol_drawdown_overlay_scales_before_hard_stop() {
+    let mut engine = engine()
+        .with_portfolio_drawdown_limits_bps(10_000, 500, 800)
+        .unwrap();
+    engine
+        .states
+        .get_mut("CXMTUSDT")
+        .expect("test symbol")
+        .strategy_pnl_ticks = -600;
+    engine.update_symbol_pnl_peak("CXMTUSDT");
+    assert_eq!(engine.symbol_drawdown_bps("CXMTUSDT"), 600);
+    let scaled = engine.symbol_risk_scaled_quantity("CXMTUSDT", 10_000);
+    assert!((1..10_000).contains(&scaled));
+
+    engine
+        .states
+        .get_mut("CXMTUSDT")
+        .expect("test symbol")
+        .strategy_pnl_ticks = -800;
+    assert_eq!(engine.symbol_risk_scaled_quantity("CXMTUSDT", 10_000), 0);
+}
+
+#[test]
 fn threshold_status_explains_warmup_and_uses_a_conservative_prior() {
     let mut engine = engine().with_strategy_variant(SimulationPolicyVariant::M7EvidenceGated);
     let initial = engine.metrics_snapshot(1, 1).symbols[0].clone();
@@ -713,7 +1026,7 @@ fn threshold_status_explains_warmup_and_uses_a_conservative_prior() {
 }
 
 #[test]
-fn shutdown_requests_reduce_only_flatten_without_faking_a_fill() {
+fn shutdown_uses_bounded_reduce_only_flatten_and_reports_flat() {
     let mut engine = engine();
     feed(
         &mut engine,
@@ -730,12 +1043,12 @@ fn shutdown_requests_reduce_only_flatten_without_faking_a_fill() {
     assert_eq!(engine.summary().current_absolute_position, 3);
     let settlement = engine.shutdown(4, "test shutdown");
     assert!(settlement.flatten_requested);
-    assert_eq!(settlement.summary.current_absolute_position, 3);
-    assert_eq!(settlement.settlement_status, "flatten_orders_working");
+    assert_eq!(settlement.summary.current_absolute_position, 0);
+    assert_eq!(settlement.settlement_status, "flat");
     assert!(settlement
         .records
         .iter()
-        .any(|record| record.kind == "order_placed"));
+        .any(|record| record.kind == "fill"));
 }
 
 #[cfg(test)]
@@ -756,5 +1069,21 @@ mod walkforward_regression_tests {
             Err(SimulationError::CalibrationSeedNotPrior { .. })
         ));
         assert!(validate_calibration_seed_horizon(&seeds, 101).is_ok());
+    }
+
+    #[test]
+    fn core_v1_capabilities_are_explicit_and_funding_ablation_is_isolated() {
+        assert!(SimulationPolicyVariant::CoreV1.uses_tail_guard());
+        assert!(SimulationPolicyVariant::CoreV1.uses_evidence_gate());
+        assert!(!SimulationPolicyVariant::CoreV1.uses_microstructure());
+        assert!(!SimulationPolicyVariant::CoreV1.uses_fill_gate());
+        assert!(!SimulationPolicyVariant::CoreV1.uses_statistical_term());
+        assert!(!SimulationPolicyVariant::CoreV1.uses_dynamic_capital());
+        assert!(!SimulationPolicyVariant::CoreV1.uses_funding_controller());
+
+        assert!(SimulationPolicyVariant::M8FundingAware.uses_funding_controller());
+        assert!(SimulationPolicyVariant::M8FundingDisabled.uses_tail_guard());
+        assert!(SimulationPolicyVariant::M8FundingDisabled.uses_evidence_gate());
+        assert!(!SimulationPolicyVariant::M8FundingDisabled.uses_funding_controller());
     }
 }

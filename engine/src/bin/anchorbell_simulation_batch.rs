@@ -13,8 +13,8 @@ use anchorbell_engine::{
     analytics_evidence::EvidenceConfig,
     execution::{BinanceEnvironment, SessionCheckpoint},
     market::{
-        AssetClass, BinanceScaledExecutionFilters, InstrumentRegistryConfig,
-        PublicMarketMetadataClient,
+        AssetClass, BinanceFundingInfo, BinanceFundingRateSnapshot, BinanceScaledExecutionFilters,
+        InstrumentRegistryConfig, PublicMarketMetadataClient,
     },
     platform::RuntimeProfile,
     runtime::{
@@ -80,7 +80,7 @@ async fn load_execution_filters(
     price_scale: u32,
     quantity_scale: u32,
 ) -> Result<BTreeMap<String, BinanceScaledExecutionFilters>, String> {
-    let client = PublicMarketMetadataClient::new(environment.endpoints().rest_base, None)
+    let client = PublicMarketMetadataClient::new(environment.endpoints().rest_base.as_str(), None)
         .map_err(|error| format!("metadata client construction failed: {error}"))?;
     let metadata = client
         .exchange_info()
@@ -114,10 +114,19 @@ async fn load_execution_filters(
 async fn load_funding_intervals(
     environment: BinanceEnvironment,
     symbols: &[String],
-) -> Result<BTreeMap<String, u32>, String> {
-    let client = PublicMarketMetadataClient::new(environment.endpoints().rest_base, None)
+) -> Result<
+    (
+        BTreeMap<String, u32>,
+        BTreeMap<String, BinanceFundingInfo>,
+        BTreeMap<String, usize>,
+    ),
+    String,
+> {
+    let client = PublicMarketMetadataClient::new(environment.endpoints().rest_base.as_str(), None)
         .map_err(|error| format!("funding metadata client construction failed: {error}"))?;
     let mut result = BTreeMap::new();
+    let mut metadata = BTreeMap::new();
+    let mut history_counts = BTreeMap::new();
     for symbol in symbols {
         let normalized = symbol.trim().to_ascii_uppercase();
         let rows = client
@@ -133,9 +142,41 @@ async fn load_funding_intervals(
                 "fundingInfo returned zero interval for {normalized}"
             ));
         }
-        result.insert(normalized, row.funding_interval_hours);
+        row.validate()
+            .map_err(|error| format!("invalid fundingInfo for {normalized}: {error}"))?;
+        let history = client
+            .funding_rate_history(&normalized, 100)
+            .await
+            .map_err(|error| {
+                format!("fundingRate history unavailable for {normalized}: {error}")
+            })?;
+        validate_funding_history(&normalized, &row, &history)?;
+        history_counts.insert(normalized.clone(), history.len());
+        let funding_interval_hours = row.funding_interval_hours;
+        metadata.insert(normalized.clone(), row);
+        result.insert(normalized, funding_interval_hours);
     }
-    Ok(result)
+    Ok((result, metadata, history_counts))
+}
+
+fn validate_funding_history(
+    symbol: &str,
+    info: &BinanceFundingInfo,
+    history: &[BinanceFundingRateSnapshot],
+) -> Result<(), String> {
+    if history.is_empty() {
+        return Err(format!("fundingRate history is empty for {symbol}"));
+    }
+    if history.iter().any(|row| {
+        row.symbol != symbol
+            || row.funding_time_ms == 0
+            || row.funding_rate.trim().is_empty()
+            || !matches!(row.rate_type.as_str(), "Regular" | "Special")
+    }) {
+        return Err(format!("fundingRate history is incomplete for {symbol}"));
+    }
+    info.validate()
+        .map_err(|error| format!("invalid funding bounds for {symbol}: {error}"))
 }
 
 fn main() {
@@ -150,7 +191,10 @@ fn main() {
     let symbols = args
         .symbols
         .clone()
-        .unwrap_or_else(|| profile.symbols.clone());
+        .unwrap_or_else(|| profile.symbols.clone())
+        .into_iter()
+        .map(|symbol| symbol.trim().to_ascii_uppercase())
+        .collect::<Vec<_>>();
     let output_root: PathBuf = args
         .output_root
         .clone()
@@ -187,9 +231,14 @@ fn main() {
         )
         .await
         .unwrap_or_else(|error| fail(format!("Binance execution-rule gate failed: {error}")));
-        let funding_intervals = load_funding_intervals(environment, &symbols)
+        let (funding_intervals, funding_info, funding_history_counts) =
+            load_funding_intervals(environment, &symbols)
             .await
             .unwrap_or_else(|error| fail(format!("Binance funding-rule gate failed: {error}")));
+        profile
+            .fee_schedule
+            .validate_at(timestamp_ms())
+            .unwrap_or_else(|error| fail(format!("Binance commission-rule gate failed: {error}")));
         let mut health = RuntimeHealthReporter::new(profile.runtime_audit_path.clone());
         health
             .start(RuntimeProfile::Batch, timestamp_ms())
@@ -296,7 +345,7 @@ fn main() {
                 .unwrap_or_else(|error| {
                     fail(format!("cannot allocate simulation-batch capital: {error}"))
                 });
-        let specs = experiment_plan
+        let specs: Vec<SimulationBatchSpec> = experiment_plan
             .runtime_specs_with_ablations()
             .unwrap_or_else(|error| fail(format!("invalid experiment plan: {error}")))
             .into_iter()
@@ -311,6 +360,38 @@ fn main() {
                 evidence_policy: spec.evidence_policy,
             })
             .collect();
+        let has_m8 = specs.iter().any(|spec| {
+            matches!(
+                spec.variant,
+                anchorbell_engine::simulation::SimulationPolicyVariant::M8FundingAware
+                    | anchorbell_engine::simulation::SimulationPolicyVariant::M8FundingDisabled
+            )
+        });
+        if environment == BinanceEnvironment::Production
+            && specs.iter().any(|spec| {
+                matches!(
+                    spec.variant,
+                    anchorbell_engine::simulation::SimulationPolicyVariant::M2Microstructure
+                        | anchorbell_engine::simulation::SimulationPolicyVariant::M3FillAware
+                        | anchorbell_engine::simulation::SimulationPolicyVariant::M4Statistical
+                        | anchorbell_engine::simulation::SimulationPolicyVariant::M6DynamicCapital
+                ) && spec.role != anchorbell_engine::simulation::ExperimentRole::Challenger
+            })
+        {
+            fail("production strategy gate failed: F2/F3/F4/F6 variants may run only as independent challengers");
+        }
+        if has_m8
+            && (funding_info.len() != symbols.len()
+                || funding_history_counts.len() != symbols.len()
+                || funding_history_counts.values().any(|count| *count == 0))
+        {
+            fail("M8 startup gate failed: complete per-symbol funding interval, bounds, special-rate history, and fee metadata are required");
+        }
+        if specs.iter().any(|spec| {
+            spec.variant == anchorbell_engine::simulation::SimulationPolicyVariant::M9DeadlineCausalDroMpc
+        }) {
+            fail("M9 startup gate failed: independent out-of-sample calibration data and sample threshold are not configured");
+        }
         registry
             .transition(&run_id, RunStatus::Running, timestamp_ms())
             .unwrap_or_else(|error| fail(format!("run registry running failed: {error}")));
@@ -324,6 +405,7 @@ fn main() {
             experiment_plan_id: experiment_plan.plan_id.clone(),
             experiment_plan_digest: experiment_plan.digest(),
             universe_id: profile.universe_id.clone(),
+            market_id: profile.market_id.clone(),
             environment,
             symbols,
             anchors,
@@ -333,17 +415,23 @@ fn main() {
             max_position: profile.max_position,
             requested_quantity: profile.requested_quantity,
             max_mark_index_gap_bps: profile.max_mark_index_gap_bps,
+            portfolio_drawdown_soft_bps: profile.portfolio_drawdown_soft_bps,
+            portfolio_drawdown_hard_bps: profile.portfolio_drawdown_hard_bps,
             max_anchor_age_ms: profile.max_anchor_age_ms,
             fee_ppm: profile.fee_ppm,
             fee_schedule: profile.fee_schedule.clone(),
             execution_filters,
             funding_intervals,
+            funding_info,
+            funding_history_counts,
+            funding_lead_ms: profile.funding_lead_ms,
             quantity_scale: profile.quantity_scale,
             price_scale: profile.price_scale,
             position_allocations: Some(allocations),
             output_root,
             specs,
             max_subscriptions_per_shard: profile.max_subscriptions_per_shard,
+            market_event_queue_capacity: profile.market_event_queue_capacity,
             connect_timeout_ms: profile.connect_timeout_ms,
             read_timeout_ms: profile.read_timeout_ms,
             metrics_refresh_ms: profile.metrics_refresh_ms,
@@ -380,7 +468,15 @@ fn main() {
                 let now_ms = timestamp_ms();
                 let _ = health.halted("simulation.runtime", now_ms, &reason).await;
                 let _ = registry.fail(&run_id, reason.clone(), now_ms);
-                fail(format!("batch execution failed: {reason}"));
+                eprintln!("batch execution failed: {reason}");
+                // Exit 2 is reserved for the storage floor so systemd does
+                // not spin while the host is unsafe. Recoverable market and
+                // feed failures use exit 1 and are restarted by the unit.
+                process::exit(if reason.contains("simulation storage safety stop") {
+                    2
+                } else {
+                    1
+                });
             }
         };
         heartbeat_task.abort();

@@ -17,7 +17,7 @@ async fn main() {
     let symbol = std::env::var("ANCHORBELL_SYMBOL").unwrap_or_else(|_| "BTCUSDT".into());
     let subscription = BinanceSubscription::new(symbol).expect("valid symbol");
     let config = BinanceMarketConfig {
-        market_ws_base: deployment.environment.endpoints().market_ws_base.into(),
+        market_ws_base: deployment.environment.endpoints().market_ws_base,
         subscriptions: vec![subscription],
         price_scale: std::env::var("ANCHORBELL_PRICE_SCALE")
             .ok()

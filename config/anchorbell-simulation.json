@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
-  "policy_id": "M1-M9-pico-bps-server-20260906",
+  "policy_id": "CORE-V1-binance-safe-server-20260909",
+  "market_id": "binance_usdm_tradfi_perpetual",
   "environment": "Production",
   "index_anchors": true,
   "symbols": [
@@ -12,19 +13,22 @@
     "ZHIPUUSDT",
     "ZHONGJIUSDT"
   ],
-  "output_root": "/var/lib/anchorbell/simulation-batch-m1-m9-pico-20260906",
+  "output_root": "/var/lib/anchorbell/simulation-core-v1-20260909",
   "capital_usdt": "1500",
   "duration_secs": 0,
   "entry_threshold_bps": 5,
-  "threshold_scale_ppm": 700000,
+  "threshold_scale_ppm": 1000000,
   "max_position": 10000000,
   "requested_quantity": 1000000,
   "max_mark_index_gap_bps": 50,
+  "portfolio_drawdown_soft_bps": 500,
+  "portfolio_drawdown_hard_bps": 800,
   "max_anchor_age_ms": 120000,
   "fee_ppm": 0,
   "quantity_scale": 8,
   "price_scale": 8,
   "max_subscriptions_per_shard": 64,
+  "market_event_queue_capacity": 1048576,
   "connect_timeout_ms": 5000,
   "read_timeout_ms": 15000,
   "metrics_refresh_ms": 1000,
@@ -43,111 +47,19 @@
   "dynamic_capital_refresh_ms": 60000,
   "depth_snapshot_limit": 100,
   "checkpoint_interval_ms": 5000,
-  "m9_calibration_source_label": "F3_m3",
+  "m9_calibration_source_label": "CORE_V1",
   "experiments": [
     {
-      "label": "F0_m0",
-      "strategy": "m0",
+      "label": "CORE_V1",
+      "strategy": "core_v1",
       "ablations": [],
-      "role": "Control",
+      "role": "SafetyOverlay",
       "parent_experiment_id": null,
       "execution_overlay": "adaptive_emergency_reduce_only_taker",
-      "evidence_policy": "oos_required"
-    },
-    {
-      "label": "F1_m1",
-      "strategy": "m1",
-      "ablations": [],
-      "role": "Incremental",
-      "parent_experiment_id": "F0_m0",
-      "execution_overlay": "adaptive_emergency_reduce_only_taker",
-      "evidence_policy": "oos_required"
-    },
-    {
-      "label": "F2_m2",
-      "strategy": "m2",
-      "ablations": [],
-      "role": "Incremental",
-      "parent_experiment_id": "F1_m1",
-      "execution_overlay": "adaptive_emergency_reduce_only_taker",
-      "evidence_policy": "oos_required"
-    },
-    {
-      "label": "F3_m3",
-      "strategy": "m3",
-      "ablations": [],
-      "role": "Incremental",
-      "parent_experiment_id": "F2_m2",
-      "execution_overlay": "adaptive_emergency_reduce_only_taker",
-      "evidence_policy": "oos_required"
-    },
-    {
-      "label": "F4_m4",
-      "strategy": "m4",
-      "ablations": [],
-      "role": "Incremental",
-      "parent_experiment_id": "F3_m3",
-      "execution_overlay": "adaptive_emergency_reduce_only_taker",
-      "evidence_policy": "oos_required"
-    },
-    {
-      "label": "F5_m5",
-      "strategy": "m5",
-      "ablations": [],
-      "role": "Incremental",
-      "parent_experiment_id": "F4_m4",
-      "execution_overlay": "adaptive_emergency_reduce_only_taker",
-      "evidence_policy": "oos_required"
-    },
-    {
-      "label": "F6_m6",
-      "strategy": "m6",
-      "ablations": [],
-      "role": "Incremental",
-      "parent_experiment_id": "F5_m5",
-      "execution_overlay": "adaptive_emergency_reduce_only_taker",
-      "evidence_policy": "oos_required"
-    },
-    {
-      "label": "F7_m7",
-      "strategy": "m7",
-      "ablations": [],
-      "role": "Incremental",
-      "parent_experiment_id": "F6_m6",
-      "execution_overlay": "adaptive_emergency_reduce_only_taker",
-      "evidence_policy": "oos_required"
-    },
-    {
-      "label": "M8_full",
-      "strategy": "m8",
-      "ablations": [],
-      "role": "Incremental",
-      "parent_experiment_id": "F7_m7",
-      "execution_overlay": "adaptive_emergency_reduce_only_taker",
-      "evidence_policy": "oos_required"
-    },
-    {
-      "label": "M8_no_funding",
-      "strategy": "m8",
-      "ablations": [
-        "funding"
-      ],
-      "role": "Ablation",
-      "parent_experiment_id": "M8_full",
-      "execution_overlay": "adaptive_emergency_reduce_only_taker",
-      "evidence_policy": "oos_required"
-    },
-    {
-      "label": "M9_full",
-      "strategy": "m9",
-      "ablations": [],
-      "role": "Challenger",
-      "parent_experiment_id": "M8_full",
-      "execution_overlay": "adaptive_emergency_reduce_only_taker",
-      "evidence_policy": "oos_required"
+      "evidence_policy": "promotion_required"
     }
   ],
-  "experiment_plan_id": "m1-m9-single-ledger-ablation-matrix",
+  "experiment_plan_id": "core-v1-production-plan",
   "universe_id": "frozen-close-ah",
   "asset_class": "ordinary_equity",
   "max_stale_ms": 5000,
@@ -173,6 +85,6 @@
     "effective_from_ms": 1774922400000,
     "effective_until_ms": null
   },
-  "default_strategy_variant": "m4",
+  "default_strategy_variant": "core_v1",
   "funding_lead_ms": 300000
 }

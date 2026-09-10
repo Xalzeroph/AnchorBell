@@ -23,7 +23,7 @@ use crate::{
     execution::{BinanceEnvironment, SessionCheckpoint},
     market::{
         binance::{parse_price_ticks, parse_quantity, BinanceMarketEvent},
-        metadata::{BinanceDepthSnapshot, BinanceScaledExecutionFilters},
+        metadata::{BinanceDepthSnapshot, BinanceFundingInfo, BinanceScaledExecutionFilters},
         recorder::{add_event_lineage, market_event_to_json},
         BinanceC2cFxClient, BinanceC2cFxPoller, BinanceMarketConfig, BinanceMarketFeed,
         BinanceMarketStream, FxPollerConfig, FxUpdate, PublicMarketMetadataClient, ReconnectPolicy,
@@ -49,7 +49,6 @@ const RUN_STATUS_SCHEMA_VERSION: u16 = 1;
 const EXPERIMENT_INDEX_SCHEMA_VERSION: u16 = 1;
 const DISPLAY_HISTORY_CAPACITY: usize = 900;
 const RISK_HISTORY_CAPACITY: usize = 7_201;
-const MARKET_EVENT_CHANNEL_CAPACITY: usize = 65_536;
 
 #[derive(Debug, Clone)]
 pub struct SimulationBatchSpec {
@@ -70,6 +69,7 @@ pub struct SimulationBatchConfig {
     pub experiment_plan_id: String,
     pub experiment_plan_digest: String,
     pub universe_id: String,
+    pub market_id: String,
     pub environment: BinanceEnvironment,
     pub symbols: Vec<String>,
     pub anchors: BTreeMap<String, AnchorSnapshot>,
@@ -79,17 +79,26 @@ pub struct SimulationBatchConfig {
     pub max_position: i64,
     pub requested_quantity: i64,
     pub max_mark_index_gap_bps: i64,
+    pub portfolio_drawdown_soft_bps: i64,
+    pub portfolio_drawdown_hard_bps: i64,
     pub max_anchor_age_ms: u64,
     pub fee_ppm: i64,
     pub fee_schedule: FeeScheduleConfig,
     pub execution_filters: BTreeMap<String, BinanceScaledExecutionFilters>,
     pub funding_intervals: BTreeMap<String, u32>,
+    pub funding_info: BTreeMap<String, BinanceFundingInfo>,
+    pub funding_history_counts: BTreeMap<String, usize>,
+    pub funding_lead_ms: u64,
     pub quantity_scale: u32,
     pub price_scale: u32,
     pub position_allocations: Option<BTreeMap<String, PositionAllocation>>,
     pub output_root: PathBuf,
     pub specs: Vec<SimulationBatchSpec>,
     pub max_subscriptions_per_shard: usize,
+    /// Bounded market ingress capacity. A full queue invalidates the run;
+    /// sizing it from the profile prevents transient Binance reconnect bursts
+    /// from being mistaken for a valid zero-trade result.
+    pub market_event_queue_capacity: usize,
     pub connect_timeout_ms: u64,
     pub read_timeout_ms: u64,
     pub metrics_refresh_ms: u64,
@@ -437,7 +446,29 @@ fn build_engine(
     .with_dynamic_capital_refresh_ms(config.dynamic_capital_refresh_ms)
     .with_threshold_scale_ppm(config.threshold_scale_ppm)
     .with_execution_filters(config.execution_filters.clone())
-    .with_funding_intervals(config.funding_intervals.clone());
+    .with_funding_intervals(config.funding_intervals.clone())
+    .with_funding_lead_ms(config.funding_lead_ms)
+    .with_market_context(config.market_id.clone())
+    .with_method_context(spec.label.clone());
+    if config.portfolio_drawdown_soft_bps != 0 || config.portfolio_drawdown_hard_bps != 0 {
+        let capital = config
+            .position_allocations
+            .as_ref()
+            .and_then(|allocations| {
+                allocations.values().try_fold(0_i64, |total, allocation| {
+                    total.checked_add(allocation.budget_usdt_ticks)
+                })
+            })
+            .filter(|capital| *capital > 0)
+            .ok_or(SimulationError::InvalidConfig(
+                "portfolio drawdown guard requires allocated capital",
+            ))?;
+        engine = engine.with_portfolio_drawdown_limits_bps(
+            capital,
+            config.portfolio_drawdown_soft_bps,
+            config.portfolio_drawdown_hard_bps,
+        )?;
+    }
     engine.restore_calibration_states(calibration_seeds);
     if let Some(allocations) = config.position_allocations.clone() {
         engine = engine.with_position_allocations(allocations)?;
@@ -451,7 +482,18 @@ fn validate(config: &SimulationBatchConfig) -> Result<(), SimulationError> {
         || config.experiment_plan_id.trim().is_empty()
         || config.experiment_plan_digest.trim().is_empty()
         || config.universe_id.trim().is_empty()
+        || config.market_id.trim().is_empty()
+        || config.threshold_scale_ppm <= 0
+        || config.threshold_scale_ppm > 1_000_000
+        || config.funding_lead_ms == 0
         || config.max_subscriptions_per_shard == 0
+        || config.market_event_queue_capacity == 0
+        || config.portfolio_drawdown_soft_bps < 0
+        || config.portfolio_drawdown_hard_bps < 0
+        || (config.portfolio_drawdown_soft_bps == 0 && config.portfolio_drawdown_hard_bps != 0)
+        || (config.portfolio_drawdown_soft_bps != 0
+            && config.portfolio_drawdown_hard_bps <= config.portfolio_drawdown_soft_bps)
+        || config.portfolio_drawdown_hard_bps > 10_000
     {
         return Err(SimulationError::InvalidConfig(
             "batch execution requires symbols, specs, and shard capacity",
@@ -462,6 +504,36 @@ fn validate(config: &SimulationBatchConfig) -> Result<(), SimulationError> {
             "batch execution labels must be non-empty",
         ));
     }
+    if config.environment == BinanceEnvironment::Production
+        && config
+            .specs
+            .iter()
+            .any(|spec| spec.variant == SimulationPolicyVariant::CoreV1)
+        && config.threshold_scale_ppm < 1_000_000
+    {
+        return Err(SimulationError::InvalidConfig(
+            "CORE_V1 production evidence hurdle cannot be scaled below 100%",
+        ));
+    }
+    if config.execution_filters.len() != config.symbols.len()
+        || config.funding_intervals.len() != config.symbols.len()
+        || config.funding_info.len() != config.symbols.len()
+        || config.funding_history_counts.len() != config.symbols.len()
+        || config.symbols.iter().any(|symbol| {
+            !config.execution_filters.contains_key(symbol)
+                || !config.funding_intervals.contains_key(symbol)
+                || !config.funding_info.contains_key(symbol)
+                || !config.funding_history_counts.contains_key(symbol)
+        })
+    {
+        return Err(SimulationError::InvalidConfig(
+            "batch execution requires complete per-symbol exchange and funding metadata",
+        ));
+    }
+    config
+        .fee_schedule
+        .validate()
+        .map_err(SimulationError::InvalidConfig)?;
     if config
         .specs
         .windows(2)
@@ -547,8 +619,11 @@ pub async fn run(
         "experiment_plan_id": config.experiment_plan_id,
         "experiment_plan_digest": config.experiment_plan_digest,
         "universe_id": config.universe_id,
+        "market_id": config.market_id,
         "entry_threshold_bps": config.entry_threshold_bps,
         "threshold_scale_ppm": config.threshold_scale_ppm,
+        "portfolio_drawdown_soft_bps": config.portfolio_drawdown_soft_bps,
+        "portfolio_drawdown_hard_bps": config.portfolio_drawdown_hard_bps,
         "fee_ppm": config.fee_ppm,
         "fee_schedule": config.fee_schedule,
         "anchor_source": crate::simulation::engine::INDEX_ANCHOR_SOURCE,
@@ -565,6 +640,9 @@ pub async fn run(
         "depth_snapshot_limit": config.depth_snapshot_limit,
         "duration_secs": config.duration_secs,
         "emergency_execution": config.emergency_execution,
+        "funding_lead_ms": config.funding_lead_ms,
+        "funding_info": config.funding_info,
+        "funding_history_counts": config.funding_history_counts,
     });
     let parameter_bytes = serde_json::to_vec(&parameter_material)
         .map_err(|_| SimulationError::InvalidConfig("cannot encode parameter digest"))?;
@@ -608,6 +686,7 @@ pub async fn run(
         "policy_id": config.policy_id,
         "experiment_plan_id": config.experiment_plan_id,
         "universe_id": config.universe_id,
+        "market_id": config.market_id,
         "method_catalog": crate::strategy::strategy_methods(),
         "created_at_ms": manifest_created_at_ms,
         "parameter_digest": parameter_digest,
@@ -636,6 +715,9 @@ pub async fn run(
         "depth_snapshot_limit": config.depth_snapshot_limit,
         "duration_secs": config.duration_secs,
         "emergency_execution": config.emergency_execution,
+        "funding_lead_ms": config.funding_lead_ms,
+        "funding_info": config.funding_info,
+        "funding_history_counts": config.funding_history_counts,
         "calibration_scope": "run_local",
         "evidence": config.evidence.clone(),
     });
@@ -793,14 +875,14 @@ pub async fn run(
 
     let mut shard_tasks = tokio::task::JoinSet::new();
     let (event_tx, mut event_rx) =
-        mpsc::channel::<BinanceMarketEvent>(MARKET_EVENT_CHANNEL_CAPACITY);
+        mpsc::channel::<BinanceMarketEvent>(config.market_event_queue_capacity);
     let event_dropped = Arc::new(AtomicU64::new(0));
     let endpoints = config.environment.endpoints();
 
     // Start buffering diff-depth before the REST snapshot, matching Binance's
     // required bootstrap order and preserving events during snapshot latency.
     let depth_configs = BinanceMarketConfig::for_symbols(
-        endpoints.public_market_ws_base,
+        endpoints.public_market_ws_base.clone(),
         &config.symbols,
         BinanceMarketFeed::OrderBookDepth,
         config.price_scale,
@@ -826,7 +908,7 @@ pub async fn run(
         });
     }
 
-    let depth_client = PublicMarketMetadataClient::new(endpoints.rest_base, None)
+    let depth_client = PublicMarketMetadataClient::new(endpoints.rest_base.as_str(), None)
         .map_err(|error| SimulationError::Market(format!("depth snapshot client: {error}")))?;
     let mut depth_books = BTreeMap::<String, LocalOrderBook>::new();
     let mut depth_buffers =
@@ -1447,6 +1529,44 @@ pub async fn run(
         .await?;
         return Err(error);
     }
+    if let Some(non_flat) = ledger_results
+        .iter()
+        .find(|ledger| !ledger.summary.flat_at_end)
+    {
+        let error = SimulationError::Market(format!(
+            "normal completion blocked: ledger {} ended with residual position={} working_orders={} settlement_status={}",
+            non_flat.label,
+            non_flat.summary.current_absolute_position,
+            non_flat.summary.working_orders,
+            non_flat.settlement_status
+        ));
+        let finished_at_ms = now_ms();
+        let reason = error.to_string();
+        write_json_atomic(
+            &run_status_path,
+            &serde_json::json!({
+                "schema_version": RUN_STATUS_SCHEMA_VERSION,
+                "status": "failed",
+                "finished_at_ms": finished_at_ms,
+                "reason": reason,
+                "flat_at_end": false,
+                "residual_exposure": true,
+            }),
+        )
+        .await?;
+        write_experiment_index(
+            &experiment_index_path,
+            &config,
+            &manifest_run_id,
+            "failed",
+            manifest_created_at_ms,
+            Some(finished_at_ms),
+            Some(&reason),
+            None,
+        )
+        .await?;
+        return Err(error);
+    }
     let promotion_input = SimulationPromotionInput {
         ledger_count: ledger_results.len() as u64,
         orders: ledger_results
@@ -1522,7 +1642,7 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::{calibration_key, MARKET_EVENT_CHANNEL_CAPACITY};
+    use super::calibration_key;
     use tokio::sync::mpsc;
 
     #[tokio::test]
@@ -1533,7 +1653,6 @@ mod tests {
             sender.try_send(2),
             Err(mpsc::error::TrySendError::Full(2))
         ));
-        assert_eq!(MARKET_EVENT_CHANNEL_CAPACITY, 65_536);
     }
 
     #[test]

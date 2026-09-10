@@ -17,6 +17,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 mod decision_audit;
+mod runtime_math;
 
 use super::portfolio_guard::{
     PortfolioDrawdownAction, PortfolioDrawdownGuard, PortfolioDrawdownSnapshot,
@@ -24,10 +25,11 @@ use super::portfolio_guard::{
 pub use super::risk_metrics::RiskMetrics;
 use super::risk_metrics::{calculate_risk_metrics, RISK_SAMPLE_INTERVAL_MS};
 use decision_audit::DecisionAuditContext;
+use runtime_math::*;
 
 use crate::{
     backtest::TopOfBook,
-    execution::BinanceEnvironment,
+    execution::{binance_runtime_config, BinanceEnvironment},
     execution::{
         decide_adaptive_taker, AdaptiveTakerDecision, AdaptiveTakerInput, EmergencyExecutionPolicy,
         OrderIntent, Side,
@@ -49,13 +51,13 @@ use crate::{
     strategy::{
         calendar::{calendar_for, EquitySessionCalendar},
         capital::{dynamic_weights, CapitalRiskInput},
-        decide_m9, decide_maker_exit, profile_for, side_adverse_selection_bps,
-        side_adverse_selection_pico_bps,
+        decide_m9, decide_maker_exit, profile_for, side_adverse_selection_pico_bps,
         universe::instrument_for,
         AdaptiveThreshold, AnchorCurrency, AnchorMakerStrategy, CalibrationSnapshot,
-        CalibrationState, DataQualityStatus, DualFlattenPlan, ExitBook, ExitConstraints,
-        ExitWorkingOrder, FairValueEstimate, FundingRateKind, FundingSchedule, M9Action, M9Input,
-        MakerExitDecision, MakerExitInput, SignalInput, VenueSessionState,
+        CalibrationState, CalibrationStatus, DataQualityStatus, DualFlattenPlan, ExitBook,
+        ExitConstraints, ExitWorkingOrder, FairValueEstimate, FundingRateKind, FundingSchedule,
+        M9Action, M9Calibration, M9Input, MakerExitDecision, MakerExitInput, SignalInput,
+        VenueSessionState,
     },
 };
 
@@ -81,6 +83,8 @@ impl AnchorSnapshot {
 pub enum SimulationPolicyVariant {
     M0Fixed,
     M1AdaptiveRisk,
+    /// Permanent production core: M1 adaptive risk plus proven safety overlays.
+    CoreV1,
     M2Microstructure,
     M3FillAware,
     M4Statistical,
@@ -92,6 +96,8 @@ pub enum SimulationPolicyVariant {
     M7EvidenceGated,
     /// M7 plus funding-aware carry/avoid/tolerate/exit control.
     M8FundingAware,
+    /// M8 without its funding controller, used only for a valid funding ablation.
+    M8FundingDisabled,
     /// M8 funding control plus deadline-constrained causal residual DRO-MPC.
     M9DeadlineCausalDroMpc,
 }
@@ -101,6 +107,7 @@ impl SimulationPolicyVariant {
         match self {
             Self::M0Fixed => "m0_fixed",
             Self::M1AdaptiveRisk => "m1_adaptive_risk",
+            Self::CoreV1 => "core_v1",
             Self::M2Microstructure => "m2_microstructure",
             Self::M3FillAware => "m3_fill_aware",
             Self::M4Statistical => "m4_statistical",
@@ -108,36 +115,90 @@ impl SimulationPolicyVariant {
             Self::M6DynamicCapital => "m6_dynamic_capital",
             Self::M7EvidenceGated => "m7_evidence_gated",
             Self::M8FundingAware => "m8_funding_aware",
+            Self::M8FundingDisabled => "m8_funding_disabled",
             Self::M9DeadlineCausalDroMpc => "m9_deadline_causal_dro_mpc",
         }
     }
 
     fn uses_microstructure(self) -> bool {
-        self >= Self::M2Microstructure
+        matches!(
+            self,
+            Self::M2Microstructure
+                | Self::M3FillAware
+                | Self::M4Statistical
+                | Self::M5Robust
+                | Self::M6DynamicCapital
+                | Self::M7EvidenceGated
+                | Self::M8FundingAware
+                | Self::M8FundingDisabled
+                | Self::M9DeadlineCausalDroMpc
+        )
     }
 
     fn uses_fill_gate(self) -> bool {
-        self >= Self::M3FillAware
+        matches!(
+            self,
+            Self::M3FillAware
+                | Self::M4Statistical
+                | Self::M5Robust
+                | Self::M6DynamicCapital
+                | Self::M7EvidenceGated
+                | Self::M8FundingAware
+                | Self::M8FundingDisabled
+                | Self::M9DeadlineCausalDroMpc
+        )
     }
 
     fn uses_statistical_term(self) -> bool {
-        self >= Self::M4Statistical
+        matches!(
+            self,
+            Self::M4Statistical
+                | Self::M5Robust
+                | Self::M6DynamicCapital
+                | Self::M7EvidenceGated
+                | Self::M8FundingAware
+                | Self::M8FundingDisabled
+                | Self::M9DeadlineCausalDroMpc
+        )
     }
 
     fn uses_tail_guard(self) -> bool {
-        self >= Self::M5Robust
+        matches!(
+            self,
+            Self::CoreV1
+                | Self::M5Robust
+                | Self::M6DynamicCapital
+                | Self::M7EvidenceGated
+                | Self::M8FundingAware
+                | Self::M8FundingDisabled
+                | Self::M9DeadlineCausalDroMpc
+        )
     }
 
     fn uses_dynamic_capital(self) -> bool {
-        self >= Self::M6DynamicCapital
+        matches!(
+            self,
+            Self::M6DynamicCapital
+                | Self::M7EvidenceGated
+                | Self::M8FundingAware
+                | Self::M8FundingDisabled
+                | Self::M9DeadlineCausalDroMpc
+        )
     }
 
     fn uses_evidence_gate(self) -> bool {
-        self >= Self::M7EvidenceGated
+        matches!(
+            self,
+            Self::CoreV1
+                | Self::M7EvidenceGated
+                | Self::M8FundingAware
+                | Self::M8FundingDisabled
+                | Self::M9DeadlineCausalDroMpc
+        )
     }
 
     fn uses_funding_controller(self) -> bool {
-        self >= Self::M8FundingAware
+        matches!(self, Self::M8FundingAware | Self::M9DeadlineCausalDroMpc)
     }
 }
 
@@ -447,8 +508,9 @@ pub(crate) async fn load_index_anchor_set_internal(
     }
     let mut seen = BTreeMap::new();
     let mut selected_metadata = Vec::with_capacity(symbols.len());
-    let client = PublicMarketMetadataClient::new(environment.endpoints().rest_base, http_proxy)
-        .map_err(|error| SimulationError::Market(format!("index anchor client: {error}")))?;
+    let client =
+        PublicMarketMetadataClient::new(environment.endpoints().rest_base.as_str(), http_proxy)
+            .map_err(|error| SimulationError::Market(format!("index anchor client: {error}")))?;
     let exchange_info = client
         .exchange_info()
         .await
@@ -718,6 +780,28 @@ struct SimulationSymbolState {
     ewma_spread_micro_bps: i64,
     ewma_abs_return_pico_bps: i64,
     ewma_spread_pico_bps: i64,
+    ewma_signed_return_pico_bps: i64,
+    /// Signed fair-value residual (fair value minus mid) used as the causal
+    /// direction of the mean-reversion hypothesis.
+    ewma_signed_residual_pico_bps: i64,
+    /// Signed EWMA of residual absolute changes. Positive values mean the
+    /// dislocation is expanding away from zero; negative values mean it is
+    /// contracting toward zero.
+    ewma_residual_drift_pico_bps: i64,
+    /// Signed EWMA of the residual level change. Positive values indicate
+    /// drift toward the positive residual regime; negative values indicate
+    /// drift toward the negative residual regime.
+    ewma_signed_residual_drift_pico_bps: i64,
+    /// Signed EWMA of the change in residual drift. This is a causal
+    /// acceleration term for abrupt repricing, not a forecast of direction.
+    ewma_residual_curvature_pico_bps: i64,
+    /// EWMA sign persistence in [-1e6, 1e6]. Positive persistence means the
+    /// residual remains on one side of zero; negative persistence means it
+    /// crosses zero, which is evidence against a persistent regime.
+    ewma_residual_persistence_ppm: i64,
+    last_residual_pico_bps: Option<i64>,
+    last_residual_change_pico_bps: Option<i64>,
+    last_residual_dynamics_time_ms: Option<u64>,
     near_miss_count: u64,
     adaptive_relief_bps: i64,
     adaptive_relief_micro_bps: i64,
@@ -731,6 +815,9 @@ struct SimulationSymbolState {
     strategy_pnl_ticks: i64,
     funding_pnl_ticks: i64,
     fees_ticks: i64,
+    /// High-water mark of the symbol net-PnL path, updated on the causal
+    /// decision path so future observations cannot leak into sizing.
+    peak_net_pnl_ticks: i64,
     latest_funding_rate_e8: Option<i64>,
     last_settled_funding_time_ms: u64,
     fills: u64,
@@ -802,6 +889,7 @@ pub struct SimulationSummary {
     pub rejected_entries: u64,
     /// Rejections partitioned by the owning layer (strategy/risk/execution).
     pub gate_rejections: BTreeMap<String, u64>,
+    pub gate_rejection_records: Vec<GateRejectionRecord>,
     pub realized_pnl_ticks: i64,
     pub unrealized_pnl_ticks: i64,
     pub market_pnl_ticks: i64,
@@ -814,9 +902,26 @@ pub struct SimulationSummary {
     pub taker_fee_ppm: i64,
     pub unrealized_valuation_complete: bool,
     pub current_absolute_position: i64,
+    /// Signed inventory imbalance across symbols, normalized by each symbol's
+    /// configured maximum position. Positive values are net long; negative
+    /// values are net short. This exposes common-mode concentration directly
+    /// instead of hiding it behind gross position.
+    pub portfolio_inventory_imbalance_bps: i64,
     pub peak_absolute_position: i64,
     pub working_orders: u64,
     pub flat_at_end: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GateRejectionRecord {
+    pub reason: String,
+    pub symbol: String,
+    pub market: String,
+    pub method: String,
+    pub source: String,
+    pub threshold: Option<i64>,
+    pub observed_value: Option<i64>,
+    pub timestamp_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -889,7 +994,6 @@ struct ThresholdDiagnostic {
     missing_component: Option<&'static str>,
 }
 
-const FUNDING_FLATTEN_LEAD_MS: u64 = 5 * 60 * 1_000;
 const MICRO_BPS_SCALE: i64 = 1_000_000;
 const PICO_BPS_SCALE: i64 = 1_000_000_000_000;
 const EWMA_PREVIOUS_WEIGHT_PPM: i64 = 700_000;
@@ -900,11 +1004,21 @@ const ADAPTIVE_NEAR_MISS_WINDOW_PICO_BPS: i64 = 20 * PICO_BPS_SCALE;
 const MARKOUT_HORIZON_MS: u64 = 30 * 1_000;
 const THRESHOLD_PRIOR_VOLATILITY_PICO_BPS: i64 = 10 * PICO_BPS_SCALE;
 const THRESHOLD_PRIOR_SPREAD_PICO_BPS: i64 = 2 * PICO_BPS_SCALE;
+/// Do not infer a tail probability from a handful of fills. This is a policy
+/// sample floor, not an exchange/trading-rule constant.
+const MIN_MARKOUT_FEEDBACK_SAMPLES: usize = 8;
+/// Pseudo-observations for the zero-trend prior. A short burst of one-sided
+/// prints must not immediately veto a mean-reversion quote.
+const TREND_PRIOR_OBSERVATIONS: i128 = 32;
+const TREND_CONFLICT_CAP_PICO_BPS: i64 = 75 * PICO_BPS_SCALE;
+const MIN_EVIDENCE_SCALE_PPM: i64 = 250_000;
+const RESIDUAL_REGIME_CAP_PICO_BPS: i64 = 75 * PICO_BPS_SCALE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SimulationRiskState {
     Trading,
     ReduceOnlyEquitySession,
+    ReduceOnlySymbolDrawdown,
     /// Conservative M1-M7 funding-deadline gate.
     ReduceOnlyFundingDeadline,
     /// M8 only: economic funding cost justifies reducing a held position.
@@ -922,6 +1036,7 @@ impl SimulationRiskState {
         match self {
             Self::Trading => "trading",
             Self::ReduceOnlyEquitySession => "reduce_only_equity_session",
+            Self::ReduceOnlySymbolDrawdown => "reduce_only_symbol_drawdown",
             Self::ReduceOnlyFundingDeadline => "reduce_only_funding_deadline",
             Self::ReduceOnlyFundingRisk => "reduce_only_funding_risk",
             Self::NoEntryFunding => "no_entry_funding",
@@ -961,6 +1076,11 @@ pub struct SymbolMetrics {
     pub funding_pnl_ticks: i64,
     pub fees_ticks: i64,
     pub net_pnl_ticks: i64,
+    /// Drawdown of this symbol's own net-PnL path from its observed peak,
+    /// measured against its current allocated capital. This is separate from
+    /// portfolio drawdown so one damaged symbol cannot consume the whole
+    /// portfolio risk budget while the aggregate still looks calm.
+    pub symbol_drawdown_bps: i64,
     pub risk_metrics: Option<RiskMetrics>,
     pub anchor_age_ms: Option<u64>,
     pub anchor_final_close: bool,
@@ -976,6 +1096,7 @@ pub struct SymbolMetrics {
     pub entry_block_reason: String,
     pub data_quality: DataQualityStatus,
     pub mark_age_ms: Option<u64>,
+    pub book_age_ms: Option<u64>,
     pub bid_price_ticks: Option<i64>,
     pub ask_price_ticks: Option<i64>,
     pub anchor_price_ticks: i64,
@@ -987,9 +1108,42 @@ pub struct SymbolMetrics {
     pub ewma_spread_micro_bps: i64,
     pub ewma_abs_return_pico_bps: i64,
     pub ewma_spread_pico_bps: i64,
+    /// Signed EWMA return used to distinguish mean-reversion from a moving
+    /// dislocation. Positive values indicate upward pressure.
+    pub ewma_signed_return_pico_bps: i64,
+    /// Signed fair-value residual (fair value minus mid), in pico-bps.
+    pub ewma_signed_residual_pico_bps: i64,
+    /// Positive values indicate residual expansion away from zero; negative
+    /// values indicate contraction toward zero.
+    pub ewma_residual_drift_pico_bps: i64,
+    /// Signed direction drift of the residual level, in pico-bps.
+    pub ewma_signed_residual_drift_pico_bps: i64,
+    /// Causal residual acceleration in pico-bps.
+    pub ewma_residual_curvature_pico_bps: i64,
+    /// Serial persistence of the residual sign in parts per million. It is
+    /// shrunk toward zero during the causal warm-up period.
+    pub ewma_residual_persistence_ppm: i64,
+    /// Conservative residual-regime risk score used by Core V1 sizing.
+    pub residual_regime_risk_pico_bps: i64,
+    pub residual_regime_scale_ppm: i64,
+    /// Directional persistence after shrinkage toward a zero-trend prior.
+    pub trend_persistence_bps: i64,
+    pub buy_trend_conflict_pico_bps: i64,
+    pub sell_trend_conflict_pico_bps: i64,
+    pub buy_market_trend_conflict_pico_bps: i64,
+    pub sell_market_trend_conflict_pico_bps: i64,
+    pub reversion_evidence_lower_bps: i64,
+    pub reversion_evidence_scale_ppm: i64,
     pub ewma_adverse_markout_bps: i64,
     pub ewma_adverse_markout_micro_bps: i64,
     pub ewma_adverse_markout_pico_bps: i64,
+    /// Conservative upper estimate used by admission and allocation. The raw
+    /// EWMA remains visible for diagnosing adaptation lag.
+    pub adverse_markout_upper_pico_bps: i64,
+    /// Directional conservative markout bounds used by the side-specific
+    /// conditional-value gate.
+    pub buy_adverse_markout_upper_pico_bps: i64,
+    pub sell_adverse_markout_upper_pico_bps: i64,
     pub evaluated_markouts: u64,
     pub adverse_markouts: u64,
     pub adaptive_relief_bps: i64,
@@ -1007,6 +1161,14 @@ pub struct SymbolMetrics {
     pub liquidity_ratio_bps: Option<i64>,
     pub liquidity_penalty_bps: Option<i64>,
     pub liquidity_fill_probability_bps: Option<u16>,
+    /// Wilson lower bound of observed order-level fills. `None` means the
+    /// rolling lifecycle sample has not reached the minimum evidence floor.
+    pub empirical_fill_probability_lcb_bps: Option<u16>,
+    /// Direction-specific Wilson lower bounds. Sparse sides conservatively
+    /// fall back to the aggregate lower bound and never borrow a favorable
+    /// bound from the opposite side.
+    pub buy_empirical_fill_probability_lcb_bps: Option<u16>,
+    pub sell_empirical_fill_probability_lcb_bps: Option<u16>,
     pub fair_value_ticks: Option<i64>,
     pub fair_value_confidence_bps: Option<i64>,
     pub market_regime: Option<String>,
@@ -1038,6 +1200,7 @@ pub struct PerformancePoint {
     pub gross_pnl_ticks: i64,
     pub net_pnl_ticks: i64,
     pub current_absolute_position: i64,
+    pub portfolio_inventory_imbalance_bps: i64,
     pub symbols: Vec<SymbolPerformancePoint>,
 }
 
@@ -1092,6 +1255,10 @@ pub struct SimulationEngine {
     funding_controller_enabled: bool,
     threshold_scale_ppm: i64,
     portfolio_drawdown_guard: Option<PortfolioDrawdownGuard>,
+    /// Derived from configured portfolio limits; this is a safety overlay,
+    /// not a replacement for the independent dynamic-capital challenger.
+    symbol_drawdown_soft_bps: i64,
+    symbol_drawdown_hard_bps: i64,
     position_allocations: BTreeMap<String, PositionAllocation>,
     capital_usdt_ticks: Option<i64>,
     states: BTreeMap<String, SimulationSymbolState>,
@@ -1103,6 +1270,11 @@ pub struct SimulationEngine {
     filled_quantity: i64,
     rejected_entries: u64,
     gate_rejections: BTreeMap<String, u64>,
+    gate_rejection_records: Vec<GateRejectionRecord>,
+    market_id: String,
+    method_id: String,
+    funding_lead_ms: u64,
+    funding_metadata_complete: bool,
     peak_absolute_position: i64,
     last_event_at_ms: u64,
     last_received_at_ms: u64,
@@ -1155,7 +1327,7 @@ impl SimulationEngine {
                         mark_price_ticks: None,
                         index_price_ticks: None,
                         next_funding_time_ms: 0,
-                        funding_interval_hours: 8,
+                        funding_interval_hours: 0,
                         last_mark_time_ms: 0,
                         last_mark_received_at_ms: 0,
                         last_trade_id: None,
@@ -1166,6 +1338,15 @@ impl SimulationEngine {
                         ewma_spread_micro_bps: 0,
                         ewma_abs_return_pico_bps: 0,
                         ewma_spread_pico_bps: 0,
+                        ewma_signed_return_pico_bps: 0,
+                        ewma_signed_residual_pico_bps: 0,
+                        ewma_residual_drift_pico_bps: 0,
+                        ewma_signed_residual_drift_pico_bps: 0,
+                        ewma_residual_curvature_pico_bps: 0,
+                        ewma_residual_persistence_ppm: 0,
+                        last_residual_pico_bps: None,
+                        last_residual_change_pico_bps: None,
+                        last_residual_dynamics_time_ms: None,
                         ewma_adverse_markout_micro_bps: 0,
                         ewma_adverse_markout_pico_bps: 0,
                         evaluated_markouts: 0,
@@ -1184,6 +1365,7 @@ impl SimulationEngine {
                         strategy_pnl_ticks: 0,
                         funding_pnl_ticks: 0,
                         fees_ticks: 0,
+                        peak_net_pnl_ticks: 0,
                         latest_funding_rate_e8: None,
                         last_settled_funding_time_ms: 0,
                         fills: 0,
@@ -1209,7 +1391,7 @@ impl SimulationEngine {
             .collect();
         Ok(Self {
             strategy: AnchorMakerStrategy::new(entry_threshold_bps, 0),
-            strategy_variant: SimulationPolicyVariant::M4Statistical,
+            strategy_variant: SimulationPolicyVariant::CoreV1,
             max_position,
             requested_quantity,
             max_mark_index_gap_bps,
@@ -1224,6 +1406,8 @@ impl SimulationEngine {
             funding_controller_enabled: true,
             threshold_scale_ppm: 1_000_000,
             portfolio_drawdown_guard: None,
+            symbol_drawdown_soft_bps: 0,
+            symbol_drawdown_hard_bps: 0,
             position_allocations,
             capital_usdt_ticks: None,
             states,
@@ -1235,6 +1419,11 @@ impl SimulationEngine {
             filled_quantity: 0,
             rejected_entries: 0,
             gate_rejections: BTreeMap::new(),
+            gate_rejection_records: Vec::new(),
+            market_id: String::new(),
+            method_id: String::new(),
+            funding_lead_ms: 0,
+            funding_metadata_complete: false,
             peak_absolute_position: 0,
             last_event_at_ms: 0,
             last_received_at_ms: 0,
@@ -1276,7 +1465,9 @@ impl SimulationEngine {
     }
 
     fn funding_controller_active(&self) -> bool {
-        self.strategy_variant.uses_funding_controller() && self.funding_controller_enabled
+        self.strategy_variant.uses_funding_controller()
+            && self.funding_controller_enabled
+            && self.funding_metadata_complete
     }
 
     fn funding_entry_allowed_for_strategy(
@@ -1285,9 +1476,15 @@ impl SimulationEngine {
         now_ms: u64,
     ) -> bool {
         if self.strategy_variant.uses_funding_controller() && !self.funding_controller_enabled {
-            funding_entry_allowed(state, now_ms)
+            funding_entry_allowed(state, now_ms, self.funding_lead_ms)
         } else {
-            funding_entry_allowed_variant(state, now_ms, self.strategy_variant, self.fee_ppm)
+            funding_entry_allowed_variant(
+                state,
+                now_ms,
+                self.strategy_variant,
+                self.fee_ppm,
+                self.funding_lead_ms,
+            )
         }
     }
 
@@ -1315,6 +1512,17 @@ impl SimulationEngine {
         }
         self.portfolio_drawdown_guard = PortfolioDrawdownGuard::new(capital, soft, hard)
             .map_err(SimulationError::InvalidConfig)?;
+        let symbol_count = i64::try_from(self.states.len().max(1)).unwrap_or(i64::MAX);
+        self.symbol_drawdown_soft_bps = if soft == 0 {
+            0
+        } else {
+            (soft / symbol_count).max(1)
+        };
+        self.symbol_drawdown_hard_bps = if hard == 0 {
+            0
+        } else {
+            (hard / symbol_count).max(self.symbol_drawdown_soft_bps.saturating_add(1))
+        };
         self.capital_usdt_ticks = Some(capital);
         Ok(self)
     }
@@ -1325,6 +1533,123 @@ impl SimulationEngine {
             self.portfolio_drawdown_guard.as_mut(),
             s.unrealized_valuation_complete.then_some(s.net_pnl_ticks),
         )
+    }
+
+    fn update_symbol_pnl_peak(&mut self, symbol: &str) {
+        if let Some(state) = self.states.get_mut(symbol) {
+            let net_pnl = state
+                .market_pnl_ticks
+                .saturating_add(state.strategy_pnl_ticks)
+                .saturating_add(state.funding_pnl_ticks)
+                .saturating_sub(state.fees_ticks);
+            state.peak_net_pnl_ticks = state.peak_net_pnl_ticks.max(net_pnl);
+        }
+    }
+
+    fn symbol_capital(&self, symbol: &str) -> i64 {
+        self.position_allocations
+            .get(symbol)
+            .map(|allocation| allocation.budget_usdt_ticks)
+            .filter(|capital| *capital > 0)
+            .or_else(|| {
+                self.capital_usdt_ticks.map(|capital| {
+                    capital / i64::try_from(self.states.len().max(1)).unwrap_or(1).max(1)
+                })
+            })
+            .unwrap_or(0)
+    }
+
+    fn symbol_drawdown_bps(&self, symbol: &str) -> i64 {
+        let Some(state) = self.states.get(symbol) else {
+            return 0;
+        };
+        let capital = self.symbol_capital(symbol);
+        if capital <= 0 {
+            return 0;
+        }
+        let current = state
+            .market_pnl_ticks
+            .saturating_add(state.strategy_pnl_ticks)
+            .saturating_add(state.funding_pnl_ticks)
+            .saturating_sub(state.fees_ticks);
+        let loss_from_peak = state.peak_net_pnl_ticks.saturating_sub(current).max(0);
+        (i128::from(loss_from_peak)
+            .saturating_mul(10_000)
+            .checked_div(i128::from(capital.max(1)))
+            .unwrap_or(0))
+        .clamp(0, i128::from(i64::MAX)) as i64
+    }
+
+    fn symbol_risk_scaled_quantity(&self, symbol: &str, quantity: i64) -> i64 {
+        if quantity <= 0
+            || self.symbol_drawdown_soft_bps <= 0
+            || self.symbol_drawdown_hard_bps <= self.symbol_drawdown_soft_bps
+        {
+            return quantity.max(0);
+        }
+        let drawdown = self.symbol_drawdown_bps(symbol);
+        if drawdown <= self.symbol_drawdown_soft_bps {
+            return quantity;
+        }
+        if drawdown >= self.symbol_drawdown_hard_bps {
+            return 0;
+        }
+        // A linear schedule preserves some opportunity after a soft breach
+        // but drives risk to zero at the hard boundary.
+        let span = i128::from(self.symbol_drawdown_hard_bps - self.symbol_drawdown_soft_bps);
+        let remaining = i128::from(self.symbol_drawdown_hard_bps - drawdown);
+        let scale_bps = 5_000_i128 * remaining / span;
+        let scaled = i128::from(quantity) * scale_bps / 10_000_i128;
+        scaled.clamp(1, i128::from(quantity)) as i64
+    }
+
+    fn portfolio_inventory_imbalance_bps(&self) -> i64 {
+        self.states
+            .iter()
+            .map(|(symbol, state)| {
+                let max_position = self
+                    .position_allocations
+                    .get(symbol)
+                    .map(|allocation| allocation.max_position)
+                    .unwrap_or(self.max_position)
+                    .max(1);
+                i128::from(state.position) * 10_000 / i128::from(max_position)
+            })
+            .fold(0_i128, |total, value| total.saturating_add(value))
+            .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+    }
+
+    /// Robust market-region factor: the lower median of peer signed EWMAs is
+    /// used instead of a mean so one damaged symbol cannot contaminate the
+    /// whole group. It is only active with at least two observed peers.
+    fn market_trend_conflict_pico_bps(&self, symbol: &str, side: Side) -> i64 {
+        let Some(region) = profile_for(symbol).map(|profile| profile.region) else {
+            return 0;
+        };
+        let mut signed = Vec::new();
+        let mut volatility = Vec::new();
+        let mut observations = usize::MAX;
+        for (peer_symbol, state) in &self.states {
+            if profile_for(peer_symbol).map(|profile| profile.region) != Some(region) {
+                continue;
+            }
+            if state.calibration.return_abs_pico_bps.is_empty()
+                || state.ewma_abs_return_pico_bps <= 0
+            {
+                continue;
+            }
+            signed.push(state.ewma_signed_return_pico_bps);
+            volatility.push(state.ewma_abs_return_pico_bps);
+            observations = observations.min(state.calibration.return_abs_pico_bps.len());
+        }
+        if signed.len() < 2 || observations == 0 || observations == usize::MAX {
+            return 0;
+        }
+        signed.sort_unstable();
+        volatility.sort_unstable();
+        let group_signed = signed[(signed.len() - 1) / 2];
+        let group_volatility = volatility[(volatility.len() - 1) / 2];
+        directional_trend_conflict_pico_bps(group_signed, group_volatility, observations, side)
     }
 
     pub fn with_strategy_variant(mut self, variant: SimulationPolicyVariant) -> Self {
@@ -1344,6 +1669,21 @@ impl SimulationEngine {
         self
     }
 
+    pub fn with_market_context(mut self, market_id: String) -> Self {
+        self.market_id = market_id;
+        self
+    }
+
+    pub fn with_method_context(mut self, method_id: String) -> Self {
+        self.method_id = method_id;
+        self
+    }
+
+    pub fn with_funding_lead_ms(mut self, lead_ms: u64) -> Self {
+        self.funding_lead_ms = lead_ms;
+        self
+    }
+
     pub fn with_execution_filters(
         mut self,
         execution_filters: BTreeMap<String, BinanceScaledExecutionFilters>,
@@ -1353,6 +1693,9 @@ impl SimulationEngine {
     }
 
     pub fn with_funding_intervals(mut self, funding_intervals: BTreeMap<String, u32>) -> Self {
+        self.funding_metadata_complete = !funding_intervals.is_empty()
+            && funding_intervals.len() == self.states.len()
+            && funding_intervals.values().all(|hours| *hours > 0);
         for (symbol, interval_hours) in funding_intervals {
             if let Some(state) = self.states.get_mut(&symbol) {
                 state.funding_interval_hours = interval_hours.max(1);
@@ -1574,14 +1917,34 @@ impl SimulationEngine {
                     state.fees_ticks,
                     state.fills,
                 );
+                let adverse_markout_upper_pico_bps = conservative_adverse_markout_pico_bps(state);
                 let adverse_markout_bps =
-                    pico_bps_to_bps(state.ewma_adverse_markout_pico_bps).clamp(0, 100);
+                    pico_bps_to_bps(adverse_markout_upper_pico_bps).clamp(0, 100);
+                let directional_markout_bps = pico_bps_to_bps(
+                    conservative_adverse_markout_pico_bps_for_side(state, Side::Buy).max(
+                        conservative_adverse_markout_pico_bps_for_side(state, Side::Sell),
+                    ),
+                )
+                .clamp(0, 100);
+                let residual_regime_bps = pico_bps_to_bps(
+                    residual_regime_risk_pico_bps(state, Side::Buy)
+                        .max(residual_regime_risk_pico_bps(state, Side::Sell)),
+                )
+                .clamp(0, 100);
+                let market_trend_bps = pico_bps_to_bps(
+                    self.market_trend_conflict_pico_bps(symbol, Side::Buy)
+                        .max(self.market_trend_conflict_pico_bps(symbol, Side::Sell)),
+                )
+                .clamp(0, 100);
                 let risk_bps = 1_i64
                     .saturating_add(state.ewma_abs_return_bps.saturating_mul(3))
                     .saturating_add(state.ewma_spread_bps)
                     .saturating_add(gap_bps / 2)
                     .saturating_add(tail_bps / 2)
                     .saturating_add(adverse_markout_bps.saturating_mul(2))
+                    .saturating_add(directional_markout_bps)
+                    .saturating_add(residual_regime_bps)
+                    .saturating_add(market_trend_bps / 2)
                     .saturating_add(fee_drag_bps)
                     .saturating_add(post_fee_loss_bps)
                     .max(1);
@@ -1725,9 +2088,10 @@ impl SimulationEngine {
         records
     }
 
-    /// Cancels all working quotes and submits reduce-only maker orders for
-    /// residual positions. It never fabricates a fill: callers must continue
-    /// feeding market events until the returned orders actually fill.
+    /// Cancels all working quotes and submits a bounded reduce-only IOC for
+    /// residual positions. The IOC is capped by the configured participation
+    /// limit and current opposing depth; it never fabricates liquidity. Any
+    /// remaining position is deliberately reported as a failed settlement.
     pub fn flatten_all(&mut self, timestamp_ms: u64, detail: &str) -> Vec<SimulationRecord> {
         let mut records = self.cancel_all(timestamp_ms, detail);
         let symbols = self.states.keys().cloned().collect::<Vec<_>>();
@@ -1736,20 +2100,32 @@ impl SimulationEngine {
             if position == 0 {
                 continue;
             }
-            let desired = self.states[&symbol].book.map(|book| OrderIntent {
-                symbol: self.states[&symbol].symbol_id,
-                side: if position > 0 { Side::Sell } else { Side::Buy },
-                price: if position > 0 {
-                    book.ask_price_ticks
-                } else {
-                    book.bid_price_ticks
-                },
-                quantity: position.checked_abs().unwrap_or(i64::MAX),
-                post_only: true,
-                reduce_only: true,
-            });
+            let desired =
+                force_reduce_only_taker_intent(&self.states[&symbol], self.emergency_policy);
             if let Some(intent) = desired {
                 records.extend(self.place_symbol(&symbol, intent, timestamp_ms, true, None));
+                if self.states[&symbol].position != 0 {
+                    let state = self.states.get(&symbol).expect("symbol state exists");
+                    records.push(self.record(
+                        &symbol,
+                        state,
+                        timestamp_ms,
+                        RecordFields {
+                            kind: "flatten_unavailable",
+                            decision_id: None,
+                            client_id: None,
+                            side: None,
+                            price_ticks: None,
+                            quantity: Some(state.position.checked_abs().unwrap_or(i64::MAX)),
+                            order_age_ms: None,
+                            queue_ahead_quantity: None,
+                            quote_distance_bps: None,
+                            detail: Some(
+                                "reduce-only flatten attempted but residual position remains",
+                            ),
+                        },
+                    ));
+                }
             } else {
                 let state = self.states.get(&symbol).expect("symbol state exists");
                 records.push(self.record(
@@ -1766,7 +2142,9 @@ impl SimulationEngine {
                         order_age_ms: None,
                         queue_ahead_quantity: None,
                         quote_distance_bps: None,
-                        detail: Some("reduce-only maker flatten requires a valid book"),
+                        detail: Some(
+                            "reduce-only shutdown IOC requires valid opposing depth and participation capacity",
+                        ),
                     },
                 ));
             }
@@ -1774,8 +2152,8 @@ impl SimulationEngine {
         records
     }
 
-    /// Normal shutdown boundary: cancel, request maker-only flattening, and
-    /// return a settlement that explicitly distinguishes flat, pending, and
+    /// Normal shutdown boundary: cancel, request bounded reduce-only flattening,
+    /// and return a settlement that explicitly distinguishes flat, pending, and
     /// unflattened residual states.
     pub fn shutdown(&mut self, timestamp_ms: u64, detail: &str) -> FinalSettlement {
         let flatten_requested = self.states.values().any(|state| state.position != 0);
@@ -1799,9 +2177,31 @@ impl SimulationEngine {
         }
     }
 
-    fn reject_entry(&mut self, owner: &'static str) {
+    fn reject_entry(&mut self, owner: &str) {
         self.rejected_entries = self.rejected_entries.saturating_add(1);
         *self.gate_rejections.entry(owner.to_owned()).or_default() += 1;
+    }
+
+    fn reject_entry_structured(
+        &mut self,
+        symbol: &str,
+        reason: &str,
+        source: &str,
+        threshold: Option<i64>,
+        observed_value: Option<i64>,
+        timestamp_ms: u64,
+    ) {
+        self.reject_entry(reason);
+        self.gate_rejection_records.push(GateRejectionRecord {
+            reason: reason.to_owned(),
+            symbol: symbol.to_owned(),
+            market: self.market_id.clone(),
+            method: self.method_id.clone(),
+            source: source.to_owned(),
+            threshold,
+            observed_value,
+            timestamp_ms,
+        });
     }
 
     pub fn summary(&self) -> SimulationSummary {
@@ -1838,6 +2238,7 @@ impl SimulationEngine {
             filled_quantity: self.filled_quantity,
             rejected_entries: self.rejected_entries,
             gate_rejections: self.gate_rejections.clone(),
+            gate_rejection_records: self.gate_rejection_records.clone(),
             realized_pnl_ticks,
             unrealized_pnl_ticks,
             market_pnl_ticks,
@@ -1855,6 +2256,7 @@ impl SimulationEngine {
             taker_fee_ppm: self.emergency_policy.taker_fee_ppm,
             unrealized_valuation_complete,
             current_absolute_position,
+            portfolio_inventory_imbalance_bps: self.portfolio_inventory_imbalance_bps(),
             peak_absolute_position: self.peak_absolute_position,
             working_orders,
             flat_at_end,
@@ -2014,6 +2416,10 @@ impl SimulationEngine {
                     SimulationRiskState::HaltMarketData
                 } else if !anchor_allowed {
                     SimulationRiskState::HaltAnchor
+                } else if self.symbol_drawdown_hard_bps > 0
+                    && self.symbol_drawdown_bps(symbol) >= self.symbol_drawdown_hard_bps
+                {
+                    SimulationRiskState::ReduceOnlySymbolDrawdown
                 } else if self.strategy_variant.uses_tail_guard() && m5_tail_reduce_only(state) {
                     SimulationRiskState::ReduceOnlyTailRisk
                 } else if !funding_known {
@@ -2047,6 +2453,10 @@ impl SimulationEngine {
                     self.last_event_at_ms
                         .saturating_sub(state.last_mark_time_ms)
                 });
+                let book_age_ms = (state.last_book_event_at_ms > 0).then(|| {
+                    self.last_event_at_ms
+                        .saturating_sub(state.last_book_event_at_ms)
+                });
                 let reference_ticks = fair_value
                     .map(|estimate| estimate.price.0)
                     .unwrap_or(state.anchor.close_price_ticks);
@@ -2058,6 +2468,7 @@ impl SimulationEngine {
                 let sell_edge_bps = sell_edge_pico_bps.map(pico_bps_to_bps);
                 let buy_edge_micro_bps = buy_edge_pico_bps.map(pico_bps_to_micro);
                 let sell_edge_micro_bps = sell_edge_pico_bps.map(pico_bps_to_micro);
+                let adverse_markout_upper_pico_bps = conservative_adverse_markout_pico_bps(state);
                 let entry_block_reason = entry_block_reason_for(
                     state,
                     risk_state,
@@ -2073,6 +2484,7 @@ impl SimulationEngine {
                     risk_state.label(),
                     entry_block_reason,
                 );
+                let symbol_drawdown_bps = self.symbol_drawdown_bps(symbol);
 
                 SymbolMetrics {
                     symbol: symbol.clone(),
@@ -2138,6 +2550,7 @@ impl SimulationEngine {
                         .saturating_add(state.strategy_pnl_ticks)
                         .saturating_add(state.funding_pnl_ticks)
                         .saturating_sub(state.fees_ticks),
+                    symbol_drawdown_bps,
                     risk_metrics: None,
                     anchor_age_ms,
                     anchor_final_close: state.anchor.observed_at_ms == 0
@@ -2146,7 +2559,12 @@ impl SimulationEngine {
                     next_funding_time_ms: state.next_funding_time_ms,
                     latest_funding_rate_e8: state.latest_funding_rate_e8,
                     funding_flatten_deadline_ms: (!funding_controller_active)
-                        .then(|| funding_flatten_deadline(state.next_funding_time_ms))
+                        .then(|| {
+                            funding_flatten_deadline(
+                                state.next_funding_time_ms,
+                                self.funding_lead_ms,
+                            )
+                        })
                         .flatten(),
                     funding_action: if self.strategy_variant.uses_funding_controller()
                         && !self.funding_controller_enabled
@@ -2169,6 +2587,7 @@ impl SimulationEngine {
                     entry_block_reason: labels.1.to_owned(),
                     data_quality,
                     mark_age_ms,
+                    book_age_ms,
                     bid_price_ticks,
                     ask_price_ticks,
                     anchor_price_ticks: state.anchor.close_price_ticks,
@@ -2180,11 +2599,34 @@ impl SimulationEngine {
                     ewma_spread_micro_bps: state.ewma_spread_micro_bps,
                     ewma_abs_return_pico_bps: state.ewma_abs_return_pico_bps,
                     ewma_spread_pico_bps: state.ewma_spread_pico_bps,
+                    ewma_signed_return_pico_bps: state.ewma_signed_return_pico_bps,
+                    ewma_signed_residual_pico_bps: state.ewma_signed_residual_pico_bps,
+                    ewma_residual_drift_pico_bps: state.ewma_residual_drift_pico_bps,
+                    ewma_signed_residual_drift_pico_bps: state.ewma_signed_residual_drift_pico_bps,
+                    ewma_residual_curvature_pico_bps: state.ewma_residual_curvature_pico_bps,
+                    ewma_residual_persistence_ppm: state.ewma_residual_persistence_ppm,
+                    residual_regime_risk_pico_bps: residual_regime_risk_pico_bps(state, Side::Buy)
+                        .max(residual_regime_risk_pico_bps(state, Side::Sell)),
+                    residual_regime_scale_ppm: residual_regime_scale_ppm(state),
+                    trend_persistence_bps: trend_persistence_bps(state),
+                    buy_trend_conflict_pico_bps: trend_conflict_pico_bps(state, Side::Buy),
+                    sell_trend_conflict_pico_bps: trend_conflict_pico_bps(state, Side::Sell),
+                    buy_market_trend_conflict_pico_bps: self
+                        .market_trend_conflict_pico_bps(symbol, Side::Buy),
+                    sell_market_trend_conflict_pico_bps: self
+                        .market_trend_conflict_pico_bps(symbol, Side::Sell),
+                    reversion_evidence_lower_bps: reversion_evidence_lower_bps(state),
+                    reversion_evidence_scale_ppm: reversion_evidence_scale_ppm(state),
                     ewma_adverse_markout_bps: pico_bps_to_bps(state.ewma_adverse_markout_pico_bps),
                     ewma_adverse_markout_micro_bps: pico_bps_to_micro(
                         state.ewma_adverse_markout_pico_bps,
                     ),
                     ewma_adverse_markout_pico_bps: state.ewma_adverse_markout_pico_bps,
+                    adverse_markout_upper_pico_bps,
+                    buy_adverse_markout_upper_pico_bps:
+                        conservative_adverse_markout_pico_bps_for_side(state, Side::Buy),
+                    sell_adverse_markout_upper_pico_bps:
+                        conservative_adverse_markout_pico_bps_for_side(state, Side::Sell),
                     evaluated_markouts: state.evaluated_markouts,
                     adverse_markouts: state.adverse_markouts,
                     adaptive_relief_bps: state.adaptive_relief_bps,
@@ -2205,6 +2647,11 @@ impl SimulationEngine {
                     liquidity_fill_probability_bps: state.book.map(|book| {
                         fill_probability_bps(quote_quantity, book.bid_quantity, book.ask_quantity)
                     }),
+                    empirical_fill_probability_lcb_bps: empirical_fill_probability_lcb_bps(state),
+                    buy_empirical_fill_probability_lcb_bps:
+                        empirical_fill_probability_lcb_bps_for_side(state, Side::Buy),
+                    sell_empirical_fill_probability_lcb_bps:
+                        empirical_fill_probability_lcb_bps_for_side(state, Side::Sell),
                     fair_value_ticks: fair_value.map(|estimate| estimate.price.0),
                     fair_value_confidence_bps: fair_value.map(|estimate| estimate.confidence_bps),
                     market_regime: fair_value.map(|estimate| estimate.regime.label().to_owned()),
@@ -2265,6 +2712,7 @@ impl SimulationEngine {
             gross_pnl_ticks: summary.gross_pnl_ticks,
             net_pnl_ticks: summary.net_pnl_ticks,
             current_absolute_position: summary.current_absolute_position,
+            portfolio_inventory_imbalance_bps: summary.portfolio_inventory_imbalance_bps,
             symbols: self
                 .states
                 .iter()
@@ -2406,6 +2854,11 @@ impl SimulationEngine {
                 spread_pico_bps,
                 residual_pico_bps_for_state(state),
             );
+            observe_residual_dynamics(
+                state,
+                ticker.event_time_ms,
+                residual_pico_bps_for_state(state),
+            );
         } else {
             return Vec::new();
         }
@@ -2444,8 +2897,16 @@ impl SimulationEngine {
                     let change_pico_bps =
                         (change.abs() * 10_000 * i128::from(PICO_BPS_SCALE) / i128::from(previous))
                             .clamp(0, i128::from(i64::MAX)) as i64;
+                    let signed_change_pico_bps = (change * 10_000 * i128::from(PICO_BPS_SCALE)
+                        / i128::from(previous))
+                    .clamp(i128::from(i64::MIN), i128::from(i64::MAX))
+                        as i64;
                     state.ewma_abs_return_pico_bps =
                         ewma_scaled(state.ewma_abs_return_pico_bps, change_pico_bps);
+                    state.ewma_signed_return_pico_bps = ewma_signed_scaled(
+                        state.ewma_signed_return_pico_bps,
+                        signed_change_pico_bps,
+                    );
                     state.ewma_abs_return_micro_bps =
                         pico_bps_to_micro(state.ewma_abs_return_pico_bps);
                     state.ewma_abs_return_bps = pico_bps_to_bps(state.ewma_abs_return_pico_bps);
@@ -2473,6 +2934,7 @@ impl SimulationEngine {
             state.mark_price_ticks = Some(mark.mark_price.0);
             state.index_price_ticks = Some(mark.index_price.0);
             let residual = residual_pico_bps_for_state(state);
+            observe_residual_dynamics(state, mark.event_time_ms, residual);
             state
                 .calibration
                 .observe_market(mark.event_time_ms, return_sample, None, residual);
@@ -2633,9 +3095,9 @@ impl SimulationEngine {
                 Side::Buy => book.bid_quantity,
                 Side::Sell => book.ask_quantity,
             };
-            state.calibration.observe_fill(
+            state.calibration.observe_fill_side(
                 trade.event_time_ms.max(trade.trade_time_ms),
-                order.placed_at_ms,
+                order.side,
                 quantity,
                 displayed_depth,
             );
@@ -2763,6 +3225,7 @@ impl SimulationEngine {
     fn rebalance_symbol(&mut self, symbol: &str, timestamp_ms: u64) -> Vec<SimulationRecord> {
         let decision_id = self.next_decision_id;
         self.next_decision_id = self.next_decision_id.saturating_add(1);
+        self.update_symbol_pnl_peak(symbol);
         let allocation = self.position_allocations.get(symbol);
         let max_position = allocation
             .map(|allocation| allocation.max_position)
@@ -2770,7 +3233,24 @@ impl SimulationEngine {
         let requested_quantity = allocation
             .map(|allocation| allocation.requested_quantity)
             .unwrap_or(self.requested_quantity);
+        let symbol_drawdown_bps = self.symbol_drawdown_bps(symbol);
+        let symbol_reduce_only = self.symbol_drawdown_hard_bps > 0
+            && symbol_drawdown_bps >= self.symbol_drawdown_hard_bps;
+        let requested_quantity = self.symbol_risk_scaled_quantity(symbol, requested_quantity);
+        let portfolio_inventory_imbalance_bps = self.portfolio_inventory_imbalance_bps();
         let strategy_variant = self.strategy_variant;
+        let market_buy_trend_conflict_pico_bps =
+            if strategy_variant == SimulationPolicyVariant::M0Fixed {
+                0
+            } else {
+                self.market_trend_conflict_pico_bps(symbol, Side::Buy)
+            };
+        let market_sell_trend_conflict_pico_bps =
+            if strategy_variant == SimulationPolicyVariant::M0Fixed {
+                0
+            } else {
+                self.market_trend_conflict_pico_bps(symbol, Side::Sell)
+            };
         let portfolio_drawdown_action = self.observe_portfolio_drawdown();
         self.update_adaptive_threshold_controller(
             symbol,
@@ -2778,7 +3258,7 @@ impl SimulationEngine {
             max_position,
             requested_quantity,
         );
-        let (desired, reduce_only, has_working, decision_reason) = {
+        let (mut desired, reduce_only, has_working, mut decision_reason) = {
             let state = self.states.get(symbol).expect("symbol state exists");
             let Some(book) = state.book else {
                 return Vec::new();
@@ -2818,10 +3298,12 @@ impl SimulationEngine {
                 .as_ref()
                 .is_some_and(|overlay| overlay.reduce_only);
             let portfolio_reduce_only = portfolio_drawdown_action.blocks_new_risk();
-            let entries_allowed = session_allowed && funding_allowed && !portfolio_reduce_only;
+            let entries_allowed =
+                session_allowed && funding_allowed && !portfolio_reduce_only && !symbol_reduce_only;
             let tail_reduce_only = strategy_variant.uses_tail_guard() && m5_tail_reduce_only(state);
             if !entries_allowed || tail_reduce_only {
-                let should_reduce = (portfolio_reduce_only && state.position != 0)
+                let should_reduce = ((portfolio_reduce_only || symbol_reduce_only)
+                    && state.position != 0)
                     || position_requires_reduction(
                         state.position,
                         session_allowed,
@@ -2836,6 +3318,8 @@ impl SimulationEngine {
                         state.working.is_some(),
                         if portfolio_reduce_only {
                             portfolio_drawdown_action.label()
+                        } else if symbol_reduce_only {
+                            "symbol_drawdown_hard_stop"
                         } else {
                             entry_restriction_reason(
                                 state.position,
@@ -2851,9 +3335,12 @@ impl SimulationEngine {
                         timestamp_ms,
                         self.quantity_scale,
                         self.emergency_policy,
+                        self.execution_filters.get(symbol).copied(),
                         self.fee_ppm,
                         self.max_mark_index_gap_bps,
                         state.funding_interval_hours,
+                        self.funding_lead_ms,
+                        strategy_variant.uses_tail_guard(),
                     );
                     (desired, true, state.working.is_some(), exit_reason)
                 }
@@ -2865,6 +3352,7 @@ impl SimulationEngine {
                     requested_quantity,
                     self.max_mark_index_gap_bps,
                     self.fee_ppm,
+                    self.funding_lead_ms,
                 );
                 let evidence_ok = reduce_only
                     || dynamic_threshold_for(
@@ -2903,7 +3391,7 @@ impl SimulationEngine {
                     && book.bid_quantity > 0
                     && book.ask_quantity > 0
                     && mark_index_ok
-                    && signal_age_ms <= 5_000
+                    && signal_age_ms <= binance_runtime_config().operational.max_signal_age_ms
                     && state.anchor.valid_at(timestamp_ms, self.max_anchor_age_ms)
                     && (!self.live_risk_gates
                         || state.anchor.observed_at_ms == 0
@@ -2964,12 +3452,77 @@ impl SimulationEngine {
                     } else if m7_blocked {
                         None
                     } else {
+                        let buy_queue_ahead = if state.local_book.is_valid() {
+                            state.local_book.quantity_at(true, book.bid_price_ticks)
+                        } else {
+                            book.bid_quantity
+                        };
+                        let sell_queue_ahead = if state.local_book.is_valid() {
+                            state.local_book.quantity_at(false, book.ask_price_ticks)
+                        } else {
+                            book.ask_quantity
+                        };
+                        // Estimate the two queues as separate competing-risk
+                        // processes. A shared minimum was safe but overly
+                        // destructive: one congested side erased the other
+                        // side's valid conditional value.
+                        let queue_fill_probabilities_bps = queue_aware_fill_probability_bps_by_side(
+                            quantity,
+                            book.bid_quantity,
+                            book.ask_quantity,
+                            buy_queue_ahead,
+                            sell_queue_ahead,
+                        );
+                        let fill_probabilities_bps = effective_fill_probability_bps_by_side(
+                            state,
+                            queue_fill_probabilities_bps,
+                        );
                         let fill_probability_bps =
-                            fill_probability_bps(quantity, book.bid_quantity, book.ask_quantity);
-                        let (buy_micro_adverse_bps, sell_micro_adverse_bps) =
-                            side_adverse_selection_bps(book.bid_quantity, book.ask_quantity);
+                            fill_probabilities_bps.0.min(fill_probabilities_bps.1);
                         let (buy_pico_adverse_bps, sell_pico_adverse_bps) =
                             side_adverse_selection_pico_bps(book.bid_quantity, book.ask_quantity);
+                        let buy_trend_conflict_pico_bps =
+                            if strategy_variant == SimulationPolicyVariant::M0Fixed {
+                                0
+                            } else {
+                                trend_conflict_pico_bps(state, Side::Buy)
+                                    .max(market_buy_trend_conflict_pico_bps)
+                            };
+                        let sell_trend_conflict_pico_bps =
+                            if strategy_variant == SimulationPolicyVariant::M0Fixed {
+                                0
+                            } else {
+                                trend_conflict_pico_bps(state, Side::Sell)
+                                    .max(market_sell_trend_conflict_pico_bps)
+                            };
+                        let buy_adverse_pico_bps = (if strategy_variant.uses_microstructure() {
+                            buy_pico_adverse_bps
+                        } else {
+                            0
+                        })
+                        .saturating_add(buy_trend_conflict_pico_bps);
+                        let sell_adverse_pico_bps = (if strategy_variant.uses_microstructure() {
+                            sell_pico_adverse_bps
+                        } else {
+                            0
+                        })
+                        .saturating_add(sell_trend_conflict_pico_bps);
+                        // The base hurdle already contains the aggregate
+                        // markout upper bound. Add only the excess observed on
+                        // the selected side, so directionally good fills are
+                        // not charged for the opposite-side tail.
+                        let aggregate_markout_pico_bps =
+                            conservative_adverse_markout_pico_bps(state);
+                        let buy_markout_excess =
+                            conservative_adverse_markout_pico_bps_for_side(state, Side::Buy)
+                                .saturating_sub(aggregate_markout_pico_bps);
+                        let sell_markout_excess =
+                            conservative_adverse_markout_pico_bps_for_side(state, Side::Sell)
+                                .saturating_sub(aggregate_markout_pico_bps);
+                        let buy_adverse_pico_bps =
+                            buy_adverse_pico_bps.saturating_add(buy_markout_excess);
+                        let sell_adverse_pico_bps =
+                            sell_adverse_pico_bps.saturating_add(sell_markout_excess);
                         let fair_value = fair_value_for_state(state);
                         let signal_reference = fair_value
                             .map(|estimate| estimate.price.0)
@@ -2994,32 +3547,19 @@ impl SimulationEngine {
                             threshold,
                             threshold_relief_micro_bps: state.adaptive_relief_micro_bps,
                             threshold_relief_pico_bps: state.adaptive_relief_pico_bps,
-                            inventory_skew_bps: 50,
-                            inventory_skew_pico_bps: 50 * PICO_BPS_SCALE,
-                            buy_adverse_selection_bps: if strategy_variant.uses_microstructure() {
-                                buy_micro_adverse_bps
-                            } else {
-                                0
-                            },
-                            sell_adverse_selection_bps: if strategy_variant.uses_microstructure() {
-                                sell_micro_adverse_bps
-                            } else {
-                                0
-                            },
-                            buy_adverse_selection_pico_bps: if strategy_variant
-                                .uses_microstructure()
-                            {
-                                buy_pico_adverse_bps
-                            } else {
-                                0
-                            },
-                            sell_adverse_selection_pico_bps: if strategy_variant
-                                .uses_microstructure()
-                            {
-                                sell_pico_adverse_bps
-                            } else {
-                                0
-                            },
+                            inventory_skew_bps: binance_runtime_config()
+                                .operational
+                                .default_inventory_skew_bps,
+                            inventory_skew_pico_bps: binance_runtime_config()
+                                .operational
+                                .default_inventory_skew_bps
+                                * PICO_BPS_SCALE,
+                            buy_adverse_selection_bps: pico_bps_to_bps(buy_adverse_pico_bps),
+                            sell_adverse_selection_bps: pico_bps_to_bps(sell_adverse_pico_bps),
+                            buy_adverse_selection_pico_bps: buy_adverse_pico_bps,
+                            sell_adverse_selection_pico_bps: sell_adverse_pico_bps,
+                            buy_fill_probability_bps: fill_probabilities_bps.0,
+                            sell_fill_probability_bps: fill_probabilities_bps.1,
                             fill_probability_bps,
                             confidence_bps: 10_000_i64
                                 .saturating_sub(fair_value_confidence_bps.saturating_mul(50))
@@ -3029,9 +3569,44 @@ impl SimulationEngine {
                             fill_aware: strategy_variant.uses_fill_gate(),
                             max_mark_index_gap_bps: self.max_mark_index_gap_bps,
                             signal_age_ms,
-                            max_signal_age_ms: 5_000,
+                            max_signal_age_ms: binance_runtime_config()
+                                .operational
+                                .max_signal_age_ms,
                         });
-                        input.and_then(AnchorMakerStrategy::generate_adaptive_intent)
+                        input
+                            .and_then(AnchorMakerStrategy::generate_adaptive_intent)
+                            .and_then(|mut intent| {
+                                if strategy_variant == SimulationPolicyVariant::CoreV1 {
+                                    if let Some(threshold) = threshold {
+                                        intent.quantity = core_v1_margin_scaled_quantity(
+                                            state, intent, threshold,
+                                        );
+                                    }
+                                }
+                                let side_fill_probability_bps = match intent.side {
+                                    Side::Buy => fill_probabilities_bps.0,
+                                    Side::Sell => fill_probabilities_bps.1,
+                                };
+                                intent.quantity = fill_probability_scaled_quantity(
+                                    side_fill_probability_bps,
+                                    intent.quantity,
+                                );
+                                let trend_conflict = match intent.side {
+                                    Side::Buy => trend_conflict_pico_bps(state, Side::Buy)
+                                        .max(market_buy_trend_conflict_pico_bps),
+                                    Side::Sell => trend_conflict_pico_bps(state, Side::Sell)
+                                        .max(market_sell_trend_conflict_pico_bps),
+                                };
+                                intent.quantity =
+                                    trend_conflict_scaled_quantity(trend_conflict, intent.quantity);
+                                intent.quantity = cross_symbol_concentration_scaled_quantity(
+                                    portfolio_inventory_imbalance_bps,
+                                    state.position,
+                                    intent.side,
+                                    intent.quantity,
+                                );
+                                (intent.quantity > 0).then_some(intent)
+                            })
                     };
                     let reason = if intent.is_some() {
                         "admissible"
@@ -3044,6 +3619,61 @@ impl SimulationEngine {
                 }
             }
         };
+
+        // L3 execution-feasibility admission: project a maker entry through
+        // the authoritative exchange filters before it reaches placement.
+        // Signal sizing is a risk budget, while Binance filters define a
+        // discrete feasible set.  The projection may increase a tiny intent
+        // to the minimum tradable step/notional, but never beyond the
+        // remaining position capacity.  If the feasible set is empty, fail
+        // closed here with an explainable gate instead of producing a burst
+        // of exchange-level rejects later in the event loop.
+        if let Some(mut intent) = desired {
+            if !reduce_only {
+                if let Some(filters) = self.execution_filters.get(symbol).copied() {
+                    let current_position = self
+                        .states
+                        .get(symbol)
+                        .map(|state| state.position.checked_abs().unwrap_or(i64::MAX))
+                        .unwrap_or_default();
+                    let maximum_quantity = self
+                        .position_allocations
+                        .get(symbol)
+                        .map(|allocation| allocation.max_position.saturating_sub(current_position))
+                        .unwrap_or(self.max_position.saturating_sub(current_position));
+                    let requested_price = intent.price;
+                    let requested_quantity = intent.quantity;
+                    let projected = filters
+                        .normalize_price(intent.price, intent.side == Side::Buy, intent.post_only)
+                        .and_then(|price| {
+                            filters
+                                .normalize_quantity(
+                                    intent.quantity,
+                                    price,
+                                    maximum_quantity,
+                                    self.quantity_scale,
+                                )
+                                .map(|quantity| (price, quantity))
+                        });
+                    match projected {
+                        Ok((price, quantity)) => {
+                            intent.price = price;
+                            intent.quantity = quantity;
+                            if quantity != requested_quantity {
+                                decision_reason = "exchange_quantity_projected";
+                            } else if price != requested_price {
+                                decision_reason = "exchange_price_projected";
+                            }
+                            desired = Some(intent);
+                        }
+                        Err(reason) => {
+                            desired = None;
+                            decision_reason = reason;
+                        }
+                    }
+                }
+            }
+        }
         if desired.is_none() {
             let outcome = if has_working {
                 "cancel_pending"
@@ -3082,7 +3712,25 @@ impl SimulationEngine {
                 }));
                 record
             };
-            self.reject_entry(decision_reason);
+            let rejection_source = if decision_reason.starts_with("exchange_") {
+                "binance_exchange_filters_pre_admission"
+            } else {
+                "strategy_risk_gate"
+            };
+            self.reject_entry_structured(
+                symbol,
+                decision_reason,
+                rejection_source,
+                rejection_threshold_bps(
+                    self,
+                    symbol,
+                    timestamp_ms,
+                    requested_quantity,
+                    max_position,
+                ),
+                rejection_observed_edge_bps(self, symbol),
+                timestamp_ms,
+            );
             if has_working {
                 let mut records = vec![decision_record];
                 records.extend(self.cancel_symbol(
@@ -3177,17 +3825,64 @@ impl SimulationEngine {
     fn place_symbol(
         &mut self,
         symbol: &str,
-        intent: OrderIntent,
+        mut intent: OrderIntent,
         timestamp_ms: u64,
         reduce_only: bool,
         decision_id: Option<u64>,
     ) -> Vec<SimulationRecord> {
         if let Some(filters) = self.execution_filters.get(symbol).copied() {
+            match filters.normalize_price(intent.price, intent.side == Side::Buy, intent.post_only)
+            {
+                Ok(price) => intent.price = price,
+                Err(reason) => {
+                    self.reject_entry_structured(
+                        symbol,
+                        reason,
+                        "binance_exchange_filters",
+                        Some(filters.price_tick),
+                        Some(intent.price),
+                        timestamp_ms,
+                    );
+                    return Vec::new();
+                }
+            }
             let mark_price_ticks = self
                 .states
                 .get(symbol)
                 .and_then(|state| state.mark_price_ticks)
                 .unwrap_or_default();
+            let current_position = self
+                .states
+                .get(symbol)
+                .map(|state| state.position.checked_abs().unwrap_or(i64::MAX))
+                .unwrap_or_default();
+            let maximum_quantity = if reduce_only {
+                current_position
+            } else {
+                self.position_allocations
+                    .get(symbol)
+                    .map(|allocation| allocation.max_position.saturating_sub(current_position))
+                    .unwrap_or(self.max_position.saturating_sub(current_position))
+            };
+            match filters.normalize_quantity(
+                intent.quantity,
+                intent.price,
+                maximum_quantity,
+                self.quantity_scale,
+            ) {
+                Ok(quantity) => intent.quantity = quantity,
+                Err(reason) => {
+                    self.reject_entry_structured(
+                        symbol,
+                        reason,
+                        "binance_exchange_filters",
+                        Some(filters.min_notional_price_ticks),
+                        Some(intent.quantity),
+                        timestamp_ms,
+                    );
+                    return Vec::new();
+                }
+            }
             if let Err(reason) = filters.validate_order(
                 intent.price,
                 intent.quantity,
@@ -3195,7 +3890,14 @@ impl SimulationEngine {
                 intent.side == Side::Buy,
                 self.quantity_scale,
             ) {
-                self.reject_entry(reason);
+                self.reject_entry_structured(
+                    symbol,
+                    reason,
+                    "binance_exchange_filters",
+                    Some(filters.min_notional_price_ticks),
+                    Some(intent.quantity),
+                    timestamp_ms,
+                );
                 return Vec::new();
             }
         }
@@ -3205,11 +3907,25 @@ impl SimulationEngine {
         let client_id = self.next_client_id;
         if intent.is_emergency_taker() {
             if !reduce_only {
-                self.reject_entry("execution_taker_not_reduce_only");
+                self.reject_entry_structured(
+                    symbol,
+                    "execution_taker_not_reduce_only",
+                    "execution_policy",
+                    None,
+                    None,
+                    timestamp_ms,
+                );
                 return Vec::new();
             }
             let Some(book) = self.states.get(symbol).and_then(|state| state.book) else {
-                self.reject_entry("execution_taker_invalid_book");
+                self.reject_entry_structured(
+                    symbol,
+                    "execution_taker_invalid_book",
+                    "execution_policy",
+                    None,
+                    None,
+                    timestamp_ms,
+                );
                 return Vec::new();
             };
             let crosses = match intent.side {
@@ -3217,14 +3933,28 @@ impl SimulationEngine {
                 Side::Sell => intent.price <= book.bid_price_ticks,
             };
             if !crosses {
-                self.reject_entry("execution_taker_not_aggressive");
+                self.reject_entry_structured(
+                    symbol,
+                    "execution_taker_not_aggressive",
+                    "execution_policy",
+                    None,
+                    Some(intent.price),
+                    timestamp_ms,
+                );
                 return Vec::new();
             }
             let position = self.states[symbol].position;
             if (intent.side == Side::Buy && position >= 0)
                 || (intent.side == Side::Sell && position <= 0)
             {
-                self.reject_entry("execution_taker_not_reducing");
+                self.reject_entry_structured(
+                    symbol,
+                    "execution_taker_not_reducing",
+                    "execution_policy",
+                    None,
+                    Some(position),
+                    timestamp_ms,
+                );
                 return Vec::new();
             }
             let quantity = intent
@@ -3289,7 +4019,14 @@ impl SimulationEngine {
             ];
         }
         if !intent.post_only {
-            self.reject_entry("execution_maker_validation");
+            self.reject_entry_structured(
+                symbol,
+                "execution_maker_validation",
+                "execution_policy",
+                None,
+                Some(intent.price),
+                timestamp_ms,
+            );
             return Vec::new();
         }
         self.next_client_id = self.next_client_id.saturating_add(1);
@@ -3302,7 +4039,14 @@ impl SimulationEngine {
             Side::Sell => intent.price >= book.ask_price_ticks,
         };
         if !maker_valid {
-            self.reject_entry("execution_maker_validation");
+            self.reject_entry_structured(
+                symbol,
+                "execution_maker_validation",
+                "execution_policy",
+                None,
+                Some(intent.price),
+                timestamp_ms,
+            );
             return Vec::new();
         }
         if reduce_only
@@ -3344,7 +4088,9 @@ impl SimulationEngine {
                 .saturating_add(self.realism.latency.total_entry_ms()),
             cancel_requested_at_ms: None,
         });
-        state.calibration.observe_order_placed(timestamp_ms);
+        state
+            .calibration
+            .observe_order_placed_side(timestamp_ms, intent.side);
         self.order_count = self.order_count.saturating_add(1);
         let state = self.states.get(symbol).expect("symbol state exists");
         vec![self.record(
@@ -3491,7 +4237,7 @@ fn decision_audit(context: DecisionAuditContext<'_>) -> DecisionAudit {
         && context
             .timestamp_ms
             .saturating_sub(context.state.last_mark_time_ms)
-            <= 5_000;
+            <= binance_runtime_config().operational.max_signal_age_ms;
     let anchor_valid = context
         .state
         .anchor
@@ -3509,6 +4255,7 @@ fn decision_audit(context: DecisionAuditContext<'_>) -> DecisionAudit {
             context.timestamp_ms,
             context.engine.strategy_variant,
             context.engine.fee_ppm,
+            context.engine.funding_lead_ms,
         );
     let effective_quantity = book
         .map(|book| {
@@ -3660,6 +4407,7 @@ fn m9_intent_for_state(
     requested_quantity: i64,
     max_mark_index_gap_bps: i64,
     fee_ppm: i64,
+    funding_lead_ms: u64,
 ) -> (Option<OrderIntent>, bool, &'static str) {
     let Some(book) = state.book else {
         return (None, false, "m9_market_book_unavailable");
@@ -3667,7 +4415,8 @@ fn m9_intent_for_state(
     let Some(fair_value) = fair_value_for_state(state) else {
         return (None, false, "m9_fair_value_unavailable");
     };
-    let Some(deadline_ms) = funding_flatten_deadline(state.next_funding_time_ms) else {
+    let Some(deadline_ms) = funding_flatten_deadline(state.next_funding_time_ms, funding_lead_ms)
+    else {
         return (None, false, "m9_deadline_unavailable");
     };
     let mark = state.mark_price_ticks.unwrap_or(0);
@@ -3706,7 +4455,14 @@ fn m9_intent_for_state(
         .calibration
         .snapshot(ppm_to_pico_bps(fee_ppm.saturating_mul(2)));
     let Some(calibration) = calibration_snapshot.calibration else {
-        return (None, false, "m9_calibration_unavailable");
+        // Separate a causal warm-up state from a malformed/invalid snapshot.
+        // They must not share one rejection bucket when judging whether M9 has
+        // enough evidence to become a challenger.
+        let reason = match calibration_snapshot.status {
+            CalibrationStatus::InsufficientHistory => "m9_calibration_warming_up",
+            CalibrationStatus::Calibrated => "m9_calibration_invalid",
+        };
+        return (None, false, reason);
     };
     let decision = decide_m9(
         M9Input {
@@ -3731,7 +4487,7 @@ fn m9_intent_for_state(
                 .map(|rate| -rate / 10_000)
                 .unwrap_or(0),
             fee_bps: ppm_to_bps(fee_ppm.saturating_mul(2)),
-            markout_bps: pico_bps_to_bps(state.ewma_adverse_markout_pico_bps),
+            markout_bps: pico_bps_to_bps(conservative_adverse_markout_pico_bps(state)),
             volatility_pico_bps: state.ewma_abs_return_pico_bps.saturating_mul(3),
             spread_pico_bps: state.ewma_spread_pico_bps,
             funding_carry_pico_bps: state
@@ -3743,7 +4499,7 @@ fn m9_intent_for_state(
                 })
                 .unwrap_or(0),
             fee_pico_bps: ppm_to_pico_bps(fee_ppm.saturating_mul(2)),
-            markout_pico_bps: state.ewma_adverse_markout_pico_bps,
+            markout_pico_bps: conservative_adverse_markout_pico_bps(state),
             data_valid,
             funding_valid,
         },
@@ -3813,15 +4569,19 @@ fn entry_restriction_reason(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn maker_exit_intent_for_state(
     symbol: &str,
     state: &SimulationSymbolState,
     timestamp_ms: u64,
     quantity_scale: u32,
     emergency_policy: EmergencyExecutionPolicy,
+    execution_filters: Option<BinanceScaledExecutionFilters>,
     fee_ppm: i64,
     max_mark_index_gap_bps: i64,
     funding_interval_hours: u32,
+    funding_lead_ms: u64,
+    tail_guard_enabled: bool,
 ) -> (Option<OrderIntent>, &'static str) {
     let Some(position_quantity) = state.position.checked_abs() else {
         return (None, "maker_exit_position_overflow");
@@ -3850,8 +4610,10 @@ fn maker_exit_intent_for_state(
         timestamp_ms,
         next_equity_pre_open_at_ms(symbol, timestamp_ms),
         funding,
-        30 * 60 * 1_000,
-        5 * 60 * 1_000,
+        binance_runtime_config()
+            .operational
+            .default_maker_flatten_horizon_ms,
+        funding_lead_ms,
     ) else {
         return (None, "maker_exit_plan_invalid");
     };
@@ -3862,9 +4624,7 @@ fn maker_exit_intent_for_state(
     let maker_estimated_time_ms = calibration
         .map(|value| value.fill_horizon_ms)
         .unwrap_or_default();
-    let maker_confidence_bps = calibration
-        .map(|value| value.fill_hazard_bps.clamp(0, 10_000) as u16)
-        .unwrap_or(10_000);
+    let maker_confidence_bps = calibrated_maker_confidence_bps(calibration);
     let mark_index_gap_bps = match (state.mark_price_ticks, state.index_price_ticks) {
         (Some(mark), Some(index)) if mark > 0 && index > 0 => Some(bps_between(mark, index)),
         _ => None,
@@ -3873,9 +4633,17 @@ fn maker_exit_intent_for_state(
         .working
         .map(|order| order.remaining_quantity)
         .unwrap_or(position_quantity);
+    // Tail-risk reduction is an immediate risk action. Reusing the normal
+    // deadline would allow a stale maker quote to keep a large position open
+    // while the market is already in the reduce-only band.
+    let emergency_deadline_ms = if tail_guard_enabled && m5_tail_reduce_only(state) {
+        Some(timestamp_ms)
+    } else {
+        plan.hard_deadline_ms()
+    };
     let taker_input = AdaptiveTakerInput {
         now_ms: timestamp_ms,
-        deadline_ms: plan.hard_deadline_ms(),
+        deadline_ms: emergency_deadline_ms,
         position: state.position,
         maker_remaining_quantity,
         maker_estimated_time_ms,
@@ -3887,7 +4655,10 @@ fn maker_exit_intent_for_state(
         market_age_ms: timestamp_ms.saturating_sub(state.last_mark_time_ms),
         book_age_ms: timestamp_ms.saturating_sub(state.last_book_event_at_ms),
         remote_state_known: !state.last_mark_time_ms.eq(&0),
-        anchor_valid: state.anchor.valid_at(timestamp_ms, u64::MAX),
+        // An anchor is required for opening risk, but never for reducing a
+        // confirmed position. Blocking the emergency path on an expired
+        // reference would turn stale-data protection into residual exposure.
+        anchor_valid: state.anchor.close_price_ticks > 0,
         mark_index_gap_bps,
         max_mark_index_gap_bps,
         volatility_bps: state.ewma_abs_return_bps,
@@ -3924,19 +4695,20 @@ fn maker_exit_intent_for_state(
             reduce_only: order.reduce_only,
         },
     };
-    let decision = decide_maker_exit(MakerExitInput {
-        symbol: state.symbol_id,
-        position: state.position,
-        position_confirmed: true,
-        now_ms: timestamp_ms,
-        max_book_age_ms: 5_000,
-        plan,
-        book: Some(ExitBook {
-            bid: book.bid_price_ticks,
-            ask: book.ask_price_ticks,
-            observed_at_ms: state.last_book_event_at_ms,
-        }),
-        constraints: Some(ExitConstraints {
+    let constraints = execution_filters
+        .map(|filters| ExitConstraints {
+            min_price: filters.min_price_ticks,
+            max_price: filters.max_price_ticks,
+            price_tick: filters.price_tick,
+            min_quantity: filters.min_quantity_units,
+            max_quantity: position_quantity.min(filters.max_quantity_units),
+            quantity_step: filters.quantity_step,
+            min_notional: filters.min_notional_price_ticks,
+            quantity_scale,
+            observed_at_ms: timestamp_ms,
+            max_age_ms: 0,
+        })
+        .or(Some(ExitConstraints {
             min_price: 1,
             max_price: i64::MAX,
             price_tick: 1,
@@ -3946,8 +4718,21 @@ fn maker_exit_intent_for_state(
             min_notional: 1,
             quantity_scale,
             observed_at_ms: timestamp_ms,
-            max_age_ms: 5_000,
+            max_age_ms: 0,
+        }));
+    let decision = decide_maker_exit(MakerExitInput {
+        symbol: state.symbol_id,
+        position: state.position,
+        position_confirmed: true,
+        now_ms: timestamp_ms,
+        max_book_age_ms: binance_runtime_config().operational.max_signal_age_ms,
+        plan,
+        book: Some(ExitBook {
+            bid: book.bid_price_ticks,
+            ask: book.ask_price_ticks,
+            observed_at_ms: state.last_book_event_at_ms,
         }),
+        constraints,
         working,
     });
     match decision {
@@ -3972,6 +4757,61 @@ fn maker_exit_intent_for_state(
     }
 }
 
+fn calibrated_maker_confidence_bps(calibration: Option<M9Calibration>) -> u16 {
+    calibration
+        .map(|value| value.fill_hazard_bps.clamp(0, 10_000) as u16)
+        .unwrap_or(0)
+}
+
+fn force_reduce_only_taker_intent(
+    state: &SimulationSymbolState,
+    policy: EmergencyExecutionPolicy,
+) -> Option<OrderIntent> {
+    let position_quantity = state.position.checked_abs()?;
+    let book = state.book?;
+    if position_quantity == 0
+        || book.bid_price_ticks <= 0
+        || book.ask_price_ticks <= book.bid_price_ticks
+    {
+        return None;
+    }
+    let opposing_depth = if state.position > 0 {
+        book.bid_quantity
+    } else {
+        book.ask_quantity
+    };
+    if opposing_depth <= 0 || policy.max_participation_bps == 0 {
+        return None;
+    }
+    let participation_quantity =
+        (i128::from(opposing_depth) * i128::from(policy.max_participation_bps) / 10_000)
+            .clamp(0, i128::from(i64::MAX)) as i64;
+    let quantity = position_quantity.min(participation_quantity);
+    if quantity <= 0 {
+        return None;
+    }
+    let aggressive_price = |price: i64, buy: bool| {
+        let delta = (i128::from(price) * i128::from(policy.max_slippage_bps) / 10_000)
+            .clamp(1, i128::from(i64::MAX)) as i64;
+        if buy {
+            price.saturating_add(delta)
+        } else {
+            price.saturating_sub(delta).max(1)
+        }
+    };
+    let (side, price) = if state.position > 0 {
+        (Side::Sell, aggressive_price(book.bid_price_ticks, false))
+    } else {
+        (Side::Buy, aggressive_price(book.ask_price_ticks, true))
+    };
+    Some(OrderIntent::emergency_reduce_only_taker(
+        state.symbol_id,
+        side,
+        price,
+        quantity,
+    ))
+}
+
 pub fn event_time_ms(event: &BinanceMarketEvent) -> u64 {
     match event {
         BinanceMarketEvent::BookTicker(value) => value.event_time_ms,
@@ -3981,13 +4821,13 @@ pub fn event_time_ms(event: &BinanceMarketEvent) -> u64 {
     }
 }
 
-fn funding_flatten_deadline(next_funding_time_ms: u64) -> Option<u64> {
-    (next_funding_time_ms > 0).then(|| next_funding_time_ms.saturating_sub(FUNDING_FLATTEN_LEAD_MS))
+fn funding_flatten_deadline(next_funding_time_ms: u64, funding_lead_ms: u64) -> Option<u64> {
+    (next_funding_time_ms > 0).then(|| next_funding_time_ms.saturating_sub(funding_lead_ms))
 }
 
-fn funding_entry_allowed(state: &SimulationSymbolState, now_ms: u64) -> bool {
+fn funding_entry_allowed(state: &SimulationSymbolState, now_ms: u64, funding_lead_ms: u64) -> bool {
     state.next_funding_time_ms > now_ms
-        && funding_flatten_deadline(state.next_funding_time_ms)
+        && funding_flatten_deadline(state.next_funding_time_ms, funding_lead_ms)
             .is_some_and(|deadline| now_ms < deadline)
 }
 
@@ -4087,9 +4927,10 @@ fn funding_entry_allowed_variant(
     now_ms: u64,
     variant: SimulationPolicyVariant,
     fee_ppm: i64,
+    funding_lead_ms: u64,
 ) -> bool {
     if !variant.uses_funding_controller() {
-        return funding_entry_allowed(state, now_ms);
+        return funding_entry_allowed(state, now_ms, funding_lead_ms);
     }
     m8_funding_decision(
         state,
@@ -4111,6 +4952,7 @@ fn entry_block_reason_for(
 ) -> &'static str {
     match risk_state {
         SimulationRiskState::ReduceOnlyEquitySession => "equity_session_open",
+        SimulationRiskState::ReduceOnlySymbolDrawdown => "symbol_drawdown_hard_stop",
         SimulationRiskState::ReduceOnlyFundingDeadline => "funding_deadline",
         SimulationRiskState::ReduceOnlyFundingRisk => "funding_cost_exceeds_edge",
         SimulationRiskState::NoEntryFunding => "funding_entry_blocked",
@@ -4177,7 +5019,8 @@ fn data_quality_for(
     // retained only for latency diagnostics.
     if state.last_mark_time_ms == 0
         || now_ms < state.last_mark_time_ms
-        || now_ms.saturating_sub(state.last_mark_time_ms) > 5_000
+        || now_ms.saturating_sub(state.last_mark_time_ms)
+            > binance_runtime_config().operational.max_signal_age_ms
     {
         return DataQualityStatus::Stale;
     }
@@ -4187,725 +5030,35 @@ fn data_quality_for(
     DataQualityStatus::Fresh
 }
 
-fn edge_pico_bps(numerator_price: i64, denominator_price: i64) -> Option<i64> {
-    if numerator_price <= 0 || denominator_price <= 0 {
-        return None;
-    }
-    Some(
-        ((i128::from(numerator_price) - i128::from(denominator_price))
-            * 10_000
-            * i128::from(PICO_BPS_SCALE)
-            / i128::from(denominator_price))
-        .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64,
-    )
-}
-
-/// Compatibility diagnostic; admission uses edge_pico_bps directly.
-fn fair_value_for_state(state: &SimulationSymbolState) -> Option<FairValueEstimate> {
-    let book = state.book?;
-    let index = state.index_price_ticks?;
-    let mark = state.mark_price_ticks?;
-    let mid = book.bid_price_ticks.checked_add(book.ask_price_ticks)? / 2;
-    FairValueEstimate::from_market_precise(
-        crate::strategy::PriceTicks(state.anchor.close_price_ticks),
-        crate::strategy::PriceTicks(index),
-        crate::strategy::PriceTicks(mark),
-        crate::strategy::PriceTicks(mid),
-        state.ewma_abs_return_pico_bps,
-        state.ewma_spread_pico_bps,
-    )
-}
-
-fn dynamic_threshold_diagnostic_for(
-    state: &SimulationSymbolState,
-    variant: SimulationPolicyVariant,
-    floor_bps: i64,
-    fee_ppm: i64,
+fn rejection_threshold_bps(
+    engine: &SimulationEngine,
+    symbol: &str,
+    timestamp_ms: u64,
     requested_quantity: i64,
     max_position: i64,
-    timestamp_ms: u64,
-) -> ThresholdDiagnostic {
-    let Some(book) = state.book else {
-        return ThresholdDiagnostic {
-            status: ThresholdStatus::WarmingUp,
-            threshold: None,
-            prior_used: true,
-            missing_component: Some("book"),
-        };
-    };
-    let Some(mark) = state.mark_price_ticks else {
-        return ThresholdDiagnostic {
-            status: ThresholdStatus::InsufficientData,
-            threshold: None,
-            prior_used: true,
-            missing_component: Some("mark_price"),
-        };
-    };
-    let Some(index) = state.index_price_ticks else {
-        return ThresholdDiagnostic {
-            status: ThresholdStatus::InsufficientData,
-            threshold: None,
-            prior_used: true,
-            missing_component: Some("index_price"),
-        };
-    };
-    if book.bid_price_ticks <= 0
-        || book.ask_price_ticks < book.bid_price_ticks
-        || book.bid_quantity <= 0
-        || book.ask_quantity <= 0
-        || mark <= 0
-        || index <= 0
-        || floor_bps < 0
-        || fee_ppm < 0
-        || requested_quantity <= 0
-        || max_position <= 0
-    {
-        return ThresholdDiagnostic {
-            status: ThresholdStatus::InvalidInput,
-            threshold: None,
-            prior_used: false,
-            missing_component: Some("validated_components"),
-        };
-    }
-    let gap_pico_bps = edge_pico_bps(mark, index)
-        .map(|value| i128::from(value.unsigned_abs()))
-        .unwrap_or(i128::from(i64::MAX))
-        .min(i128::from(i64::MAX)) as i64;
-    let prior_used = variant != SimulationPolicyVariant::M0Fixed
-        && (state.ewma_abs_return_pico_bps == 0 || state.ewma_spread_pico_bps == 0);
-    let volatility_pico_bps = if state.ewma_abs_return_pico_bps == 0 {
-        THRESHOLD_PRIOR_VOLATILITY_PICO_BPS
-    } else {
-        state.ewma_abs_return_pico_bps.saturating_mul(3)
-    };
-    let cost_pico_bps = ppm_to_pico_bps(fee_ppm.saturating_mul(2));
-    let fair_value_confidence_pico_bps = fair_value_for_state(state)
-        .map(|estimate| {
-            i128::from(estimate.confidence_bps).saturating_mul(i128::from(PICO_BPS_SCALE))
-        })
-        .unwrap_or(i128::from(gap_pico_bps))
-        .clamp(0, i128::from(i64::MAX)) as i64;
-    let confidence_component_pico_bps = 5 * i128::from(PICO_BPS_SCALE)
-        + i128::from(fair_value_confidence_pico_bps).min(50 * i128::from(PICO_BPS_SCALE));
-    let uncertainty_pico_bps = (i128::from(gap_pico_bps) / 2)
-        .max(confidence_component_pico_bps)
-        .clamp(0, i128::from(i64::MAX)) as i64;
-    let spread_pico_bps = if state.ewma_spread_pico_bps == 0 {
-        THRESHOLD_PRIOR_SPREAD_PICO_BPS
-    } else {
-        state.ewma_spread_pico_bps / 2
-    };
-    let liquidity_pico_bps =
-        liquidity_penalty_pico_bps(requested_quantity, book.bid_quantity, book.ask_quantity);
-    let baseline_adverse_selection_pico_bps = if variant.uses_microstructure() {
-        state.ewma_abs_return_pico_bps.saturating_mul(2)
-    } else {
-        0
-    };
-    let fill_feedback_pico_bps = if variant == SimulationPolicyVariant::M0Fixed {
-        0
-    } else {
-        state.ewma_adverse_markout_pico_bps
-    };
-    // Favorable markout feedback may reduce the estimated cost, but a cost
-    // component must never become negative and invalidate the full model.
-    let adverse_selection_pico_bps = baseline_adverse_selection_pico_bps
-        .saturating_add(fill_feedback_pico_bps)
-        .max(0);
-    let statistical_pico_bps = if variant.uses_statistical_term() {
-        uncertainty_pico_bps
-            .saturating_add(cost_pico_bps)
-            .saturating_add(spread_pico_bps)
-            .saturating_add(adverse_selection_pico_bps)
-            .saturating_add(state.ewma_abs_return_pico_bps.saturating_mul(8))
-    } else {
-        0
-    };
-    let tail_risk_pico_bps = if variant.uses_tail_guard() {
-        m5_tail_risk_pico(state)
-    } else {
-        0
-    };
-    let inventory_pico_bps = if max_position > 0 {
-        let ratio_pico = i128::from(state.position).abs() * 10_000 * i128::from(PICO_BPS_SCALE)
-            / i128::from(max_position);
-        (ratio_pico.saturating_mul(ratio_pico) / (1_000_000_i128 * i128::from(PICO_BPS_SCALE)))
-            .clamp(0, i128::from(i64::MAX)) as i64
-    } else {
-        100 * PICO_BPS_SCALE
-    };
-    let funding_remaining_ms = state.next_funding_time_ms.saturating_sub(timestamp_ms);
-    let deadline_risk_pico_bps =
-        if state.next_funding_time_ms > timestamp_ms && state.latest_funding_rate_e8.is_some() {
-            if funding_remaining_ms <= 10 * 60 * 1_000 {
-                50 * PICO_BPS_SCALE
-            } else if funding_remaining_ms <= 30 * 60 * 1_000 {
-                25 * PICO_BPS_SCALE
-            } else if funding_remaining_ms <= 60 * 60 * 1_000 {
-                10 * PICO_BPS_SCALE
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-    let floor_pico_bps = i128::from(floor_bps.max(0))
-        .saturating_mul(i128::from(PICO_BPS_SCALE))
-        .clamp(0, i128::from(i64::MAX)) as i64;
-    let threshold = AdaptiveThreshold::from_pico_components(
-        floor_pico_bps,
-        if variant == SimulationPolicyVariant::M0Fixed {
-            0
-        } else {
-            volatility_pico_bps
-        },
-        if variant == SimulationPolicyVariant::M0Fixed {
-            0
-        } else {
-            cost_pico_bps
-        },
-        if variant == SimulationPolicyVariant::M0Fixed {
-            0
-        } else {
-            uncertainty_pico_bps
-        },
-        if variant == SimulationPolicyVariant::M0Fixed {
-            0
-        } else {
-            deadline_risk_pico_bps
-        },
-        if variant == SimulationPolicyVariant::M0Fixed {
-            0
-        } else {
-            5 * PICO_BPS_SCALE
-        },
-        if variant == SimulationPolicyVariant::M0Fixed {
-            0
-        } else {
-            spread_pico_bps
-        },
-        adverse_selection_pico_bps,
-        if variant == SimulationPolicyVariant::M0Fixed {
-            0
-        } else {
-            liquidity_pico_bps
-        },
-        if variant == SimulationPolicyVariant::M0Fixed {
-            0
-        } else {
-            inventory_pico_bps
-        },
-        statistical_pico_bps,
-        tail_risk_pico_bps,
-    );
-    ThresholdDiagnostic {
-        status: if threshold.is_some() {
-            if prior_used {
-                ThresholdStatus::WarmingUp
-            } else {
-                ThresholdStatus::Ready
-            }
-        } else {
-            ThresholdStatus::ModelFailure
-        },
-        threshold,
-        prior_used,
-        missing_component: None,
-    }
-}
-
-fn dynamic_threshold_for(
-    state: &SimulationSymbolState,
-    variant: SimulationPolicyVariant,
-    floor_bps: i64,
-    fee_ppm: i64,
-    requested_quantity: i64,
-    max_position: i64,
-    timestamp_ms: u64,
-) -> Option<AdaptiveThreshold> {
-    dynamic_threshold_diagnostic_for(
+) -> Option<i64> {
+    let state = engine.states.get(symbol)?;
+    dynamic_threshold_for(
         state,
-        variant,
-        floor_bps,
-        fee_ppm,
+        engine.strategy_variant,
+        engine.strategy.entry_threshold_bps,
+        engine.fee_ppm,
         requested_quantity,
         max_position,
         timestamp_ms,
     )
-    .threshold
+    .map(|threshold| scale_threshold_non_fee(threshold, engine.threshold_scale_ppm))
+    .and_then(AdaptiveThreshold::required_pico_bps)
+    .map(|required| pico_bps_to_bps(required.saturating_sub(state.adaptive_relief_pico_bps)))
 }
 
-fn scale_threshold_non_fee(threshold: AdaptiveThreshold, scale_ppm: i64) -> AdaptiveThreshold {
-    let scale = |value: i64| {
-        (i128::from(value) * i128::from(scale_ppm.clamp(0, 1_000_000)) / 1_000_000)
-            .clamp(0, i128::from(i64::MAX)) as i64
-    };
-    let values = threshold.components_pico_bps();
-    AdaptiveThreshold::from_pico_components(
-        scale(values[0]),
-        scale(values[1]),
-        values[2],
-        values[3],
-        values[4],
-        scale(values[5]),
-        scale(values[6]),
-        scale(values[7]),
-        scale(values[8]),
-        scale(values[9]),
-        scale(values[10]),
-        scale(values[11]),
-    )
-    .expect("scaled threshold components are non-negative")
-}
-
-fn threshold_metrics(threshold: AdaptiveThreshold) -> ThresholdMetrics {
-    let exact = threshold.components_pico_bps();
-    ThresholdMetrics {
-        floor_bps: threshold.floor_bps,
-        residual_volatility_bps: threshold.residual_volatility_bps,
-        cost_bps: threshold.cost_bps,
-        uncertainty_bps: threshold.uncertainty_bps,
-        deadline_risk_bps: threshold.deadline_risk_bps,
-        safety_margin_bps: threshold.safety_margin_bps,
-        spread_bps: threshold.spread_bps,
-        adverse_selection_bps: threshold.adverse_selection_bps,
-        liquidity_bps: threshold.liquidity_bps,
-        inventory_bps: threshold.inventory_bps,
-        statistical_bps: threshold.statistical_bps,
-        tail_risk_bps: threshold.tail_risk_bps,
-        floor_pico_bps: exact[0],
-        residual_volatility_pico_bps: exact[1],
-        cost_pico_bps: exact[2],
-        uncertainty_pico_bps: exact[3],
-        deadline_risk_pico_bps: exact[4],
-        safety_margin_pico_bps: exact[5],
-        spread_pico_bps: exact[6],
-        adverse_selection_pico_bps: exact[7],
-        liquidity_pico_bps: exact[8],
-        inventory_pico_bps: exact[9],
-        statistical_pico_bps: exact[10],
-        tail_risk_pico_bps: exact[11],
-        required_bps: threshold.required_bps(),
-        required_pico_bps: threshold.required_pico_bps(),
-        required_micro_bps: threshold.required_micro_bps(),
-    }
-}
-
-fn ewma_scaled(previous: i64, sample: i64) -> i64 {
-    if previous <= 0 {
-        sample.max(0)
-    } else {
-        ((i128::from(previous) * i128::from(EWMA_PREVIOUS_WEIGHT_PPM)
-            + i128::from(sample.max(0)) * i128::from(EWMA_SAMPLE_WEIGHT_PPM))
-            / i128::from(1_000_000_i64))
-        .clamp(0, i128::from(i64::MAX)) as i64
-    }
-}
-
-fn ewma_micro(previous: i64, sample: i64) -> i64 {
-    ewma_scaled(previous, sample)
-}
-
-fn pico_bps_to_micro(value: i64) -> i64 {
-    if value == 0 {
-        return 0;
-    }
-    let magnitude = i128::from(value.unsigned_abs());
-    let rounded = ((magnitude + i128::from(PICO_BPS_SCALE / MICRO_BPS_SCALE / 2))
-        / i128::from(PICO_BPS_SCALE / MICRO_BPS_SCALE))
-    .clamp(0, i128::from(i64::MAX)) as i64;
-    if value >= 0 {
-        rounded
-    } else {
-        rounded.saturating_neg()
-    }
-}
-
-#[cfg(test)]
-fn micro_bps_to_bps(value: i64) -> i64 {
-    if value == 0 {
-        return 0;
-    }
-    let magnitude = i128::from(value.unsigned_abs());
-    let rounded = ((magnitude + i128::from(MICRO_BPS_SCALE / 2)) / i128::from(MICRO_BPS_SCALE))
-        .clamp(0, i128::from(i64::MAX)) as i64;
-    if value >= 0 {
-        rounded
-    } else {
-        rounded.saturating_neg()
-    }
-}
-
-#[cfg(test)]
-fn edge_micro_bps(numerator_price: i64, denominator_price: i64) -> Option<i64> {
-    edge_pico_bps(numerator_price, denominator_price).map(pico_bps_to_micro)
-}
-
-fn pico_bps_to_bps(value: i64) -> i64 {
-    if value == 0 {
-        return 0;
-    }
-    let magnitude = i128::from(value.unsigned_abs());
-    let rounded = ((magnitude + i128::from(PICO_BPS_SCALE / 2)) / i128::from(PICO_BPS_SCALE))
-        .clamp(0, i128::from(i64::MAX)) as i64;
-    if value >= 0 {
-        rounded
-    } else {
-        rounded.saturating_neg()
-    }
-}
-
-fn ppm_to_pico_bps(ppm: i64) -> i64 {
-    if ppm <= 0 {
-        return 0;
-    }
-    (i128::from(ppm) * i128::from(PICO_BPS_SCALE) / 100).clamp(0, i128::from(i64::MAX)) as i64
-}
-
-fn bps_between(left: i64, right: i64) -> i64 {
-    edge_pico_bps(left, right)
-        .map(pico_bps_to_bps)
-        .unwrap_or(i64::MAX)
-}
-
-fn bps_between_pico(left: i64, right: i64) -> i64 {
-    edge_pico_bps(left, right)
-        .map(|value| i128::from(value.unsigned_abs()).min(i128::from(i64::MAX)) as i64)
-        .unwrap_or(i64::MAX)
-}
-
-const M5_TAIL_CAUTION_BPS: i64 = 35;
-const M5_TAIL_REDUCE_ONLY_BPS: i64 = 60;
-const M5_TAIL_HALT_BPS: i64 = 100;
-
-fn m5_tail_stress_pico(state: &SimulationSymbolState) -> i64 {
-    let volatility = state.ewma_abs_return_pico_bps.saturating_mul(4);
-    let mark_index = match (state.mark_price_ticks, state.index_price_ticks) {
-        (Some(mark), Some(index)) => bps_between_pico(mark, index).saturating_mul(2),
-        _ => i64::MAX,
-    };
-    let spread = state.ewma_spread_pico_bps.saturating_mul(4);
-    volatility.max(mark_index).max(spread)
-}
-
-fn m5_tail_stress_bps(state: &SimulationSymbolState) -> i64 {
-    pico_bps_to_bps(m5_tail_stress_pico(state))
-}
-
-fn m5_tail_risk_pico(state: &SimulationSymbolState) -> i64 {
-    // Keep the tail premium finite. A halted quote is a risk decision, not an
-    // arithmetic failure; the signal remains explainable as a large hurdle.
-    m5_tail_stress_pico(state)
-        .saturating_sub(M5_TAIL_CAUTION_BPS.saturating_mul(PICO_BPS_SCALE))
-        .max(0)
-        .saturating_mul(2)
-        .min(10_000 * PICO_BPS_SCALE)
-}
-
-fn m5_quote_quantity(state: &SimulationSymbolState, requested_quantity: i64) -> i64 {
-    match m5_tail_stress_bps(state) {
-        stress if stress >= M5_TAIL_HALT_BPS => 0,
-        stress if stress >= M5_TAIL_REDUCE_ONLY_BPS => requested_quantity / 4,
-        stress if stress >= M5_TAIL_CAUTION_BPS => requested_quantity / 2,
-        _ => requested_quantity,
-    }
-}
-
-fn m5_tail_reduce_only(state: &SimulationSymbolState) -> bool {
-    m5_tail_stress_bps(state) >= M5_TAIL_REDUCE_ONLY_BPS
-}
-
-fn m7_entry_admissible(state: &SimulationSymbolState, threshold_pico_bps: i64) -> bool {
-    let Some(book) = state.book else {
-        return false;
-    };
-    let mid = book.bid_price_ticks.saturating_add(book.ask_price_ticks) / 2;
-    let fair_value_ticks = fair_value_for_state(state)
-        .map(|estimate| estimate.price.0)
-        .unwrap_or(0);
-    if mid <= 0 || fair_value_ticks <= 0 || threshold_pico_bps <= 0 {
-        return false;
-    }
-    let residual_pico_bps = bps_between_pico(mid, fair_value_ticks);
-    // M7 treats very large residuals under elevated stress as repricing,
-    // not a free mean-reversion edge, while preserving ordinary opportunities.
-    residual_pico_bps >= threshold_pico_bps
-        && !(residual_pico_bps >= 500 * PICO_BPS_SCALE
-            && m5_tail_stress_pico(state) >= M5_TAIL_CAUTION_BPS * PICO_BPS_SCALE)
-}
-
-fn ppm_to_bps(ppm: i64) -> i64 {
-    if ppm <= 0 {
-        return 0;
-    }
-    ((i128::from(ppm) + 99) / 100).clamp(0, i128::from(i64::MAX)) as i64
-}
-
-fn liquidity_adjusted_quantity(
-    requested_quantity: i64,
-    bid_quantity: i64,
-    ask_quantity: i64,
-) -> i64 {
-    if requested_quantity <= 0 || bid_quantity <= 0 || ask_quantity <= 0 {
-        return 0;
-    }
-    let depth = bid_quantity.min(ask_quantity);
-    // Limit participation to 10% of the thinner side. Consuming an entire
-    // displayed level is not a realistic passive execution assumption and
-    // would make the liquidity penalty dominate the economic hurdle.
-    // Synthetic unit-test books use tiny integer quantities; preserve their
-    // exact fill semantics instead of collapsing a 10% cap to one unit.
-    if depth < 10_000 {
-        return requested_quantity.min(depth).max(1);
-    }
-    let participation_cap =
-        (i128::from(depth) * 1_000 / 10_000).clamp(1, i128::from(i64::MAX)) as i64;
-    requested_quantity.min(participation_cap).max(1)
-}
-
-fn liquidity_ratio_pico_bps(quantity: i64, bid_quantity: i64, ask_quantity: i64) -> i64 {
-    if quantity <= 0 || bid_quantity <= 0 || ask_quantity <= 0 {
-        return 10_000 * PICO_BPS_SCALE;
-    }
-    let depth = bid_quantity.min(ask_quantity);
-    (i128::from(quantity).max(0) * 10_000 * i128::from(PICO_BPS_SCALE) / i128::from(depth))
-        .clamp(0, 10_000 * i128::from(PICO_BPS_SCALE)) as i64
-}
-
-fn liquidity_ratio_bps(quantity: i64, bid_quantity: i64, ask_quantity: i64) -> i64 {
-    pico_bps_to_bps(liquidity_ratio_pico_bps(
-        quantity,
-        bid_quantity,
-        ask_quantity,
-    ))
-}
-
-fn liquidity_penalty_pico_bps(quantity: i64, bid_quantity: i64, ask_quantity: i64) -> i64 {
-    let participation_pico_bps = liquidity_ratio_pico_bps(quantity, bid_quantity, ask_quantity);
-    if participation_pico_bps <= 1_000 * PICO_BPS_SCALE {
-        0
-    } else {
-        ((participation_pico_bps - 1_000 * PICO_BPS_SCALE) * 6 / 1_000)
-            .clamp(0, 100 * PICO_BPS_SCALE)
-    }
-}
-
-fn liquidity_penalty_bps(quantity: i64, bid_quantity: i64, ask_quantity: i64) -> i64 {
-    pico_bps_to_bps(liquidity_penalty_pico_bps(
-        quantity,
-        bid_quantity,
-        ask_quantity,
-    ))
-}
-
-fn fill_probability_bps(quantity: i64, bid_quantity: i64, ask_quantity: i64) -> u16 {
-    if quantity <= 0 || bid_quantity <= 0 || ask_quantity <= 0 {
-        return 0;
-    }
-    let participation_bps = liquidity_ratio_bps(quantity, bid_quantity, ask_quantity);
-    // This is an explicitly conservative top-of-book proxy. It is not claimed
-    // to be a calibrated fill hazard until completed fills are observed.
-    (10_000_i64 - participation_bps * 8 / 10).clamp(500, 9_500) as u16
-}
-
-fn local_day(timestamp_ms: u64) -> u64 {
-    (timestamp_ms / 1_000 + 8 * 3_600) / 86_400
-}
-
-fn local_weekday(timestamp_ms: u64) -> u8 {
-    ((local_day(timestamp_ms) + 3) % 7 + 1) as u8
-}
-
-fn local_minute(timestamp_ms: u64) -> u16 {
-    let local_seconds = timestamp_ms / 1_000 + 8 * 3_600;
-    (local_seconds % 86_400 / 60) as u16
-}
-
-fn calendar_state_for(symbol: &str, timestamp_ms: u64) -> &'static str {
-    let Some(profile) = profile_for(symbol) else {
-        return "unknown_symbol";
-    };
-    let calendar = calendar_for(profile.region);
-    let date_key = EquitySessionCalendar::date_key_from_timestamp(timestamp_ms);
-    if !EquitySessionCalendar::calendar_snapshot_supported(date_key) {
-        return "unsupported_snapshot";
-    }
-    if calendar.is_holiday(date_key) {
-        return "holiday";
-    }
-    let weekday = local_weekday(timestamp_ms);
-    if weekday > 5 {
-        return "weekend";
-    }
-    let minute = local_minute(timestamp_ms);
-    if calendar.after_final_close(date_key, weekday, minute) {
-        return "final_close_anchor_window";
-    }
-    match calendar.detailed_state_at(weekday, minute, false, 30, true) {
-        VenueSessionState::Closed => "closed",
-        VenueSessionState::PreOpenFlatten => "pre_open_flatten",
-        VenueSessionState::PreOpenAuction => "pre_open_auction",
-        VenueSessionState::Open => "open",
-        VenueSessionState::MiddayBreak => "midday_break",
-        VenueSessionState::ClosingAuction => "closing_auction",
-        VenueSessionState::Weekend => "weekend",
-        VenueSessionState::Holiday => "holiday",
-        VenueSessionState::Unknown => "unknown",
-    }
-}
-
-fn simulation_anchor_usable(symbol: &str, anchor_observed_at_ms: u64, now_ms: u64) -> bool {
-    if anchor_observed_at_ms == 0 || !anchor_reference_allowed(symbol, anchor_observed_at_ms) {
-        return false;
-    }
-    let Some(profile) = profile_for(symbol) else {
-        return false;
-    };
-    let calendar = calendar_for(profile.region);
-    let anchor_day = local_day(anchor_observed_at_ms);
-    let current_day = local_day(now_ms);
-    if anchor_day > current_day {
-        return false;
-    }
-
-    let mut day = anchor_day.saturating_add(1);
-    while day <= current_day {
-        let day_start_ms = day.saturating_mul(86_400_000).saturating_sub(8 * 3_600_000);
-        let date_key = EquitySessionCalendar::date_key_from_timestamp(day_start_ms);
-        if !EquitySessionCalendar::calendar_snapshot_supported(date_key) {
-            return false;
-        }
-        let weekday = ((day + 3) % 7 + 1) as u8;
-        if weekday <= 5 && !calendar.is_holiday(date_key) {
-            let day_end_ms = day
-                .saturating_add(1)
-                .saturating_mul(86_400_000)
-                .saturating_sub(8 * 3_600_000)
-                .saturating_sub(1);
-            let finalized = if day == current_day {
-                calendar.after_final_close(date_key, weekday, local_minute(now_ms))
-            } else {
-                anchor_refresh_allowed(symbol, day_end_ms)
-            };
-            if finalized {
-                return false;
-            }
-        }
-        day = day.saturating_add(1);
-    }
-    true
-}
-
-fn close_candle_reaches_final_close(
-    calendar: &EquitySessionCalendar,
-    date_key: u32,
-    weekday: u8,
-    timestamp_ms: u64,
-) -> bool {
-    let minute = local_minute(timestamp_ms);
-    calendar.after_final_close(date_key, weekday, minute)
-        || (minute.saturating_add(1) == calendar.effective_final_close_minute(date_key)
-            && timestamp_ms % 60_000 >= 59_000)
-}
-
-fn anchor_refresh_allowed(symbol: &str, timestamp_ms: u64) -> bool {
-    let Some(profile) = profile_for(symbol) else {
-        return false;
-    };
-    let weekday = local_weekday(timestamp_ms);
-    let minute = local_minute(timestamp_ms);
-    let calendar = calendar_for(profile.region);
-    let date_key = EquitySessionCalendar::date_key_from_timestamp(timestamp_ms);
-    if !EquitySessionCalendar::calendar_snapshot_supported(date_key) {
-        return false;
-    }
-
-    // During weekends and exchange holidays Binance's TradFi index is carried
-    // forward from the last completed equity close. Treat that observation as
-    // the immutable closed-session anchor; do not refresh it intra-session.
-    if weekday > 5 || calendar.is_holiday(date_key) {
-        return true;
-    }
-    if close_candle_reaches_final_close(&calendar, date_key, weekday, timestamp_ms) {
-        return true;
-    }
-
-    // A simulation run may start during the overnight/pre-open window. In that
-    // case the current timestamp belongs to the next local date, while the
-    // usable anchor is the most recent prior trading day's final close.
-    // Resolve that prior close explicitly instead of rejecting a valid
-    // restart merely because the process started after midnight.
-    if minute < 540 {
-        let current_day = local_day(timestamp_ms);
-        for offset in 1..=7 {
-            let prior_day = current_day.saturating_sub(offset);
-            let prior_day_start_ms = prior_day
-                .saturating_mul(86_400_000)
-                .saturating_sub(8 * 3_600_000);
-            let prior_date_key = EquitySessionCalendar::date_key_from_timestamp(prior_day_start_ms);
-            let prior_weekday = ((prior_day + 3) % 7 + 1) as u8;
-            if calendar.after_final_close(prior_date_key, prior_weekday, 1_439) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn anchor_reference_allowed(symbol: &str, timestamp_ms: u64) -> bool {
-    if anchor_refresh_allowed(symbol, timestamp_ms) {
-        return true;
-    }
-    let Some(profile) = profile_for(symbol) else {
-        return false;
-    };
-    let weekday = local_weekday(timestamp_ms);
-    let minute = local_minute(timestamp_ms);
-    let calendar = calendar_for(profile.region);
-    let date_key = EquitySessionCalendar::date_key_from_timestamp(timestamp_ms);
-    EquitySessionCalendar::calendar_snapshot_supported(date_key)
-        && weekday <= 5
-        && !calendar.is_holiday(date_key)
-        && matches!(
-            calendar.detailed_state_at(weekday, minute, false, 30, true),
-            VenueSessionState::MiddayBreak
-        )
-}
-
-fn simulation_session_allows_entry(symbol: &str, timestamp_ms: u64) -> bool {
-    let Some(profile) = profile_for(symbol) else {
-        return false;
-    };
-    let weekday = local_weekday(timestamp_ms);
-    let minute = local_minute(timestamp_ms);
-    let calendar = calendar_for(profile.region);
-    let date_key = EquitySessionCalendar::date_key_from_timestamp(timestamp_ms);
-
-    // Unit-level replay fixtures use small synthetic timestamps rather than
-    // real epoch milliseconds; keep their deterministic closed-session path.
-    if timestamp_ms < 10_000_000_000 {
-        return matches!(
-            calendar.detailed_state_at(weekday, minute, false, 30, true),
-            VenueSessionState::Closed | VenueSessionState::MiddayBreak
-        );
-    }
-    if !EquitySessionCalendar::calendar_snapshot_supported(date_key) {
-        return false;
-    }
-
-    // The underlying equity venue is closed on weekends and holidays while
-    // Binance perpetuals remain live. Those are valid static-anchor windows;
-    // the generic calendar helper intentionally reports them as non-entry
-    // states for ordinary equity execution, so this strategy handles them
-    // explicitly.
-    if weekday > 5 || calendar.is_holiday(date_key) {
-        return true;
-    }
-
-    matches!(
-        calendar.detailed_state_at(weekday, minute, false, 30, true),
-        VenueSessionState::Closed | VenueSessionState::MiddayBreak
-    )
+fn rejection_observed_edge_bps(engine: &SimulationEngine, symbol: &str) -> Option<i64> {
+    let state = engine.states.get(symbol)?;
+    let book = state.book?;
+    let fair_value = fair_value_for_state(state)?.price.0;
+    let buy = edge_pico_bps(fair_value, book.bid_price_ticks).unwrap_or(0);
+    let sell = edge_pico_bps(book.ask_price_ticks, fair_value).unwrap_or(0);
+    Some(pico_bps_to_bps(buy.max(sell).max(0)))
 }
 
 fn residual_pico_bps_for_state(state: &SimulationSymbolState) -> Option<i64> {
@@ -4913,45 +5066,6 @@ fn residual_pico_bps_for_state(state: &SimulationSymbolState) -> Option<i64> {
     let fair_value = fair_value_for_state(state)?;
     let mid = clamp_i128((i128::from(book.bid_price_ticks) + i128::from(book.ask_price_ticks)) / 2);
     (mid > 0).then(|| bps_between_pico(fair_value.price.0, mid))
-}
-
-fn update_markout_feedback(
-    state: &mut SimulationSymbolState,
-    mark_price_ticks: i64,
-    timestamp_ms: u64,
-) {
-    if mark_price_ticks <= 0 {
-        return;
-    }
-    while let Some(observation) = state.pending_markouts.front().copied() {
-        if timestamp_ms < observation.due_at_ms {
-            break;
-        }
-        state.pending_markouts.pop_front();
-        let adverse_ticks = match observation.side {
-            Side::Buy => i128::from(observation.fill_price_ticks) - i128::from(mark_price_ticks),
-            Side::Sell => i128::from(mark_price_ticks) - i128::from(observation.fill_price_ticks),
-        };
-        let sample_micro_bps = if adverse_ticks > 0 && observation.fill_price_ticks > 0 {
-            (adverse_ticks * 10_000 * i128::from(MICRO_BPS_SCALE)
-                / i128::from(observation.fill_price_ticks))
-            .clamp(0, i128::from(i64::MAX)) as i64
-        } else {
-            0
-        };
-        let sample_pico_bps = (i128::from(sample_micro_bps)
-            * i128::from(PICO_BPS_SCALE / MICRO_BPS_SCALE))
-        .clamp(0, i128::from(i64::MAX)) as i64;
-        state
-            .calibration
-            .observe_markout(timestamp_ms, sample_pico_bps);
-        state.ewma_adverse_markout_micro_bps =
-            ewma_micro(state.ewma_adverse_markout_micro_bps, sample_micro_bps);
-        state.evaluated_markouts = state.evaluated_markouts.saturating_add(1);
-        if sample_micro_bps > 0 {
-            state.adverse_markouts = state.adverse_markouts.saturating_add(1);
-        }
-    }
 }
 
 fn apply_position_fill(
@@ -5166,7 +5280,7 @@ pub async fn run_simulation(
         BinanceMarketFeed::BookTicker,
         config.price_scale,
         config.quantity_scale,
-        1_048_576,
+        binance_runtime_config().operational.max_frame_bytes,
         config.connect_timeout_ms,
         config.read_timeout_ms,
         config.http_proxy.clone(),
@@ -5181,7 +5295,7 @@ pub async fn run_simulation(
             BinanceMarketFeed::ReferenceAndTrades,
             config.price_scale,
             config.quantity_scale,
-            1_048_576,
+            binance_runtime_config().operational.max_frame_bytes,
             config.connect_timeout_ms,
             config.read_timeout_ms,
             config.http_proxy.clone(),
@@ -5575,6 +5689,7 @@ mod risk_window_regression_tests {
             gross_pnl_ticks: pnl,
             net_pnl_ticks: pnl,
             current_absolute_position: 0,
+            portfolio_inventory_imbalance_bps: 0,
             symbols: Vec::new(),
         }
     }

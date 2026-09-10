@@ -254,7 +254,7 @@ mod tests {
             .iter()
             .find(|spec| spec.label == "M8_no_funding")
             .unwrap();
-        assert_eq!(runtime.variant, SimulationPolicyVariant::M7EvidenceGated);
+        assert_eq!(runtime.variant, SimulationPolicyVariant::M8FundingDisabled);
         assert_eq!(runtime.ablations, vec!["funding".to_owned()]);
         assert_eq!(runtime.role, ExperimentRole::Ablation);
         assert_eq!(runtime.parent_experiment_id.as_deref(), Some("M8_full"));

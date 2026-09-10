@@ -11,16 +11,16 @@ use anchorbell_engine::{
     backtest::{ConservativeTopOfBook, FillDecision, FillModel, MakerQuote, TopOfBook},
     backtest_report::BacktestReport,
     execution::{
-        BinanceAccountStatusResponse, BinanceAccountStatusWire, BinanceCredentials,
-        BinanceEnvironment, BinanceOrderWebSocket, BinanceRestClient, DeploymentConfig,
-        DeploymentConfigError, Side,
+        binance_runtime_config, BinanceAccountStatusResponse, BinanceAccountStatusWire,
+        BinanceCredentials, BinanceEnvironment, BinanceOrderWebSocket, BinanceRestClient,
+        DeploymentConfig, DeploymentConfigError, Side,
     },
     market::{
         BinanceMarketConfig, BinanceMarketStream, BinanceSubscription, InstrumentRegistryConfig,
         InstrumentRegistrySnapshot, PublicMarketMetadataClient, ReconnectPolicy,
     },
     platform::{HealthSnapshot, RuntimeProfile, SystemRegistry, SystemRole},
-    strategy::{instrument_for, EquityRegion, StrategyProfile},
+    strategy::StrategyProfile,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -143,6 +143,15 @@ struct RuntimeSnapshot {
 
 fn configured_simulation_symbols() -> Result<Vec<String>, String> {
     StrategyProfile::load("config/anchorbell-simulation.json").map(|profile| profile.symbols)
+}
+
+fn configured_instrument(
+    symbol: &str,
+) -> Option<anchorbell_engine::market::InstrumentClassification> {
+    InstrumentRegistryConfig::embedded()
+        .ok()?
+        .by_symbol()
+        .remove(&symbol.trim().to_ascii_uppercase())
 }
 
 impl DashboardSession {
@@ -337,6 +346,7 @@ async fn route(request: HttpRequest, state: DashboardState) -> (u16, &'static st
         ("GET", "/api/status") => json_response(200, status_response(&state).await),
         ("GET", "/api/instruments") => instruments_response(&state).await,
         ("GET", "/api/platform") => platform_response(&state).await,
+        ("GET", "/api/schema") => schema_response().await,
         ("GET", "/health") => probe_response("health", 200),
         ("GET", "/live") => probe_response("liveness", 200),
         ("GET", "/ready") => readiness_response(&state).await,
@@ -371,6 +381,54 @@ async fn platform_response(state: &DashboardState) -> (u16, &'static str, Vec<u8
     let mut registry = state.registry.lock().await;
     registry.mark_stale_at(now_ms());
     json_response(200, json!({"ok": true, "manifest": registry.manifest()}))
+}
+
+async fn schema_response() -> (u16, &'static str, Vec<u8>) {
+    let Some(observation) = external_batch_observation() else {
+        return json_response(
+            200,
+            json!({"ok": true, "schema_version": 1, "paths": [], "message": "暂无运行指标 schema"}),
+        );
+    };
+    let mut paths = Vec::new();
+    collect_schema_paths(&observation, "", &mut paths);
+    paths.sort();
+    paths.dedup();
+    json_response(
+        200,
+        json!({
+            "ok": true,
+            "schema_version": 1,
+            "source": "runtime_metrics",
+            "observed_at_ms": now_ms(),
+            "paths": paths,
+        }),
+    )
+}
+
+fn collect_schema_paths(value: &Value, prefix: &str, paths: &mut Vec<String>) {
+    if paths.len() >= 2_000 {
+        return;
+    }
+    match value {
+        Value::Object(entries) => {
+            for (key, child) in entries {
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                paths.push(path.clone());
+                collect_schema_paths(child, &path, paths);
+            }
+        }
+        Value::Array(entries) => {
+            if let Some(first) = entries.first() {
+                collect_schema_paths(first, &format!("{prefix}[]"), paths);
+            }
+        }
+        _ => {}
+    }
 }
 
 async fn runtimes_response(state: &DashboardState) -> (u16, &'static str, Vec<u8>) {
@@ -571,6 +629,10 @@ async fn start_runtime(body: Vec<u8>, state: &DashboardState) -> (u16, &'static 
         )
     };
     let proxy = request.proxy.clone().or(session_proxy);
+    let strategy_profile = match StrategyProfile::load("config/anchorbell-simulation.json") {
+        Ok(profile) => profile,
+        Err(error) => return json_response(500, json!({"ok": false, "message": error})),
+    };
     let mut command;
     let mut output_path = None;
 
@@ -612,11 +674,11 @@ async fn start_runtime(body: Vec<u8>, state: &DashboardState) -> (u16, &'static 
                 .arg("--symbols")
                 .arg(symbols)
                 .arg("--environment")
-                .arg("production")
+                .arg(strategy_profile.environment.as_str())
                 .arg("--price-scale")
-                .arg("8")
+                .arg(strategy_profile.price_scale.to_string())
                 .arg("--quantity-scale")
-                .arg("8")
+                .arg(strategy_profile.quantity_scale.to_string())
                 .arg("--capital-cny")
                 .arg(request.capital_cny.as_deref().unwrap_or("10000"))
                 .arg("--duration-secs")
@@ -632,17 +694,17 @@ async fn start_runtime(body: Vec<u8>, state: &DashboardState) -> (u16, &'static 
                 .arg("--metrics")
                 .arg(&run_metrics)
                 .arg("--fx-refresh-ms")
-                .arg("30000")
+                .arg(strategy_profile.fx_refresh_ms.to_string())
                 .arg("--fx-max-age-ms")
-                .arg("120000")
+                .arg(strategy_profile.fx_max_age_ms.to_string())
                 .arg("--metrics-refresh-ms")
-                .arg("1000")
+                .arg(strategy_profile.metrics_refresh_ms.to_string())
                 .arg("--index-anchor-refresh-ms")
-                .arg("60000")
+                .arg(strategy_profile.index_anchor_refresh_ms.to_string())
                 .arg("--max-mark-index-gap-bps")
-                .arg("50")
+                .arg(strategy_profile.max_mark_index_gap_bps.to_string())
                 .arg("--maker-fee-ppm")
-                .arg("200");
+                .arg(strategy_profile.fee_schedule.maker_fee_ppm.to_string());
             add_proxy(&mut command, proxy.as_ref());
             output_path = Some(run_metrics);
         }
@@ -680,19 +742,34 @@ async fn start_runtime(body: Vec<u8>, state: &DashboardState) -> (u16, &'static 
                 .arg("--duration-secs")
                 .arg(request.duration_secs.unwrap_or(0).to_string())
                 .arg("--price-scale")
-                .arg("8")
+                .arg(strategy_profile.price_scale.to_string())
                 .arg("--quantity-scale")
-                .arg("8")
+                .arg(strategy_profile.quantity_scale.to_string())
                 .arg("--max-position")
-                .arg(request.max_position.unwrap_or(1).to_string())
+                .arg(
+                    request
+                        .max_position
+                        .unwrap_or(strategy_profile.max_position)
+                        .to_string(),
+                )
                 .arg("--quantity")
-                .arg(request.quantity.unwrap_or(1).to_string())
+                .arg(
+                    request
+                        .quantity
+                        .unwrap_or(strategy_profile.requested_quantity)
+                        .to_string(),
+                )
                 .arg("--entry-threshold-bps")
-                .arg(request.entry_threshold_bps.unwrap_or(0).to_string())
+                .arg(
+                    request
+                        .entry_threshold_bps
+                        .unwrap_or(strategy_profile.entry_threshold_bps)
+                        .to_string(),
+                )
                 .arg("--max-mark-index-gap-bps")
-                .arg("50")
+                .arg(strategy_profile.max_mark_index_gap_bps.to_string())
                 .arg("--funding-lead-ms")
-                .arg("300000")
+                .arg(strategy_profile.funding_lead_ms.to_string())
                 .env(
                     "ANCHORBELL_BINANCE_ENV",
                     session_config.environment.as_str(),
@@ -974,12 +1051,29 @@ fn compact_value(value: &Value, depth: usize) -> Value {
         Value::Array(values) => {
             const MAX_ITEMS: usize = 64;
             if values.len() <= MAX_ITEMS {
-                return Value::Array(values.iter().map(|child| compact_value(child, depth + 1)).collect());
+                return Value::Array(
+                    values
+                        .iter()
+                        .map(|child| compact_value(child, depth + 1))
+                        .collect(),
+                );
             }
             let mut compact = Vec::with_capacity(MAX_ITEMS + 1);
             compact.push(json!({"_truncated_items": values.len() - MAX_ITEMS}));
-            compact.extend(values.iter().take(MAX_ITEMS / 2).map(|child| compact_value(child, depth + 1)));
-            compact.extend(values.iter().rev().take(MAX_ITEMS / 2).rev().map(|child| compact_value(child, depth + 1)));
+            compact.extend(
+                values
+                    .iter()
+                    .take(MAX_ITEMS / 2)
+                    .map(|child| compact_value(child, depth + 1)),
+            );
+            compact.extend(
+                values
+                    .iter()
+                    .rev()
+                    .take(MAX_ITEMS / 2)
+                    .rev()
+                    .map(|child| compact_value(child, depth + 1)),
+            );
             Value::Array(compact)
         }
         _ => value.clone(),
@@ -992,7 +1086,7 @@ fn manifest_view(value: Option<&Value>) -> Value {
     };
     json!({
         "anchor_source": manifest.get("anchor_source"),
-        "price_scale": manifest.get("price_scale").cloned().unwrap_or_else(|| json!(8)),
+        "price_scale": manifest.get("price_scale"),
         "anchor_kline_interval": manifest.get("anchor_kline_interval"),
         "duration_secs": manifest.get("duration_secs"),
         "entry_threshold_bps": manifest.get("entry_threshold_bps"),
@@ -1043,22 +1137,28 @@ fn latest_fx_quotes(run_dir: &Path) -> Value {
 
 async fn runs_response() -> (u16, &'static str, Vec<u8>) {
     let Some(root) = external_batch_root() else {
-        return json_response(200, json!({
-            "ok": true,
-            "observed_at_ms": now_ms(),
-            "run_count": 0,
-            "runs": [],
-        }));
+        return json_response(
+            200,
+            json!({
+                "ok": true,
+                "observed_at_ms": now_ms(),
+                "run_count": 0,
+                "runs": [],
+            }),
+        );
     };
     let latest_dir = latest_external_batch().map(|(path, _)| path);
     let mut runs = Vec::new();
     let Ok(entries) = fs::read_dir(&root) else {
-        return json_response(200, json!({
-            "ok": true,
-            "observed_at_ms": now_ms(),
-            "run_count": 0,
-            "runs": [],
-        }));
+        return json_response(
+            200,
+            json!({
+                "ok": true,
+                "observed_at_ms": now_ms(),
+                "run_count": 0,
+                "runs": [],
+            }),
+        );
     };
     for entry in entries.flatten() {
         let run_dir = entry.path();
@@ -1071,25 +1171,48 @@ async fn runs_response() -> (u16, &'static str, Vec<u8>) {
         if manifest.is_none() && index.is_none() {
             continue;
         }
-        let created_at_ms = manifest.as_ref()
+        let created_at_ms = manifest
+            .as_ref()
             .and_then(|v| v.get("created_at_ms").and_then(Value::as_u64))
-            .or_else(|| index.as_ref().and_then(|v| v.get("created_at_ms").and_then(Value::as_u64)))
+            .or_else(|| {
+                index
+                    .as_ref()
+                    .and_then(|v| v.get("created_at_ms").and_then(Value::as_u64))
+            })
             .unwrap_or_default();
-        let run_id = status.as_ref()
+        let run_id = status
+            .as_ref()
             .and_then(|v| v.get("run_id").and_then(Value::as_str))
-            .or_else(|| index.as_ref().and_then(|v| v.get("run_id").and_then(Value::as_str)))
+            .or_else(|| {
+                index
+                    .as_ref()
+                    .and_then(|v| v.get("run_id").and_then(Value::as_str))
+            })
             .unwrap_or_default();
-        let run_status = status.as_ref()
+        let run_status = status
+            .as_ref()
             .and_then(|v| v.get("status").and_then(Value::as_str))
-            .or_else(|| index.as_ref().and_then(|v| v.get("status").and_then(Value::as_str)))
+            .or_else(|| {
+                index
+                    .as_ref()
+                    .and_then(|v| v.get("status").and_then(Value::as_str))
+            })
             .unwrap_or("unknown");
-        let definitions = index.as_ref()
+        let definitions = index
+            .as_ref()
             .and_then(|v| v.get("experiments"))
-            .or_else(|| manifest.as_ref().and_then(|v| v.get("experiment_definitions")));
+            .or_else(|| {
+                manifest
+                    .as_ref()
+                    .and_then(|v| v.get("experiment_definitions"))
+            });
         let mut methods = Vec::new();
         if let Some(definitions) = definitions.and_then(Value::as_array) {
             for definition in definitions {
-                let id = definition.get("experiment_id").and_then(Value::as_str).unwrap_or_default();
+                let id = definition
+                    .get("experiment_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 if id.is_empty() {
                     continue;
                 }
@@ -1097,17 +1220,23 @@ async fn runs_response() -> (u16, &'static str, Vec<u8>) {
                 let detailed = latest_dir.as_ref().is_some_and(|path| path == &run_dir);
                 let symbols = if detailed {
                     compact_value(
-                        metrics.as_ref().and_then(|v| v.get("symbols")).unwrap_or(&Value::Null),
+                        metrics
+                            .as_ref()
+                            .and_then(|v| v.get("symbols"))
+                            .unwrap_or(&Value::Null),
                         0,
                     )
                 } else {
                     Value::Array(
-                        metrics.as_ref()
+                        metrics
+                            .as_ref()
                             .and_then(|v| v.get("symbols"))
                             .and_then(Value::as_array)
                             .into_iter()
                             .flatten()
-                            .filter_map(|symbol| symbol.get("symbol").map(|name| json!({"symbol": name})))
+                            .filter_map(|symbol| {
+                                symbol.get("symbol").map(|name| json!({"symbol": name}))
+                            })
                             .collect(),
                     )
                 };
@@ -1186,15 +1315,22 @@ async fn runs_response() -> (u16, &'static str, Vec<u8>) {
             "index": index_view(index.as_ref()),
         }));
     }
-    runs.sort_by_key(|run| run.get("created_at_ms").and_then(Value::as_u64).unwrap_or_default());
+    runs.sort_by_key(|run| {
+        run.get("created_at_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+    });
     runs.reverse();
-    json_response(200, json!({
-        "ok": true,
-        "observed_at_ms": now_ms(),
-        "root": root.display().to_string(),
-        "run_count": runs.len(),
-        "runs": runs,
-    }))
+    json_response(
+        200,
+        json!({
+            "ok": true,
+            "observed_at_ms": now_ms(),
+            "root": root.display().to_string(),
+            "run_count": runs.len(),
+            "runs": runs,
+        }),
+    )
 }
 
 fn downsample_history(value: Option<&Value>) -> Value {
@@ -1374,13 +1510,9 @@ async fn status_response(state: &DashboardState) -> Value {
         allow_production: session.config.allow_production,
         allow_order_submission: session.config.allow_live_orders,
         symbol: session.symbol.clone(),
-        region: instrument_for(&session.symbol)
-            .map(|instrument| match instrument.region {
-                EquityRegion::AShare => "A股",
-                EquityRegion::HongKong => "港股",
-            })
-            .unwrap_or("未知")
-            .to_owned(),
+        region: configured_instrument(&session.symbol)
+            .map(|instrument| format!("{:?}", instrument.market_region))
+            .unwrap_or_else(|| "未知".to_owned()),
         proxy_configured: session.proxy.is_some(),
     })
     .expect("status response is serializable")
@@ -1427,12 +1559,12 @@ async fn update_session(body: Vec<u8>, state: &DashboardState) -> (u16, &'static
     if symbol.is_empty() {
         return json_response(400, json!({"ok": false, "message": "交易标的不能为空"}));
     }
-    if instrument_for(&symbol).is_none() {
+    if configured_instrument(&symbol).is_none_or(|instrument| !instrument.simulation_enabled) {
         return json_response(
             400,
             json!({
                 "ok": false,
-                "message": "只允许 AnchorBell 确认且通过 ADR/ADS 硬过滤的 9 个 A 股/港股标的"
+                "message": "只允许 instrument registry 中明确启用模拟的标的"
             }),
         );
     }
@@ -1532,7 +1664,7 @@ async fn instruments_response(state: &DashboardState) -> (u16, &'static str, Vec
         }
     };
     let client = match PublicMarketMetadataClient::new(
-        environment.endpoints().rest_base,
+        environment.endpoints().rest_base.as_str(),
         proxy.as_deref(),
     ) {
         Ok(client) => client,
@@ -1546,13 +1678,47 @@ async fn instruments_response(state: &DashboardState) -> (u16, &'static str, Vec
             return json_response(502, json!({"ok": false, "message": error.to_string()}))
         }
     };
+    let funding_info = match client.funding_info(None).await {
+        Ok(funding_info) => funding_info,
+        Err(error) => {
+            return json_response(
+                502,
+                json!({
+                    "ok": false,
+                    "message": format!("Binance funding metadata unavailable: {error}"),
+                }),
+            )
+        }
+    };
+    let funding_by_symbol = funding_info
+        .into_iter()
+        .map(|item| (item.symbol.clone(), item))
+        .collect::<BTreeMap<_, _>>();
+    let exchange_rules = exchange_info
+        .iter()
+        .filter_map(|item| {
+            let filters = item.execution_filters().ok()?;
+            Some(json!({
+                "symbol": item.symbol,
+                "status": item.status,
+                "contract_type": item.contract_type,
+                "price_precision": item.price_precision,
+                "quantity_precision": item.quantity_precision,
+                "filters": filters,
+                "funding": funding_by_symbol.get(&item.symbol),
+            }))
+        })
+        .collect::<Vec<_>>();
     let snapshot = InstrumentRegistrySnapshot::from_exchange_info(exchange_info, &registry_config);
+    let profile = StrategyProfile::load("config/anchorbell-simulation.json").ok();
     json_response(
         200,
         json!({
             "ok": true,
             "environment": environment.to_string(),
             "registry": snapshot,
+            "exchange_rules": exchange_rules,
+            "commission": profile.map(|value| value.fee_schedule),
         }),
     )
 }
@@ -1573,7 +1739,7 @@ async fn metadata_check(state: &DashboardState) -> (u16, &'static str, Vec<u8>) 
         );
     }
     let client = match PublicMarketMetadataClient::new(
-        config.environment.endpoints().rest_base,
+        config.environment.endpoints().rest_base.as_str(),
         proxy.as_deref(),
     ) {
         Ok(client) => client,
@@ -1656,14 +1822,19 @@ async fn market_check(state: &DashboardState) -> (u16, &'static str, Vec<u8>) {
         Ok(subscription) => subscription,
         Err(_) => return json_response(400, json!({"ok": false, "message": "交易标的格式无效"})),
     };
+    let profile = match StrategyProfile::load("config/anchorbell-simulation.json") {
+        Ok(profile) => profile,
+        Err(error) => return json_response(500, json!({"ok": false, "message": error})),
+    };
+    let operational = &binance_runtime_config().operational;
     let config = BinanceMarketConfig {
-        market_ws_base: environment.endpoints().market_ws_base.into(),
+        market_ws_base: environment.endpoints().market_ws_base,
         subscriptions: vec![subscription],
-        price_scale: 8,
-        quantity_scale: 8,
-        max_frame_bytes: 1_048_576,
-        connect_timeout_ms: 5_000,
-        read_timeout_ms: 15_000,
+        price_scale: profile.price_scale,
+        quantity_scale: profile.quantity_scale,
+        max_frame_bytes: operational.max_frame_bytes,
+        connect_timeout_ms: profile.connect_timeout_ms,
+        read_timeout_ms: profile.read_timeout_ms,
         http_proxy: proxy,
         reconnect: ReconnectPolicy {
             max_attempts: Some(1),
@@ -1673,7 +1844,11 @@ async fn market_check(state: &DashboardState) -> (u16, &'static str, Vec<u8>) {
     let mut stream = BinanceMarketStream::new(config);
     let mut count = 0_u32;
     let result = tokio::time::timeout(
-        Duration::from_secs(5),
+        Duration::from_millis(
+            profile
+                .connect_timeout_ms
+                .saturating_add(profile.read_timeout_ms),
+        ),
         stream.run_until_error(|_| count += 1),
     )
     .await;

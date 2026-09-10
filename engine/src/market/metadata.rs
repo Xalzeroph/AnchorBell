@@ -10,6 +10,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::execution::binance_runtime_config;
 use crate::network::{RequestClass, RequestCoordinator};
 
 use super::freshness::{FreshnessClass, FreshnessPolicy, FreshnessState};
@@ -147,6 +148,88 @@ impl BinanceExecutionFilters {
 }
 
 impl BinanceScaledExecutionFilters {
+    /// Normalize a limit price to the exchange tick in a direction that keeps
+    /// the order's execution intent intact. Passive buys/sells are rounded
+    /// toward the book; aggressive reduce-only orders are rounded toward the
+    /// taker side. This prevents a valid signal from becoming a rejected order
+    /// solely because an arithmetic price was between two exchange ticks.
+    pub fn normalize_price(
+        self,
+        requested_price_ticks: i64,
+        is_buy: bool,
+        post_only: bool,
+    ) -> Result<i64, &'static str> {
+        if requested_price_ticks <= 0 || self.price_tick <= 0 {
+            return Err("exchange_price_rule_invalid");
+        }
+        let remainder = requested_price_ticks % self.price_tick;
+        let price = if remainder == 0 {
+            requested_price_ticks
+        } else if post_only == is_buy {
+            requested_price_ticks.saturating_sub(remainder)
+        } else {
+            requested_price_ticks.saturating_add(self.price_tick - remainder)
+        };
+        if price < self.min_price_ticks {
+            return Err("exchange_price_below_min");
+        }
+        if price > self.max_price_ticks {
+            return Err("exchange_price_above_max");
+        }
+        Ok(price)
+    }
+
+    /// Returns the exchange-admissible quantity closest to the requested
+    /// quantity without exceeding the caller's risk capacity.  If the
+    /// configured quantity is below MIN_NOTIONAL, the quantity is increased
+    /// only when the caller explicitly provides enough remaining capacity.
+    pub fn normalize_quantity(
+        self,
+        requested_quantity: i64,
+        price_ticks: i64,
+        maximum_quantity: i64,
+        quantity_scale: u32,
+    ) -> Result<i64, &'static str> {
+        if requested_quantity <= 0 || price_ticks <= 0 || maximum_quantity <= 0 {
+            return Err("exchange_quantity_non_positive");
+        }
+        let maximum_quantity = maximum_quantity.min(self.max_quantity_units);
+        if self.quantity_step <= 0 || self.min_quantity_units <= 0 {
+            return Err("exchange_quantity_rule_invalid");
+        }
+        let mut quantity = requested_quantity.min(maximum_quantity);
+        quantity -= quantity % self.quantity_step;
+        if quantity < self.min_quantity_units {
+            quantity = self.min_quantity_units;
+        }
+        let quantity_factor = 10_i128
+            .checked_pow(quantity_scale)
+            .ok_or("exchange_quantity_scale")?;
+        let minimum_notional_quantity = (i128::from(self.min_notional_price_ticks)
+            .checked_mul(quantity_factor)
+            .ok_or("exchange_notional_overflow")?
+            .saturating_add(i128::from(price_ticks).saturating_sub(1)))
+            / i128::from(price_ticks);
+        let required = i64::try_from(minimum_notional_quantity)
+            .map_err(|_| "exchange_min_notional_overflow")?;
+        if quantity < required {
+            quantity = required;
+        }
+        let remainder = quantity % self.quantity_step;
+        if remainder != 0 {
+            quantity = quantity
+                .checked_add(self.quantity_step - remainder)
+                .ok_or("exchange_quantity_overflow")?;
+        }
+        if quantity < self.min_quantity_units {
+            quantity = self.min_quantity_units;
+        }
+        if quantity > maximum_quantity || quantity > self.max_quantity_units {
+            return Err("exchange_min_notional_exceeds_risk_capacity");
+        }
+        Ok(quantity)
+    }
+
     pub fn validate_order(
         self,
         price_ticks: i64,
@@ -313,6 +396,19 @@ pub struct BinanceFundingInfo {
     pub adjusted_funding_rate_floor: String,
     #[serde(rename = "fundingIntervalHours")]
     pub funding_interval_hours: u32,
+}
+
+impl BinanceFundingInfo {
+    pub fn validate(&self) -> Result<(), PublicMetadataError> {
+        if self.symbol.trim().is_empty()
+            || self.funding_interval_hours == 0
+            || !is_positive_decimal(&self.adjusted_funding_rate_cap)
+            || !is_signed_decimal(&self.adjusted_funding_rate_floor)
+        {
+            return Err(PublicMetadataError::InvalidFundingRate);
+        }
+        Ok(())
+    }
 }
 
 pub const PUBLIC_SNAPSHOT_MAX_AGE_MS: u64 = 5_000;
@@ -581,16 +677,17 @@ impl PublicRestRequestClass {
     }
 
     fn weight(self) -> f64 {
+        let configured = &binance_runtime_config().request_weights;
         match self {
-            Self::Depth(limit) => match limit {
-                5 | 10 | 20 | 50 => 2.0,
-                100 => 5.0,
-                500 => 10.0,
-                1_000 => 20.0,
-                _ => 20.0,
-            },
-            Self::IndexPriceKline => 10.0,
-            Self::Funding | Self::ExchangeInfo | Self::Generic => 1.0,
+            Self::Depth(limit) => configured
+                .depth_by_limit
+                .get(&limit.to_string())
+                .copied()
+                .unwrap_or(configured.depth_default) as f64,
+            Self::IndexPriceKline => configured.index_price_klines as f64,
+            Self::Funding => configured.funding as f64,
+            Self::ExchangeInfo => configured.exchange_info as f64,
+            Self::Generic => configured.generic as f64,
         }
     }
 }
@@ -1566,6 +1663,22 @@ mod tests {
     }
 
     #[test]
+    fn scaled_filters_project_to_discrete_feasible_quantity() {
+        let filters = metadata()
+            .execution_filters()
+            .unwrap()
+            .scaled(5, 2)
+            .unwrap();
+        let price = filters.normalize_price(512345, true, true).unwrap();
+        assert_eq!(price, 512300);
+        assert_eq!(filters.normalize_quantity(1, price, 1_000, 2).unwrap(), 98);
+        assert_eq!(
+            filters.normalize_quantity(1, price, 97, 2),
+            Err("exchange_min_notional_exceeds_risk_capacity")
+        );
+    }
+
+    #[test]
     fn only_trading_tradifi_perpetual_is_runtime_eligible() {
         assert!(metadata().is_trading_tradifi_perpetual());
         let mut inactive = metadata();
@@ -1616,6 +1729,31 @@ mod tests {
         assert_eq!(filters.quantity_step, "0.01");
         assert_eq!(filters.min_notional, "5");
         assert_eq!(filters.multiplier_up, "1.03");
+    }
+
+    #[test]
+    fn scaled_filters_round_prices_without_losing_order_intent() {
+        let filters = metadata()
+            .execution_filters()
+            .unwrap()
+            .scaled(8, 8)
+            .unwrap();
+        assert_eq!(
+            filters.normalize_price(827_850_001, true, true),
+            Ok(827_800_000)
+        );
+        assert_eq!(
+            filters.normalize_price(827_850_001, false, true),
+            Ok(827_900_000)
+        );
+        assert_eq!(
+            filters.normalize_price(827_850_001, true, false),
+            Ok(827_900_000)
+        );
+        assert_eq!(
+            filters.normalize_price(827_850_001, false, false),
+            Ok(827_800_000)
+        );
     }
 
     #[test]

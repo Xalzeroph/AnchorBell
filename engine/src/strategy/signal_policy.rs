@@ -229,6 +229,11 @@ pub struct SignalInput {
     pub sell_adverse_selection_bps: i64,
     pub buy_adverse_selection_pico_bps: i64,
     pub sell_adverse_selection_pico_bps: i64,
+    /// Direction-specific queue-survival estimates. A shared minimum lets a
+    /// congested queue on one side erase an otherwise valid opportunity on the
+    /// other side.
+    pub buy_fill_probability_bps: u16,
+    pub sell_fill_probability_bps: u16,
     pub fill_probability_bps: u16,
     pub confidence_bps: u16,
     /// Enables the conditional-value gate for fill-aware challengers.
@@ -323,7 +328,22 @@ pub fn decide(input: SignalInput) -> SignalDecision {
     } else {
         AdaptiveThreshold::bps_to_pico(input.inventory_skew_bps)
     };
-    if inventory_skew_pico_bps < 0 || input.fill_probability_bps == 0 || input.confidence_bps == 0 {
+    let side_specific_fill =
+        input.buy_fill_probability_bps != 0 || input.sell_fill_probability_bps != 0;
+    let buy_fill_probability_bps = if side_specific_fill {
+        input.buy_fill_probability_bps
+    } else {
+        input.fill_probability_bps
+    };
+    let sell_fill_probability_bps = if side_specific_fill {
+        input.sell_fill_probability_bps
+    } else {
+        input.fill_probability_bps
+    };
+    if inventory_skew_pico_bps < 0
+        || (buy_fill_probability_bps == 0 && sell_fill_probability_bps == 0)
+        || input.confidence_bps == 0
+    {
         return SignalDecision::Blocked(SignalBlockReason::ThresholdUnavailable);
     }
     let inventory_ratio_bps =
@@ -367,7 +387,7 @@ pub fn decide(input: SignalInput) -> SignalDecision {
                 buy_edge_numerator,
                 input.anchor.0,
                 buy_threshold,
-                input.fill_probability_bps,
+                buy_fill_probability_bps,
                 input.confidence_bps,
             ))
     {
@@ -387,7 +407,7 @@ pub fn decide(input: SignalInput) -> SignalDecision {
                 sell_edge_numerator,
                 input.anchor.0,
                 sell_threshold,
-                input.fill_probability_bps,
+                sell_fill_probability_bps,
                 input.confidence_bps,
             ))
     {
@@ -510,6 +530,8 @@ pub fn adaptive_intent_from_market(
             .saturating_mul((PICO_BPS_SCALE / MICRO_BPS_SCALE) as i64),
         sell_adverse_selection_pico_bps: sell_micro_adverse_bps
             .saturating_mul((PICO_BPS_SCALE / MICRO_BPS_SCALE) as i64),
+        buy_fill_probability_bps: fill_probability_bps,
+        sell_fill_probability_bps: fill_probability_bps,
         max_mark_index_gap_bps,
         signal_age_ms,
         max_signal_age_ms,
@@ -664,6 +686,8 @@ mod tests {
             inventory_skew_pico_bps: 0,
             buy_adverse_selection_pico_bps: 0,
             sell_adverse_selection_pico_bps: 0,
+            buy_fill_probability_bps: 10_000,
+            sell_fill_probability_bps: 10_000,
             max_mark_index_gap_bps: 20,
             signal_age_ms: 10,
             max_signal_age_ms: 100,
@@ -704,6 +728,17 @@ mod tests {
                 price: PriceTicks(101_050),
                 quantity: 100
             }
+        );
+    }
+
+    #[test]
+    fn side_specific_fill_probability_blocks_only_the_unfillable_side() {
+        let mut value = input();
+        value.buy_fill_probability_bps = 0;
+        value.sell_fill_probability_bps = 10_000;
+        assert_eq!(
+            decide(value),
+            SignalDecision::Blocked(SignalBlockReason::NoEdge)
         );
     }
 

@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "environments": {
+    "testnet": {
+      "rest_base": "https://demo-fapi.binance.com",
+      "market_ws_base": "wss://demo-fstream.binance.com/market",
+      "public_market_ws_base": "wss://demo-fstream.binance.com/public",
+      "order_ws_base": "wss://testnet.binancefuture.com/ws-fapi/v1",
+      "user_data_ws_base": "wss://demo-fstream.binance.com/private"
+    },
+    "production": {
+      "rest_base": "https://fapi.binance.com",
+      "market_ws_base": "wss://fstream.binance.com/market",
+      "public_market_ws_base": "wss://fstream.binance.com/public",
+      "order_ws_base": "wss://ws-fapi.binance.com/ws-fapi/v1",
+      "user_data_ws_base": "wss://fstream.binance.com/private"
+    }
+  },
+  "request_weights": {
+    "generic": 1,
+    "exchange_info": 1,
+    "funding": 1,
+    "index_price_klines": 10,
+    "depth_by_limit": {
+      "5": 2,
+      "10": 2,
+      "20": 2,
+      "50": 2,
+      "100": 5,
+      "500": 10,
+      "1000": 20
+    },
+    "depth_default": 20
+  },
+  "operational": {
+    "max_frame_bytes": 1048576,
+    "default_recv_window_ms": 5000,
+    "max_signal_age_ms": 5000,
+    "default_funding_flatten_lead_ms": 300000,
+    "default_maker_flatten_horizon_ms": 1800000,
+    "default_funding_flatten_horizon_ms": 300000,
+    "default_inventory_skew_bps": 50,
+    "default_deadline_risk_bps": 50,
+    "listen_key_keepalive_interval_ms": 1800000
+  }
+}
