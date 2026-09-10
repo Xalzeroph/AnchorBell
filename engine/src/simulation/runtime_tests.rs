@@ -805,6 +805,17 @@ fn trend_conflict_is_directional_and_shrunk_toward_zero() {
 }
 
 #[test]
+fn trend_conflict_sizing_is_monotone_and_bounded() {
+    let quantity = 10_000;
+    assert_eq!(trend_conflict_scaled_quantity(0, quantity), quantity);
+    let mild = trend_conflict_scaled_quantity(10 * PICO_BPS_SCALE, quantity);
+    let severe = trend_conflict_scaled_quantity(TREND_CONFLICT_CAP_PICO_BPS, quantity);
+    assert!(mild < quantity);
+    assert!(severe <= mild);
+    assert!(severe >= quantity / 2);
+}
+
+#[test]
 fn reversion_evidence_uses_lower_bound_and_never_inflates_early_size() {
     let mut engine = engine();
     let state = engine.states.get_mut("CXMTUSDT").expect("test symbol");

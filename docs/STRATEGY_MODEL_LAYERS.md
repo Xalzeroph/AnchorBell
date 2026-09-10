@@ -50,7 +50,7 @@ resize an order.
 | L2 | Evidence admission | F7 evidence gate and explainable rejection | runtime, observability | Graded data/risk/evidence states; never relax on raw order count |
 | L3 | Quote construction | Maker-first price and post-only intent | `quote_engine.rs`, `maker_exit.rs` | Quote distance as a constrained optimization variable |
 | L3 | Queue/fill model | Queue ahead, trade-through and fill probability | `backtest_realism.rs`, runtime | Censored survival / competing-risk treatment of partial fills |
-| L3 | Exchange feasibility | Price, quantity, notional and percent filters | `execution/limits.rs`, metadata | Exact projection onto Binance-valid feasible set |
+| L3 | Exchange feasibility | Price, quantity, notional and percent filters | `market/metadata.rs`, `simulation/runtime.rs` pre-admission + final validation | Exact projection onto the discrete Binance-valid feasible set; fail closed when it exceeds risk capacity |
 | L3 | Cost model | Maker/taker fees, slippage and adverse selection | `execution`, runtime | Net-of-cost edge and fee-regime versioning |
 | L4 | Inventory control | Position cap, skew and reduction priority | `strategy/inventory.rs`, runtime | Convex risk budget and monotone reducing path |
 | L4 | Cross-symbol/region risk | Common-mode concentration and region factor | runtime | Robust covariance shrinkage and factor-neutral allocation |
