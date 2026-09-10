@@ -52,9 +52,9 @@ use crate::{
         decide_m9, decide_maker_exit, profile_for, side_adverse_selection_pico_bps,
         universe::instrument_for,
         AdaptiveThreshold, AnchorCurrency, AnchorMakerStrategy, CalibrationSnapshot,
-        CalibrationState, CalibrationStatus, DataQualityStatus, DualFlattenPlan, ExitBook, ExitConstraints,
-        ExitWorkingOrder, FairValueEstimate, FundingRateKind, FundingSchedule, M9Action, M9Input,
-        MakerExitDecision, MakerExitInput, SignalInput, VenueSessionState,
+        CalibrationState, CalibrationStatus, DataQualityStatus, DualFlattenPlan, ExitBook,
+        ExitConstraints, ExitWorkingOrder, FairValueEstimate, FundingRateKind, FundingSchedule,
+        M9Action, M9Input, MakerExitDecision, MakerExitInput, SignalInput, VenueSessionState,
     },
 };
 
@@ -1629,12 +1629,7 @@ impl SimulationEngine {
         volatility.sort_unstable();
         let group_signed = signed[(signed.len() - 1) / 2];
         let group_volatility = volatility[(volatility.len() - 1) / 2];
-        directional_trend_conflict_pico_bps(
-            group_signed,
-            group_volatility,
-            observations,
-            side,
-        )
+        directional_trend_conflict_pico_bps(group_signed, group_volatility, observations, side)
     }
 
     pub fn with_strategy_variant(mut self, variant: SimulationPolicyVariant) -> Self {
@@ -1902,8 +1897,7 @@ impl SimulationEngine {
                     state.fees_ticks,
                     state.fills,
                 );
-                let adverse_markout_upper_pico_bps =
-                    conservative_adverse_markout_pico_bps(state);
+                let adverse_markout_upper_pico_bps = conservative_adverse_markout_pico_bps(state);
                 let adverse_markout_bps =
                     pico_bps_to_bps(adverse_markout_upper_pico_bps).clamp(0, 100);
                 let risk_bps = 1_i64
@@ -2435,8 +2429,7 @@ impl SimulationEngine {
                 let sell_edge_bps = sell_edge_pico_bps.map(pico_bps_to_bps);
                 let buy_edge_micro_bps = buy_edge_pico_bps.map(pico_bps_to_micro);
                 let sell_edge_micro_bps = sell_edge_pico_bps.map(pico_bps_to_micro);
-                let adverse_markout_upper_pico_bps =
-                    conservative_adverse_markout_pico_bps(state);
+                let adverse_markout_upper_pico_bps = conservative_adverse_markout_pico_bps(state);
                 let entry_block_reason = entry_block_reason_for(
                     state,
                     risk_state,
@@ -2570,14 +2563,10 @@ impl SimulationEngine {
                     ewma_signed_return_pico_bps: state.ewma_signed_return_pico_bps,
                     ewma_signed_residual_pico_bps: state.ewma_signed_residual_pico_bps,
                     ewma_residual_drift_pico_bps: state.ewma_residual_drift_pico_bps,
-                    ewma_signed_residual_drift_pico_bps:
-                        state.ewma_signed_residual_drift_pico_bps,
+                    ewma_signed_residual_drift_pico_bps: state.ewma_signed_residual_drift_pico_bps,
                     ewma_residual_persistence_ppm: state.ewma_residual_persistence_ppm,
-                    residual_regime_risk_pico_bps: residual_regime_risk_pico_bps(
-                        state,
-                        Side::Buy,
-                    )
-                    .max(residual_regime_risk_pico_bps(state, Side::Sell)),
+                    residual_regime_risk_pico_bps: residual_regime_risk_pico_bps(state, Side::Buy)
+                        .max(residual_regime_risk_pico_bps(state, Side::Sell)),
                     residual_regime_scale_ppm: residual_regime_scale_ppm(state),
                     trend_persistence_bps: trend_persistence_bps(state),
                     buy_trend_conflict_pico_bps: trend_conflict_pico_bps(state, Side::Buy),
@@ -2860,10 +2849,10 @@ impl SimulationEngine {
                     let change_pico_bps =
                         (change.abs() * 10_000 * i128::from(PICO_BPS_SCALE) / i128::from(previous))
                             .clamp(0, i128::from(i64::MAX)) as i64;
-                    let signed_change_pico_bps =
-                        (change * 10_000 * i128::from(PICO_BPS_SCALE) / i128::from(previous))
-                            .clamp(i128::from(i64::MIN), i128::from(i64::MAX))
-                            as i64;
+                    let signed_change_pico_bps = (change * 10_000 * i128::from(PICO_BPS_SCALE)
+                        / i128::from(previous))
+                    .clamp(i128::from(i64::MIN), i128::from(i64::MAX))
+                        as i64;
                     state.ewma_abs_return_pico_bps =
                         ewma_scaled(state.ewma_abs_return_pico_bps, change_pico_bps);
                     state.ewma_signed_return_pico_bps = ewma_signed_scaled(
@@ -3202,20 +3191,18 @@ impl SimulationEngine {
         let requested_quantity = self.symbol_risk_scaled_quantity(symbol, requested_quantity);
         let portfolio_inventory_imbalance_bps = self.portfolio_inventory_imbalance_bps();
         let strategy_variant = self.strategy_variant;
-        let market_buy_trend_conflict_pico_bps = if strategy_variant
-            == SimulationPolicyVariant::M0Fixed
-        {
-            0
-        } else {
-            self.market_trend_conflict_pico_bps(symbol, Side::Buy)
-        };
-        let market_sell_trend_conflict_pico_bps = if strategy_variant
-            == SimulationPolicyVariant::M0Fixed
-        {
-            0
-        } else {
-            self.market_trend_conflict_pico_bps(symbol, Side::Sell)
-        };
+        let market_buy_trend_conflict_pico_bps =
+            if strategy_variant == SimulationPolicyVariant::M0Fixed {
+                0
+            } else {
+                self.market_trend_conflict_pico_bps(symbol, Side::Buy)
+            };
+        let market_sell_trend_conflict_pico_bps =
+            if strategy_variant == SimulationPolicyVariant::M0Fixed {
+                0
+            } else {
+                self.market_trend_conflict_pico_bps(symbol, Side::Sell)
+            };
         let portfolio_drawdown_action = self.observe_portfolio_drawdown();
         self.update_adaptive_threshold_controller(
             symbol,
@@ -3263,13 +3250,12 @@ impl SimulationEngine {
                 .as_ref()
                 .is_some_and(|overlay| overlay.reduce_only);
             let portfolio_reduce_only = portfolio_drawdown_action.blocks_new_risk();
-            let entries_allowed = session_allowed
-                && funding_allowed
-                && !portfolio_reduce_only
-                && !symbol_reduce_only;
+            let entries_allowed =
+                session_allowed && funding_allowed && !portfolio_reduce_only && !symbol_reduce_only;
             let tail_reduce_only = strategy_variant.uses_tail_guard() && m5_tail_reduce_only(state);
             if !entries_allowed || tail_reduce_only {
-                let should_reduce = ((portfolio_reduce_only || symbol_reduce_only) && state.position != 0)
+                let should_reduce = ((portfolio_reduce_only || symbol_reduce_only)
+                    && state.position != 0)
                     || position_requires_reduction(
                         state.position,
                         session_allowed,
@@ -3443,22 +3429,20 @@ impl SimulationEngine {
                             effective_fill_probability_bps(state, queue_fill_probability_bps);
                         let (buy_pico_adverse_bps, sell_pico_adverse_bps) =
                             side_adverse_selection_pico_bps(book.bid_quantity, book.ask_quantity);
-                        let buy_trend_conflict_pico_bps = if strategy_variant
-                            == SimulationPolicyVariant::M0Fixed
-                        {
-                            0
-                        } else {
-                            trend_conflict_pico_bps(state, Side::Buy)
-                                .max(market_buy_trend_conflict_pico_bps)
-                        };
-                        let sell_trend_conflict_pico_bps = if strategy_variant
-                            == SimulationPolicyVariant::M0Fixed
-                        {
-                            0
-                        } else {
-                            trend_conflict_pico_bps(state, Side::Sell)
-                                .max(market_sell_trend_conflict_pico_bps)
-                        };
+                        let buy_trend_conflict_pico_bps =
+                            if strategy_variant == SimulationPolicyVariant::M0Fixed {
+                                0
+                            } else {
+                                trend_conflict_pico_bps(state, Side::Buy)
+                                    .max(market_buy_trend_conflict_pico_bps)
+                            };
+                        let sell_trend_conflict_pico_bps =
+                            if strategy_variant == SimulationPolicyVariant::M0Fixed {
+                                0
+                            } else {
+                                trend_conflict_pico_bps(state, Side::Sell)
+                                    .max(market_sell_trend_conflict_pico_bps)
+                            };
                         let buy_adverse_pico_bps = (if strategy_variant.uses_microstructure() {
                             buy_pico_adverse_bps
                         } else {
@@ -3525,9 +3509,7 @@ impl SimulationEngine {
                                 if strategy_variant == SimulationPolicyVariant::CoreV1 {
                                     if let Some(threshold) = threshold {
                                         intent.quantity = core_v1_margin_scaled_quantity(
-                                            state,
-                                            intent,
-                                            threshold,
+                                            state, intent, threshold,
                                         );
                                     }
                                 }
@@ -3541,10 +3523,8 @@ impl SimulationEngine {
                                     Side::Sell => trend_conflict_pico_bps(state, Side::Sell)
                                         .max(market_sell_trend_conflict_pico_bps),
                                 };
-                                intent.quantity = trend_conflict_scaled_quantity(
-                                    trend_conflict,
-                                    intent.quantity,
-                                );
+                                intent.quantity =
+                                    trend_conflict_scaled_quantity(trend_conflict, intent.quantity);
                                 intent.quantity = cross_symbol_concentration_scaled_quantity(
                                     portfolio_inventory_imbalance_bps,
                                     state.position,
@@ -5329,7 +5309,7 @@ fn ewma_signed_scaled(previous: i64, sample: i64) -> i64 {
         ((i128::from(previous) * i128::from(EWMA_PREVIOUS_WEIGHT_PPM)
             + i128::from(sample) * i128::from(EWMA_SAMPLE_WEIGHT_PPM))
             / i128::from(1_000_000_i64))
-            .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+        .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
     }
 }
 
@@ -5344,8 +5324,7 @@ fn trend_persistence_bps(state: &SimulationSymbolState) -> i64 {
         return 0;
     }
     let raw_bps = (signed * 10_000 / volatility).clamp(0, 10_000);
-    (raw_bps * observations / (observations + TREND_PRIOR_OBSERVATIONS))
-        .clamp(0, 10_000) as i64
+    (raw_bps * observations / (observations + TREND_PRIOR_OBSERVATIONS)).clamp(0, 10_000) as i64
 }
 
 /// Directional penalty for a quote that fights the locally persistent move.
@@ -5412,23 +5391,17 @@ fn observe_residual_dynamics(
     {
         return;
     }
-    state.ewma_signed_residual_pico_bps = ewma_signed_scaled(
-        state.ewma_signed_residual_pico_bps,
-        residual,
-    );
+    state.ewma_signed_residual_pico_bps =
+        ewma_signed_scaled(state.ewma_signed_residual_pico_bps, residual);
     if let Some(previous) = state.last_residual_pico_bps {
         let previous_abs = previous.unsigned_abs().min(i64::MAX as u64) as i64;
         let residual_abs = residual.unsigned_abs().min(i64::MAX as u64) as i64;
         let signed_change = residual.saturating_sub(previous);
         let absolute_change = residual_abs.saturating_sub(previous_abs);
-        state.ewma_signed_residual_drift_pico_bps = ewma_signed_scaled(
-            state.ewma_signed_residual_drift_pico_bps,
-            signed_change,
-        );
-        state.ewma_residual_drift_pico_bps = ewma_signed_scaled(
-            state.ewma_residual_drift_pico_bps,
-            absolute_change,
-        );
+        state.ewma_signed_residual_drift_pico_bps =
+            ewma_signed_scaled(state.ewma_signed_residual_drift_pico_bps, signed_change);
+        state.ewma_residual_drift_pico_bps =
+            ewma_signed_scaled(state.ewma_residual_drift_pico_bps, absolute_change);
         let persistence_sample = if previous == 0 || residual == 0 {
             0
         } else if previous.signum() == residual.signum() {
@@ -5436,10 +5409,8 @@ fn observe_residual_dynamics(
         } else {
             -1_000_000
         };
-        state.ewma_residual_persistence_ppm = ewma_signed_scaled(
-            state.ewma_residual_persistence_ppm,
-            persistence_sample,
-        );
+        state.ewma_residual_persistence_ppm =
+            ewma_signed_scaled(state.ewma_residual_persistence_ppm, persistence_sample);
     }
     state.last_residual_pico_bps = Some(residual);
     state.last_residual_dynamics_time_ms = Some(event_time_ms);
@@ -5461,13 +5432,21 @@ fn residual_regime_risk_pico_bps(state: &SimulationSymbolState, side: Side) -> i
             .ewma_signed_residual_pico_bps
             .unsigned_abs()
             .min(i64::MAX as u64)
-            .max(state.ewma_abs_return_pico_bps.unsigned_abs().min(i64::MAX as u64))
+            .max(
+                state
+                    .ewma_abs_return_pico_bps
+                    .unsigned_abs()
+                    .min(i64::MAX as u64),
+            )
             .max(PICO_BPS_SCALE as u64) as i64,
     );
     let expansion = i128::from(state.ewma_residual_drift_pico_bps.max(0));
     let directional_drift = match side {
         Side::Buy => state.ewma_signed_residual_drift_pico_bps.max(0),
-        Side::Sell => state.ewma_signed_residual_drift_pico_bps.saturating_neg().max(0),
+        Side::Sell => state
+            .ewma_signed_residual_drift_pico_bps
+            .saturating_neg()
+            .max(0),
     };
     let drift = i128::from(expansion.max(directional_drift));
     if drift <= 0 {
@@ -5493,10 +5472,8 @@ fn residual_regime_scale_ppm(state: &SimulationSymbolState) -> i64 {
     let risk = residual_regime_risk_pico_bps(state, Side::Buy)
         .max(residual_regime_risk_pico_bps(state, Side::Sell));
     let cap = i128::from(RESIDUAL_REGIME_CAP_PICO_BPS.max(1));
-    (1_000_000_i128
-        - (i128::from(risk) * i128::from(1_000_000 - MIN_EVIDENCE_SCALE_PPM) / cap))
-    .clamp(i128::from(MIN_EVIDENCE_SCALE_PPM), 1_000_000)
-    as i64
+    (1_000_000_i128 - (i128::from(risk) * i128::from(1_000_000 - MIN_EVIDENCE_SCALE_PPM) / cap))
+        .clamp(i128::from(MIN_EVIDENCE_SCALE_PPM), 1_000_000) as i64
 }
 
 /// Lower confidence bound for the probability that a residual observation is
@@ -5711,7 +5688,7 @@ fn core_v1_margin_scaled_quantity(
     let evidence_scale = reversion_evidence_scale_ppm(state);
     let evidence_scaled = (i128::from(edge_scaled_quantity) * i128::from(evidence_scale)
         / i128::from(1_000_000_i64))
-        .clamp(1, i128::from(edge_scaled_quantity)) as i64;
+    .clamp(1, i128::from(edge_scaled_quantity)) as i64;
     residual_regime_scaled_quantity(
         residual_regime_risk_pico_bps(state, intent.side),
         evidence_scaled,
@@ -5762,10 +5739,8 @@ fn cross_symbol_concentration_scaled_quantity(
         return quantity;
     }
     let imbalance = i128::from(portfolio_imbalance_bps).abs();
-    let scale_bps = 10_000_i128 * 10_000_i128
-        / 10_000_i128.saturating_add(imbalance).max(1);
-    (i128::from(quantity) * scale_bps / 10_000_i128)
-        .clamp(1, i128::from(quantity)) as i64
+    let scale_bps = 10_000_i128 * 10_000_i128 / 10_000_i128.saturating_add(imbalance).max(1);
+    (i128::from(quantity) * scale_bps / 10_000_i128).clamp(1, i128::from(quantity)) as i64
 }
 
 /// Continuous risk reduction for a quote that fights a persistent local or
@@ -5782,8 +5757,7 @@ fn trend_conflict_scaled_quantity(conflict_pico_bps: i64, quantity: i64) -> i64 
     let conflict = i128::from(conflict_pico_bps.min(TREND_CONFLICT_CAP_PICO_BPS));
     let cap = i128::from(TREND_CONFLICT_CAP_PICO_BPS.max(1));
     let scale_bps = 10_000_i128 - 5_000_i128 * conflict / cap;
-    (i128::from(quantity) * scale_bps / 10_000_i128)
-        .clamp(1, i128::from(quantity)) as i64
+    (i128::from(quantity) * scale_bps / 10_000_i128).clamp(1, i128::from(quantity)) as i64
 }
 
 /// Convert the queue-survival estimate into a continuous execution-size
@@ -5798,8 +5772,7 @@ fn fill_probability_scaled_quantity(fill_probability_bps: u16, quantity: i64) ->
     let probability = i128::from(fill_probability_bps.min(10_000));
     let scale_ppm = i128::from(MIN_EVIDENCE_SCALE_PPM)
         + (1_000_000_i128 - i128::from(MIN_EVIDENCE_SCALE_PPM)) * probability / 10_000;
-    (i128::from(quantity) * scale_ppm / 1_000_000_i128)
-        .clamp(1, i128::from(quantity)) as i64
+    (i128::from(quantity) * scale_ppm / 1_000_000_i128).clamp(1, i128::from(quantity)) as i64
 }
 
 /// Convert residual-regime risk into a continuous inventory budget. The
@@ -5812,10 +5785,8 @@ fn residual_regime_scaled_quantity(risk_pico_bps: i64, quantity: i64) -> i64 {
     }
     let risk = i128::from(risk_pico_bps.min(RESIDUAL_REGIME_CAP_PICO_BPS));
     let cap = i128::from(RESIDUAL_REGIME_CAP_PICO_BPS.max(1));
-    let scale_ppm = 1_000_000_i128
-        - risk * i128::from(1_000_000 - MIN_EVIDENCE_SCALE_PPM) / cap;
-    (i128::from(quantity) * scale_ppm / 1_000_000_i128)
-        .clamp(1, i128::from(quantity)) as i64
+    let scale_ppm = 1_000_000_i128 - risk * i128::from(1_000_000 - MIN_EVIDENCE_SCALE_PPM) / cap;
+    (i128::from(quantity) * scale_ppm / 1_000_000_i128).clamp(1, i128::from(quantity)) as i64
 }
 
 fn m7_entry_admissible(state: &SimulationSymbolState, threshold_pico_bps: i64) -> bool {
@@ -6242,13 +6213,9 @@ fn conservative_adverse_markout_pico_bps(state: &SimulationSymbolState) -> i64 {
         .saturating_sub(1)
         .min(positive.len() - 1);
     let conditional_q90 = positive[percentile_index];
-    let probability_upper_bps = wilson_upper_probability_bps(
-        positive.len() as u64,
-        samples.len() as u64,
-    );
-    let conservative = (i128::from(conditional_q90)
-        * i128::from(probability_upper_bps)
-        / 10_000)
+    let probability_upper_bps =
+        wilson_upper_probability_bps(positive.len() as u64, samples.len() as u64);
+    let conservative = (i128::from(conditional_q90) * i128::from(probability_upper_bps) / 10_000)
         .clamp(0, i128::from(i64::MAX)) as i64;
     ewma.max(conservative)
 }

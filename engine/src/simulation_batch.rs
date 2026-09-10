@@ -455,11 +455,9 @@ fn build_engine(
             .position_allocations
             .as_ref()
             .map(|allocations| {
-                allocations
-                    .values()
-                    .try_fold(0_i64, |total, allocation| {
-                        total.checked_add(allocation.budget_usdt_ticks)
-                    })
+                allocations.values().try_fold(0_i64, |total, allocation| {
+                    total.checked_add(allocation.budget_usdt_ticks)
+                })
             })
             .flatten()
             .filter(|capital| *capital > 0)

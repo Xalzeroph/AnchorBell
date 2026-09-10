@@ -168,7 +168,13 @@ impl CalibrationState {
         Self::push(&mut self.order_placed_times_ms, time);
     }
 
-    pub fn observe_fill(&mut self, time: u64, _placed_at: u64, quantity: i64, displayed_depth: i64) {
+    pub fn observe_fill(
+        &mut self,
+        time: u64,
+        _placed_at: u64,
+        quantity: i64,
+        displayed_depth: i64,
+    ) {
         if self.frozen {
             return;
         }

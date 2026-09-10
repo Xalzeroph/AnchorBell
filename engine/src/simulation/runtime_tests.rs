@@ -725,7 +725,10 @@ fn tail_quantity_scaling_is_continuous_monotone_and_bounded() {
 fn fractional_edge_sizing_is_conservative_and_monotone() {
     let hurdle = 100 * PICO_BPS_SCALE as i64;
     let quantity = 10_000;
-    assert_eq!(fractional_edge_quantity(hurdle, hurdle, quantity), quantity / 4);
+    assert_eq!(
+        fractional_edge_quantity(hurdle, hurdle, quantity),
+        quantity / 4
+    );
     let marginal = fractional_edge_quantity(101 * PICO_BPS_SCALE as i64, hurdle, quantity);
     let strong = fractional_edge_quantity(400 * PICO_BPS_SCALE as i64, hurdle, quantity);
     assert!(marginal < strong);
@@ -740,8 +743,7 @@ fn fractional_edge_sizing_is_conservative_and_monotone() {
 #[test]
 fn cross_symbol_concentration_penalty_is_smooth_and_preserves_reductions() {
     let flat = cross_symbol_concentration_scaled_quantity(0, 0, Side::Buy, 10_000);
-    let concentrated =
-        cross_symbol_concentration_scaled_quantity(10_000, 0, Side::Buy, 10_000);
+    let concentrated = cross_symbol_concentration_scaled_quantity(10_000, 0, Side::Buy, 10_000);
     let more_concentrated =
         cross_symbol_concentration_scaled_quantity(30_000, 0, Side::Buy, 10_000);
     assert_eq!(flat, 10_000);
@@ -764,14 +766,9 @@ fn adverse_markout_upper_bound_is_finite_sample_conservative() {
     assert_eq!(conservative_adverse_markout_pico_bps(state), 0);
 
     for index in 0..8 {
-        state.calibration.observe_markout(
-            index + 1,
-            if index < 4 {
-                20 * PICO_BPS_SCALE
-            } else {
-                0
-            },
-        );
+        state
+            .calibration
+            .observe_markout(index + 1, if index < 4 { 20 * PICO_BPS_SCALE } else { 0 });
     }
     let state = engine.states.get("CXMTUSDT").expect("test symbol");
     let upper = conservative_adverse_markout_pico_bps(state);
@@ -836,10 +833,7 @@ fn residual_regime_state_tracks_drift_persistence_and_expansion() {
 fn residual_regime_sizing_is_monotone_and_never_amplifies() {
     let quantity = 10_000;
     assert_eq!(residual_regime_scaled_quantity(0, quantity), quantity);
-    let mild = residual_regime_scaled_quantity(
-        RESIDUAL_REGIME_CAP_PICO_BPS / 4,
-        quantity,
-    );
+    let mild = residual_regime_scaled_quantity(RESIDUAL_REGIME_CAP_PICO_BPS / 4, quantity);
     let severe = residual_regime_scaled_quantity(RESIDUAL_REGIME_CAP_PICO_BPS, quantity);
     assert!(mild < quantity);
     assert!(severe <= mild);
@@ -868,10 +862,7 @@ fn empirical_fill_lower_bound_only_activates_after_lifecycle_floor() {
     let state = engine.states.get_mut("CXMTUSDT").expect("test symbol");
     assert_eq!(empirical_fill_probability_lcb_bps(state), None);
     for index in 0..MIN_EMPIRICAL_FILL_TRIALS {
-        state
-            .calibration
-            .order_placed_times_ms
-            .push_back(index + 1);
+        state.calibration.order_placed_times_ms.push_back(index + 1);
     }
     assert_eq!(empirical_fill_probability_lcb_bps(state), Some(0));
     assert_eq!(effective_fill_probability_bps(state, 9_500), 0);
@@ -885,9 +876,10 @@ fn reversion_evidence_uses_lower_bound_and_never_inflates_early_size() {
     assert_eq!(reversion_evidence_scale_ppm(state), MIN_EVIDENCE_SCALE_PPM);
 
     for index in 0..32 {
-        state.calibration.residual_abs_pico_bps.push_back(
-            (index as i64 + 1) * PICO_BPS_SCALE,
-        );
+        state
+            .calibration
+            .residual_abs_pico_bps
+            .push_back((index as i64 + 1) * PICO_BPS_SCALE);
     }
     state.calibration.reversion_events = 0;
     let no_evidence_scale = reversion_evidence_scale_ppm(state);

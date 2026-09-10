@@ -89,8 +89,7 @@ pub(crate) fn calculate_risk_metrics(points: &[(u64, i64)], capital_ticks: i64) 
     } else {
         sample_count as f64 / long_run_variance_multiplier
     };
-    let hac_standard_deviation =
-        (variance * long_run_variance_multiplier).max(0.0).sqrt();
+    let hac_standard_deviation = (variance * long_run_variance_multiplier).max(0.0).sqrt();
     let downside_deviation = if sample_count == 0 {
         0.0
     } else {
@@ -119,9 +118,11 @@ pub(crate) fn calculate_risk_metrics(points: &[(u64, i64)], capital_ticks: i64) 
         let mut tail = returns.clone();
         tail.sort_by(|left, right| left.total_cmp(right));
         let tail_count = ((tail.len() as f64 * 0.05).ceil() as usize).max(1);
-        Some(tail[..tail_count.min(tail.len())].iter().sum::<f64>()
-            / tail_count.min(tail.len()) as f64
-            * 10_000.0)
+        Some(
+            tail[..tail_count.min(tail.len())].iter().sum::<f64>()
+                / tail_count.min(tail.len()) as f64
+                * 10_000.0,
+        )
     };
     let max_interval_loss_bps = returns
         .iter()
@@ -179,12 +180,9 @@ fn hac_variance_multiplier(returns: &[f64]) -> f64 {
         return 1.0;
     }
     let mean = returns.iter().sum::<f64>() / returns.len() as f64;
-    let centered = returns
-        .iter()
-        .map(|value| value - mean)
-        .collect::<Vec<_>>();
-    let variance = centered.iter().map(|value| value * value).sum::<f64>()
-        / (returns.len() - 1) as f64;
+    let centered = returns.iter().map(|value| value - mean).collect::<Vec<_>>();
+    let variance =
+        centered.iter().map(|value| value * value).sum::<f64>() / (returns.len() - 1) as f64;
     if variance <= f64::EPSILON {
         return 1.0;
     }
@@ -228,8 +226,12 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let metrics = calculate_risk_metrics(&points, 10_000);
-        assert!(metrics.expected_shortfall_5pct_bps.is_some_and(|value| value < 0.0));
-        assert!(metrics.max_interval_loss_bps.is_some_and(|value| value < 0.0));
+        assert!(metrics
+            .expected_shortfall_5pct_bps
+            .is_some_and(|value| value < 0.0));
+        assert!(metrics
+            .max_interval_loss_bps
+            .is_some_and(|value| value < 0.0));
         assert!(metrics.effective_sample_count <= metrics.sample_count as f64);
         assert!(metrics.calmar_ratio.is_some());
     }

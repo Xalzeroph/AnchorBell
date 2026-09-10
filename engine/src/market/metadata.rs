@@ -1667,10 +1667,7 @@ mod tests {
         let filters = metadata().execution_filters().unwrap();
         let price = filters.normalize_price(512345, true, true).unwrap();
         assert_eq!(price, 512300);
-        assert_eq!(
-            filters.normalize_quantity(1, price, 1_000, 2).unwrap(),
-            98
-        );
+        assert_eq!(filters.normalize_quantity(1, price, 1_000, 2).unwrap(), 98);
         assert_eq!(
             filters.normalize_quantity(1, price, 97, 2),
             Err("exchange_min_notional_exceeds_risk_capacity")
