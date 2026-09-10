@@ -987,6 +987,7 @@ const MIN_MARKOUT_FEEDBACK_SAMPLES: usize = 8;
 /// prints must not immediately veto a mean-reversion quote.
 const TREND_PRIOR_OBSERVATIONS: i128 = 32;
 const TREND_CONFLICT_CAP_PICO_BPS: i64 = 75 * PICO_BPS_SCALE;
+const MIN_EVIDENCE_SCALE_PPM: i64 = 250_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SimulationRiskState {
@@ -1091,6 +1092,8 @@ pub struct SymbolMetrics {
     pub sell_trend_conflict_pico_bps: i64,
     pub buy_market_trend_conflict_pico_bps: i64,
     pub sell_market_trend_conflict_pico_bps: i64,
+    pub reversion_evidence_lower_bps: i64,
+    pub reversion_evidence_scale_ppm: i64,
     pub ewma_adverse_markout_bps: i64,
     pub ewma_adverse_markout_micro_bps: i64,
     pub ewma_adverse_markout_pico_bps: i64,
@@ -2510,6 +2513,8 @@ impl SimulationEngine {
                         .market_trend_conflict_pico_bps(symbol, Side::Buy),
                     sell_market_trend_conflict_pico_bps: self
                         .market_trend_conflict_pico_bps(symbol, Side::Sell),
+                    reversion_evidence_lower_bps: reversion_evidence_lower_bps(state),
+                    reversion_evidence_scale_ppm: reversion_evidence_scale_ppm(state),
                     ewma_adverse_markout_bps: pico_bps_to_bps(state.ewma_adverse_markout_pico_bps),
                     ewma_adverse_markout_micro_bps: pico_bps_to_micro(
                         state.ewma_adverse_markout_pico_bps,
@@ -5209,6 +5214,43 @@ fn directional_trend_conflict_pico_bps(
         .clamp(0, i128::from(TREND_CONFLICT_CAP_PICO_BPS)) as i64
 }
 
+/// Lower confidence bound for the probability that a residual observation is
+/// followed by a causal halving event. This is deliberately a lower bound:
+/// scarce or serially dependent reversion evidence cannot create size.
+fn reversion_evidence_lower_bps(state: &SimulationSymbolState) -> i64 {
+    let trials = state
+        .calibration
+        .residual_abs_pico_bps
+        .len()
+        .saturating_sub(1) as u64;
+    let successes = state.calibration.reversion_events.min(trials);
+    wilson_lower_probability_bps(successes, trials)
+}
+
+fn reversion_evidence_scale_ppm(state: &SimulationSymbolState) -> i64 {
+    let lower_bps = reversion_evidence_lower_bps(state);
+    MIN_EVIDENCE_SCALE_PPM.saturating_add(
+        (i128::from(lower_bps) * i128::from(1_000_000 - MIN_EVIDENCE_SCALE_PPM) / 10_000)
+            .clamp(0, i128::from(1_000_000 - MIN_EVIDENCE_SCALE_PPM)) as i64,
+    )
+}
+
+fn wilson_lower_probability_bps(successes: u64, trials: u64) -> i64 {
+    if trials == 0 {
+        return 0;
+    }
+    let n = trials as f64;
+    let p = successes.min(trials) as f64 / n;
+    let z = 1.96_f64;
+    let z_squared = z * z;
+    let denominator = 1.0 + z_squared / n;
+    let center = p + z_squared / (2.0 * n);
+    let margin = z * (p * (1.0 - p) / n + z_squared / (4.0 * n * n)).sqrt();
+    ((center - margin) / denominator * 10_000.0)
+        .floor()
+        .clamp(0.0, 10_000.0) as i64
+}
+
 fn ewma_micro(previous: i64, sample: i64) -> i64 {
     ewma_scaled(previous, sample)
 }
@@ -5380,7 +5422,11 @@ fn core_v1_margin_scaled_quantity(
     let Some(hurdle) = threshold.required_pico_bps().filter(|hurdle| *hurdle > 0) else {
         return intent.quantity;
     };
-    fractional_edge_quantity(edge, hurdle, intent.quantity)
+    let edge_scaled_quantity = fractional_edge_quantity(edge, hurdle, intent.quantity);
+    let evidence_scale = reversion_evidence_scale_ppm(state);
+    (i128::from(edge_scaled_quantity) * i128::from(evidence_scale)
+        / i128::from(1_000_000_i64))
+        .clamp(1, i128::from(edge_scaled_quantity)) as i64
 }
 
 /// Fractional-Kelly-inspired sizing without claiming a return distribution.

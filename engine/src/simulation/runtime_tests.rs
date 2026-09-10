@@ -805,6 +805,29 @@ fn trend_conflict_is_directional_and_shrunk_toward_zero() {
 }
 
 #[test]
+fn reversion_evidence_uses_lower_bound_and_never_inflates_early_size() {
+    let mut engine = engine();
+    let state = engine.states.get_mut("CXMTUSDT").expect("test symbol");
+    assert_eq!(reversion_evidence_lower_bps(state), 0);
+    assert_eq!(reversion_evidence_scale_ppm(state), MIN_EVIDENCE_SCALE_PPM);
+
+    for index in 0..32 {
+        state.calibration.residual_abs_pico_bps.push_back(
+            (index as i64 + 1) * PICO_BPS_SCALE,
+        );
+    }
+    state.calibration.reversion_events = 0;
+    let no_evidence_scale = reversion_evidence_scale_ppm(state);
+    assert_eq!(no_evidence_scale, MIN_EVIDENCE_SCALE_PPM);
+
+    state.calibration.reversion_events = 31;
+    let strong_evidence = reversion_evidence_lower_bps(state);
+    assert!(strong_evidence > 0);
+    assert!(reversion_evidence_scale_ppm(state) > no_evidence_scale);
+    assert!(reversion_evidence_scale_ppm(state) <= 1_000_000);
+}
+
+#[test]
 fn symbol_drawdown_overlay_scales_before_hard_stop() {
     let mut engine = engine()
         .with_portfolio_drawdown_limits_bps(10_000, 500, 800)
