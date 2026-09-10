@@ -414,8 +414,13 @@ pub(super) fn observe_residual_dynamics(
         let residual_abs = residual.unsigned_abs().min(i64::MAX as u64) as i64;
         let signed_change = residual.saturating_sub(previous);
         let absolute_change = residual_abs.saturating_sub(previous_abs);
+        let curvature = state
+            .last_residual_change_pico_bps
+            .map_or(0, |last_change| signed_change.saturating_sub(last_change));
         state.ewma_signed_residual_drift_pico_bps =
             ewma_signed_scaled(state.ewma_signed_residual_drift_pico_bps, signed_change);
+        state.ewma_residual_curvature_pico_bps =
+            ewma_signed_scaled(state.ewma_residual_curvature_pico_bps, curvature);
         state.ewma_residual_drift_pico_bps =
             ewma_signed_scaled(state.ewma_residual_drift_pico_bps, absolute_change);
         let persistence_sample = if previous == 0 || residual == 0 {
@@ -425,6 +430,7 @@ pub(super) fn observe_residual_dynamics(
         } else {
             -1_000_000
         };
+        state.last_residual_change_pico_bps = Some(signed_change);
         state.ewma_residual_persistence_ppm =
             ewma_signed_scaled(state.ewma_residual_persistence_ppm, persistence_sample);
     }
@@ -464,7 +470,13 @@ pub(super) fn residual_regime_risk_pico_bps(state: &SimulationSymbolState, side:
             .saturating_neg()
             .max(0),
     };
-    let drift = expansion.max(i128::from(directional_drift));
+    let directional_curvature = match side {
+        Side::Buy => state.ewma_residual_curvature_pico_bps.max(0),
+        Side::Sell => state.ewma_residual_curvature_pico_bps.saturating_neg().max(0),
+    };
+    let drift = expansion
+        .max(i128::from(directional_drift))
+        .max(i128::from(directional_curvature));
     if drift <= 0 {
         return 0;
     }
@@ -920,8 +932,29 @@ pub(super) fn queue_aware_fill_probability_bps(
     buy_queue_ahead: i64,
     sell_queue_ahead: i64,
 ) -> u16 {
+    let (buy, sell) = queue_aware_fill_probability_bps_by_side(
+        quantity,
+        bid_quantity,
+        ask_quantity,
+        buy_queue_ahead,
+        sell_queue_ahead,
+    );
+    buy.min(sell)
+}
+
+/// Directional competing-risk proxy for passive fills. The buy and sell
+/// queues are distinct survival processes; only the selected side's queue is
+/// relevant to its conditional execution value. The legacy shared function
+/// above remains a conservative compatibility diagnostic.
+pub(super) fn queue_aware_fill_probability_bps_by_side(
+    quantity: i64,
+    bid_quantity: i64,
+    ask_quantity: i64,
+    buy_queue_ahead: i64,
+    sell_queue_ahead: i64,
+) -> (u16, u16) {
     if quantity <= 0 || bid_quantity <= 0 || ask_quantity <= 0 {
-        return 0;
+        return (0, 0);
     }
     let side_probability = |depth: i64, queue: i64| {
         let denominator = i128::from(depth.max(1))
@@ -929,8 +962,10 @@ pub(super) fn queue_aware_fill_probability_bps(
             .saturating_add(i128::from(quantity.max(1)).saturating_mul(2));
         (i128::from(depth) * 10_000 / denominator).clamp(500, 9_500) as i64
     };
-    side_probability(bid_quantity, buy_queue_ahead)
-        .min(side_probability(ask_quantity, sell_queue_ahead)) as u16
+    (
+        side_probability(bid_quantity, buy_queue_ahead) as u16,
+        side_probability(ask_quantity, sell_queue_ahead) as u16,
+    )
 }
 
 pub(super) const MIN_EMPIRICAL_FILL_TRIALS: u64 = 30;
@@ -961,6 +996,17 @@ pub(super) fn effective_fill_probability_bps(
     empirical_fill_probability_lcb_bps(state)
         .map(|observed| queue_probability_bps.min(observed))
         .unwrap_or(queue_probability_bps)
+}
+
+pub(super) fn effective_fill_probability_bps_by_side(
+    state: &SimulationSymbolState,
+    queue_probabilities: (u16, u16),
+) -> (u16, u16) {
+    let empirical = empirical_fill_probability_lcb_bps(state);
+    (
+        empirical.map_or(queue_probabilities.0, |value| queue_probabilities.0.min(value)),
+        empirical.map_or(queue_probabilities.1, |value| queue_probabilities.1.min(value)),
+    )
 }
 
 pub(super) fn local_day(timestamp_ms: u64) -> u64 {

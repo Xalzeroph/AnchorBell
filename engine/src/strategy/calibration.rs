@@ -1,4 +1,5 @@
 use super::m9::M9Calibration;
+use crate::execution::Side;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
@@ -71,6 +72,12 @@ pub struct CalibrationState {
     pub order_wait_ms: VecDeque<u64>,
     pub fill_participation_bps: VecDeque<i64>,
     pub adverse_markout_pico_bps: VecDeque<i64>,
+    /// Directional markout samples prevent adverse selection on one side from
+    /// contaminating the conditional value of the opposite side.
+    #[serde(default)]
+    pub adverse_markout_buy_pico_bps: VecDeque<i64>,
+    #[serde(default)]
+    pub adverse_markout_sell_pico_bps: VecDeque<i64>,
     pub last_residual_abs_pico_bps: Option<i64>,
     pub last_residual_event_time_ms: Option<u64>,
     #[serde(skip)]
@@ -96,6 +103,8 @@ impl CalibrationState {
             order_wait_ms: VecDeque::new(),
             fill_participation_bps: VecDeque::new(),
             adverse_markout_pico_bps: VecDeque::new(),
+            adverse_markout_buy_pico_bps: VecDeque::new(),
+            adverse_markout_sell_pico_bps: VecDeque::new(),
             last_residual_abs_pico_bps: None,
             last_residual_event_time_ms: None,
             frozen: false,
@@ -208,6 +217,17 @@ impl CalibrationState {
         }
         self.touch(time);
         Self::push(&mut self.adverse_markout_pico_bps, markout.max(0));
+    }
+
+    pub fn observe_directional_markout(&mut self, time: u64, side: Side, markout: i64) {
+        self.observe_markout(time, markout);
+        if self.frozen {
+            return;
+        }
+        match side {
+            Side::Buy => Self::push(&mut self.adverse_markout_buy_pico_bps, markout.max(0)),
+            Side::Sell => Self::push(&mut self.adverse_markout_sell_pico_bps, markout.max(0)),
+        }
     }
 
     pub fn snapshot(&self, fee_pico_bps: i64) -> CalibrationSnapshot {

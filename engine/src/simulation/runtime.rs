@@ -792,11 +792,15 @@ struct SimulationSymbolState {
     /// drift toward the positive residual regime; negative values indicate
     /// drift toward the negative residual regime.
     ewma_signed_residual_drift_pico_bps: i64,
+    /// Signed EWMA of the change in residual drift. This is a causal
+    /// acceleration term for abrupt repricing, not a forecast of direction.
+    ewma_residual_curvature_pico_bps: i64,
     /// EWMA sign persistence in [-1e6, 1e6]. Positive persistence means the
     /// residual remains on one side of zero; negative persistence means it
     /// crosses zero, which is evidence against a persistent regime.
     ewma_residual_persistence_ppm: i64,
     last_residual_pico_bps: Option<i64>,
+    last_residual_change_pico_bps: Option<i64>,
     last_residual_dynamics_time_ms: Option<u64>,
     near_miss_count: u64,
     adaptive_relief_bps: i64,
@@ -1114,6 +1118,8 @@ pub struct SymbolMetrics {
     pub ewma_residual_drift_pico_bps: i64,
     /// Signed direction drift of the residual level, in pico-bps.
     pub ewma_signed_residual_drift_pico_bps: i64,
+    /// Causal residual acceleration in pico-bps.
+    pub ewma_residual_curvature_pico_bps: i64,
     /// Serial persistence of the residual sign in parts per million. It is
     /// shrunk toward zero during the causal warm-up period.
     pub ewma_residual_persistence_ppm: i64,
@@ -1134,6 +1140,10 @@ pub struct SymbolMetrics {
     /// Conservative upper estimate used by admission and allocation. The raw
     /// EWMA remains visible for diagnosing adaptation lag.
     pub adverse_markout_upper_pico_bps: i64,
+    /// Directional conservative markout bounds used by the side-specific
+    /// conditional-value gate.
+    pub buy_adverse_markout_upper_pico_bps: i64,
+    pub sell_adverse_markout_upper_pico_bps: i64,
     pub evaluated_markouts: u64,
     pub adverse_markouts: u64,
     pub adaptive_relief_bps: i64,
@@ -1327,8 +1337,10 @@ impl SimulationEngine {
                         ewma_signed_residual_pico_bps: 0,
                         ewma_residual_drift_pico_bps: 0,
                         ewma_signed_residual_drift_pico_bps: 0,
+                        ewma_residual_curvature_pico_bps: 0,
                         ewma_residual_persistence_ppm: 0,
                         last_residual_pico_bps: None,
+                        last_residual_change_pico_bps: None,
                         last_residual_dynamics_time_ms: None,
                         ewma_adverse_markout_micro_bps: 0,
                         ewma_adverse_markout_pico_bps: 0,
@@ -2567,6 +2579,7 @@ impl SimulationEngine {
                     ewma_signed_residual_pico_bps: state.ewma_signed_residual_pico_bps,
                     ewma_residual_drift_pico_bps: state.ewma_residual_drift_pico_bps,
                     ewma_signed_residual_drift_pico_bps: state.ewma_signed_residual_drift_pico_bps,
+                    ewma_residual_curvature_pico_bps: state.ewma_residual_curvature_pico_bps,
                     ewma_residual_persistence_ppm: state.ewma_residual_persistence_ppm,
                     residual_regime_risk_pico_bps: residual_regime_risk_pico_bps(state, Side::Buy)
                         .max(residual_regime_risk_pico_bps(state, Side::Sell)),
@@ -2586,6 +2599,10 @@ impl SimulationEngine {
                     ),
                     ewma_adverse_markout_pico_bps: state.ewma_adverse_markout_pico_bps,
                     adverse_markout_upper_pico_bps,
+                    buy_adverse_markout_upper_pico_bps:
+                        conservative_adverse_markout_pico_bps_for_side(state, Side::Buy),
+                    sell_adverse_markout_upper_pico_bps:
+                        conservative_adverse_markout_pico_bps_for_side(state, Side::Sell),
                     evaluated_markouts: state.evaluated_markouts,
                     adverse_markouts: state.adverse_markouts,
                     adaptive_relief_bps: state.adaptive_relief_bps,
@@ -3417,19 +3434,24 @@ impl SimulationEngine {
                         } else {
                             book.ask_quantity
                         };
-                        // Use the worse side for the shared conditional-value
-                        // gate. Without a side-specific hazard model, the more
-                        // liquid side must not subsidise the less observable
-                        // queue.
-                        let queue_fill_probability_bps = queue_aware_fill_probability_bps(
+                        // Estimate the two queues as separate competing-risk
+                        // processes. A shared minimum was safe but overly
+                        // destructive: one congested side erased the other
+                        // side's valid conditional value.
+                        let queue_fill_probabilities_bps =
+                            queue_aware_fill_probability_bps_by_side(
                             quantity,
                             book.bid_quantity,
                             book.ask_quantity,
                             buy_queue_ahead,
                             sell_queue_ahead,
                         );
+                        let fill_probabilities_bps = effective_fill_probability_bps_by_side(
+                            state,
+                            queue_fill_probabilities_bps,
+                        );
                         let fill_probability_bps =
-                            effective_fill_probability_bps(state, queue_fill_probability_bps);
+                            fill_probabilities_bps.0.min(fill_probabilities_bps.1);
                         let (buy_pico_adverse_bps, sell_pico_adverse_bps) =
                             side_adverse_selection_pico_bps(book.bid_quantity, book.ask_quantity);
                         let buy_trend_conflict_pico_bps =
@@ -3458,6 +3480,22 @@ impl SimulationEngine {
                             0
                         })
                         .saturating_add(sell_trend_conflict_pico_bps);
+                        // The base hurdle already contains the aggregate
+                        // markout upper bound. Add only the excess observed on
+                        // the selected side, so directionally good fills are
+                        // not charged for the opposite-side tail.
+                        let aggregate_markout_pico_bps =
+                            conservative_adverse_markout_pico_bps(state);
+                        let buy_markout_excess =
+                            conservative_adverse_markout_pico_bps_for_side(state, Side::Buy)
+                                .saturating_sub(aggregate_markout_pico_bps);
+                        let sell_markout_excess =
+                            conservative_adverse_markout_pico_bps_for_side(state, Side::Sell)
+                                .saturating_sub(aggregate_markout_pico_bps);
+                        let buy_adverse_pico_bps =
+                            buy_adverse_pico_bps.saturating_add(buy_markout_excess);
+                        let sell_adverse_pico_bps =
+                            sell_adverse_pico_bps.saturating_add(sell_markout_excess);
                         let fair_value = fair_value_for_state(state);
                         let signal_reference = fair_value
                             .map(|estimate| estimate.price.0)
@@ -3493,6 +3531,8 @@ impl SimulationEngine {
                             sell_adverse_selection_bps: pico_bps_to_bps(sell_adverse_pico_bps),
                             buy_adverse_selection_pico_bps: buy_adverse_pico_bps,
                             sell_adverse_selection_pico_bps: sell_adverse_pico_bps,
+                            buy_fill_probability_bps: fill_probabilities_bps.0,
+                            sell_fill_probability_bps: fill_probabilities_bps.1,
                             fill_probability_bps,
                             confidence_bps: 10_000_i64
                                 .saturating_sub(fair_value_confidence_bps.saturating_mul(50))
@@ -3516,8 +3556,12 @@ impl SimulationEngine {
                                         );
                                     }
                                 }
+                                let side_fill_probability_bps = match intent.side {
+                                    Side::Buy => fill_probabilities_bps.0,
+                                    Side::Sell => fill_probabilities_bps.1,
+                                };
                                 intent.quantity = fill_probability_scaled_quantity(
-                                    fill_probability_bps,
+                                    side_fill_probability_bps,
                                     intent.quantity,
                                 );
                                 let trend_conflict = match intent.side {
@@ -5022,9 +5066,11 @@ fn update_markout_feedback(
         let sample_pico_bps = (i128::from(sample_micro_bps)
             * i128::from(PICO_BPS_SCALE / MICRO_BPS_SCALE))
         .clamp(0, i128::from(i64::MAX)) as i64;
-        state
-            .calibration
-            .observe_markout(timestamp_ms, sample_pico_bps);
+        state.calibration.observe_directional_markout(
+            timestamp_ms,
+            observation.side,
+            sample_pico_bps,
+        );
         state.ewma_adverse_markout_micro_bps =
             ewma_micro(state.ewma_adverse_markout_micro_bps, sample_micro_bps);
         state.evaluated_markouts = state.evaluated_markouts.saturating_add(1);
@@ -5044,7 +5090,34 @@ fn update_markout_feedback(
 /// diagnostics and adaptation-lag analysis.
 fn conservative_adverse_markout_pico_bps(state: &SimulationSymbolState) -> i64 {
     let ewma = state.ewma_adverse_markout_pico_bps.max(0);
-    let samples = &state.calibration.adverse_markout_pico_bps;
+    conservative_markout_upper_from_samples(
+        &state.calibration.adverse_markout_pico_bps,
+        ewma,
+    )
+}
+
+fn conservative_adverse_markout_pico_bps_for_side(
+    state: &SimulationSymbolState,
+    side: Side,
+) -> i64 {
+    let samples = match side {
+        Side::Buy => &state.calibration.adverse_markout_buy_pico_bps,
+        Side::Sell => &state.calibration.adverse_markout_sell_pico_bps,
+    };
+    if samples.len() < MIN_MARKOUT_FEEDBACK_SAMPLES {
+        // Until the directional stream has its own finite-sample floor, retain
+        // the aggregate upper bound. This is conservative and avoids treating
+        // a sparse side as evidence of zero adverse selection.
+        return conservative_adverse_markout_pico_bps(state);
+    }
+    conservative_markout_upper_from_samples(samples, 0)
+}
+
+fn conservative_markout_upper_from_samples(
+    samples: &std::collections::VecDeque<i64>,
+    ewma: i64,
+) -> i64 {
+    let ewma = ewma.max(0);
     if samples.len() < MIN_MARKOUT_FEEDBACK_SAMPLES {
         return ewma;
     }

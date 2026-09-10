@@ -830,6 +830,40 @@ fn residual_regime_state_tracks_drift_persistence_and_expansion() {
 }
 
 #[test]
+fn residual_curvature_detects_accelerating_dislocation() {
+    let mut engine = engine();
+    let state = engine.states.get_mut("CXMTUSDT").expect("test symbol");
+    let mut residual = 2 * PICO_BPS_SCALE;
+    for index in 0..64 {
+        residual = residual.saturating_add((index as i64 + 1) * PICO_BPS_SCALE);
+        observe_residual_dynamics(state, index + 1, Some(residual));
+        state.calibration.residual_abs_pico_bps.push_back(residual);
+    }
+    assert!(state.ewma_residual_curvature_pico_bps > 0);
+    assert!(residual_regime_risk_pico_bps(state, Side::Buy) > 0);
+}
+
+#[test]
+fn directional_markout_bounds_do_not_mix_sides_after_warmup() {
+    let mut engine = engine();
+    let state = engine.states.get_mut("CXMTUSDT").expect("test symbol");
+    for index in 0..8 {
+        state.calibration.observe_directional_markout(
+            index + 1,
+            Side::Buy,
+            20 * PICO_BPS_SCALE,
+        );
+        state
+            .calibration
+            .observe_directional_markout(index + 100, Side::Sell, PICO_BPS_SCALE);
+    }
+    let buy = conservative_adverse_markout_pico_bps_for_side(state, Side::Buy);
+    let sell = conservative_adverse_markout_pico_bps_for_side(state, Side::Sell);
+    assert!(buy > sell);
+    assert!(sell > 0);
+}
+
+#[test]
 fn residual_regime_sizing_is_monotone_and_never_amplifies() {
     let quantity = 10_000;
     assert_eq!(residual_regime_scaled_quantity(0, quantity), quantity);
@@ -854,6 +888,16 @@ fn fill_probability_sizing_is_monotone_and_keeps_a_conservative_probe() {
     assert!(low < high);
     assert!(high < quantity);
     assert_eq!(fill_probability_scaled_quantity(10_000, quantity), quantity);
+}
+
+#[test]
+fn directional_queue_probability_does_not_cross_subsidize_sides() {
+    let (buy, sell) = queue_aware_fill_probability_bps_by_side(10, 100, 100, 900, 0);
+    assert!(buy < sell);
+    assert_eq!(
+        queue_aware_fill_probability_bps(10, 100, 100, 900, 0),
+        buy.min(sell)
+    );
 }
 
 #[test]

@@ -43,8 +43,8 @@ resize an order.
 | L0 | Anchor and calendar truth | External close, FX, session and flatten deadlines | `reference_authority.rs`, `calendar.rs`, `historical.rs` | Immutable closure episodes and region-specific clocks |
 | L1 | Fair-value fusion | Anchor/index/mark/mid reference estimate | `strategy/reference_model.rs` | Robust weighted fusion with dispersion-aware confidence |
 | L1 | Regime state | Calm, normal, stressed, dislocated and transition states | reference model + runtime | Hysteresis, persistence and state-transition penalties |
-| L1 | Residual dynamics | Residual magnitude, drift, reversion and half-life | `calibration.rs`, runtime; signed residual EWMA, absolute expansion, sign persistence and regime-risk sizing | Causal robust state-space / mean-reversion evidence |
-| L1 | Execution feedback | Markout, fill hazard, queue and latency observations | `calibration.rs`, runtime | Wilson bounds, tail quantiles, serial-effective samples |
+| L1 | Residual dynamics | Residual magnitude, drift, curvature, reversion and half-life | `calibration.rs`, runtime; signed residual EWMA, absolute expansion, directional acceleration, sign persistence and regime-risk sizing | Causal robust state-space / mean-reversion evidence |
+| L1 | Execution feedback | Directional markout, fill hazard, queue and latency observations | `calibration.rs`, runtime | Wilson bounds, directional tail quantiles, serial-effective samples |
 | L2 | Edge signal | Anchor-relative executable buy/sell edge | `signal_policy.rs`, `anchor_maker.rs` | Net-edge after uncertainty, adverse selection and deadline cost |
 | L2 | Directional microstructure | Queue imbalance and trend conflict by side | `signal_policy.rs`, runtime; residual direction drift is side-aware | Side-specific robust conflict model and peer-region factor |
 | L2 | Evidence admission | F7 evidence gate and explainable rejection | runtime, observability | Graded data/risk/evidence states; never relax on raw order count |
@@ -82,7 +82,9 @@ The implementation order is causal and conservative:
    hysteresis; signed residual drift, absolute expansion, sign-persistence
    and reversion evidence as separate causal processes. The Core V1 budget
    applies a sample-shrunk continuous scale; it does not turn uncertain
-   residual dynamics into an unlogged hard gate.
+   residual dynamics into an unlogged hard gate. Directional queue survival and
+   directional markout bounds are kept separate, so one side's adverse flow
+   cannot erase the opposite side's evidence.
 4. **Hierarchical cross-section:** symbol estimates shrink toward their
    region factor only when peer observations are present; a single symbol
    cannot set the portfolio's belief.
@@ -101,7 +103,8 @@ model risk, not an improvement.
 The next implementation passes follow the dependency graph:
 
 1. Finish L0/L1 state contracts and schema-driven telemetry.
-2. Upgrade L2 edge/evidence admission using the state estimates.
+2. Upgrade L2 edge/evidence admission using the state estimates; use
+   direction-specific queue survival and conditional-value bounds.
 3. Upgrade L3 queue, cost and exact exchange-feasible projection.
 4. Upgrade L4 factor-neutral inventory, tail and deadline control.
 5. Upgrade L5 attribution, reconciliation and terminal flatness.
