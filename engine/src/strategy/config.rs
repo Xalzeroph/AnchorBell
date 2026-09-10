@@ -168,6 +168,7 @@ impl StrategyProfile {
         }
         if self.entry_threshold_bps < 0
             || self.threshold_scale_ppm <= 0
+            || self.threshold_scale_ppm > 1_000_000
             || self.max_position <= 0
             || self.requested_quantity <= 0
             || self.max_mark_index_gap_bps < 0
@@ -328,6 +329,15 @@ mod tests {
                 evidence_policy: "oos_required".into(),
             }],
         };
+        assert!(profile.validate().is_err());
+    }
+
+    #[test]
+    fn core_profile_cannot_relax_evidence_hurdle() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../config/anchorbell-simulation.json");
+        let mut profile = StrategyProfile::load(path).unwrap();
+        profile.threshold_scale_ppm = 999_999;
         assert!(profile.validate().is_err());
     }
 }

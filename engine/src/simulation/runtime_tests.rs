@@ -689,6 +689,15 @@ fn liquidity_controls_are_continuous_and_monotonic() {
 }
 
 #[test]
+fn queue_aware_fill_proxy_penalizes_visible_queue_and_bounds_probability() {
+    let clear = queue_aware_fill_probability_bps(10, 100, 100, 0, 0);
+    let queued = queue_aware_fill_probability_bps(10, 100, 100, 1_000, 1_000);
+    assert!(clear > queued);
+    assert!((500..=9_500).contains(&queued));
+    assert_eq!(queue_aware_fill_probability_bps(0, 100, 100, 0, 0), 0);
+}
+
+#[test]
 fn tail_quantity_scaling_is_continuous_monotone_and_bounded() {
     let requested = 10_000;
     assert_eq!(m5_scaled_quantity(0, requested), requested);
@@ -710,6 +719,45 @@ fn tail_quantity_scaling_is_continuous_monotone_and_bounded() {
             assert!(quantity > 0);
         }
     }
+}
+
+#[test]
+fn fractional_edge_sizing_is_conservative_and_monotone() {
+    let hurdle = 100 * PICO_BPS_SCALE as i64;
+    let quantity = 10_000;
+    assert_eq!(fractional_edge_quantity(hurdle, hurdle, quantity), quantity / 4);
+    let marginal = fractional_edge_quantity(101 * PICO_BPS_SCALE as i64, hurdle, quantity);
+    let strong = fractional_edge_quantity(400 * PICO_BPS_SCALE as i64, hurdle, quantity);
+    assert!(marginal < strong);
+    assert!(strong < quantity);
+    assert!(marginal >= quantity / 4);
+    assert_eq!(
+        fractional_edge_quantity(10 * PICO_BPS_SCALE as i64, hurdle, quantity),
+        0
+    );
+}
+
+#[test]
+fn symbol_drawdown_overlay_scales_before_hard_stop() {
+    let mut engine = engine()
+        .with_portfolio_drawdown_limits_bps(10_000, 500, 800)
+        .unwrap();
+    engine
+        .states
+        .get_mut("CXMTUSDT")
+        .expect("test symbol")
+        .strategy_pnl_ticks = -600;
+    engine.update_symbol_pnl_peak("CXMTUSDT");
+    assert_eq!(engine.symbol_drawdown_bps("CXMTUSDT"), 600);
+    let scaled = engine.symbol_risk_scaled_quantity("CXMTUSDT", 10_000);
+    assert!((1..10_000).contains(&scaled));
+
+    engine
+        .states
+        .get_mut("CXMTUSDT")
+        .expect("test symbol")
+        .strategy_pnl_ticks = -800;
+    assert_eq!(engine.symbol_risk_scaled_quantity("CXMTUSDT", 10_000), 0);
 }
 
 #[test]

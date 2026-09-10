@@ -53,7 +53,7 @@ use crate::{
         side_adverse_selection_pico_bps,
         universe::instrument_for,
         AdaptiveThreshold, AnchorCurrency, AnchorMakerStrategy, CalibrationSnapshot,
-        CalibrationState, DataQualityStatus, DualFlattenPlan, ExitBook, ExitConstraints,
+        CalibrationState, CalibrationStatus, DataQualityStatus, DualFlattenPlan, ExitBook, ExitConstraints,
         ExitWorkingOrder, FairValueEstimate, FundingRateKind, FundingSchedule, M9Action, M9Input,
         MakerExitDecision, MakerExitInput, SignalInput, VenueSessionState,
     },
@@ -791,6 +791,9 @@ struct SimulationSymbolState {
     strategy_pnl_ticks: i64,
     funding_pnl_ticks: i64,
     fees_ticks: i64,
+    /// High-water mark of the symbol net-PnL path, updated on the causal
+    /// decision path so future observations cannot leak into sizing.
+    peak_net_pnl_ticks: i64,
     latest_funding_rate_e8: Option<i64>,
     last_settled_funding_time_ms: u64,
     fills: u64,
@@ -977,6 +980,7 @@ const THRESHOLD_PRIOR_SPREAD_PICO_BPS: i64 = 2 * PICO_BPS_SCALE;
 enum SimulationRiskState {
     Trading,
     ReduceOnlyEquitySession,
+    ReduceOnlySymbolDrawdown,
     /// Conservative M1-M7 funding-deadline gate.
     ReduceOnlyFundingDeadline,
     /// M8 only: economic funding cost justifies reducing a held position.
@@ -994,6 +998,7 @@ impl SimulationRiskState {
         match self {
             Self::Trading => "trading",
             Self::ReduceOnlyEquitySession => "reduce_only_equity_session",
+            Self::ReduceOnlySymbolDrawdown => "reduce_only_symbol_drawdown",
             Self::ReduceOnlyFundingDeadline => "reduce_only_funding_deadline",
             Self::ReduceOnlyFundingRisk => "reduce_only_funding_risk",
             Self::NoEntryFunding => "no_entry_funding",
@@ -1033,6 +1038,11 @@ pub struct SymbolMetrics {
     pub funding_pnl_ticks: i64,
     pub fees_ticks: i64,
     pub net_pnl_ticks: i64,
+    /// Drawdown of this symbol's own net-PnL path from its observed peak,
+    /// measured against its current allocated capital. This is separate from
+    /// portfolio drawdown so one damaged symbol cannot consume the whole
+    /// portfolio risk budget while the aggregate still looks calm.
+    pub symbol_drawdown_bps: i64,
     pub risk_metrics: Option<RiskMetrics>,
     pub anchor_age_ms: Option<u64>,
     pub anchor_final_close: bool,
@@ -1165,6 +1175,10 @@ pub struct SimulationEngine {
     funding_controller_enabled: bool,
     threshold_scale_ppm: i64,
     portfolio_drawdown_guard: Option<PortfolioDrawdownGuard>,
+    /// Derived from configured portfolio limits; this is a safety overlay,
+    /// not a replacement for the independent dynamic-capital challenger.
+    symbol_drawdown_soft_bps: i64,
+    symbol_drawdown_hard_bps: i64,
     position_allocations: BTreeMap<String, PositionAllocation>,
     capital_usdt_ticks: Option<i64>,
     states: BTreeMap<String, SimulationSymbolState>,
@@ -1262,6 +1276,7 @@ impl SimulationEngine {
                         strategy_pnl_ticks: 0,
                         funding_pnl_ticks: 0,
                         fees_ticks: 0,
+                        peak_net_pnl_ticks: 0,
                         latest_funding_rate_e8: None,
                         last_settled_funding_time_ms: 0,
                         fills: 0,
@@ -1302,6 +1317,8 @@ impl SimulationEngine {
             funding_controller_enabled: true,
             threshold_scale_ppm: 1_000_000,
             portfolio_drawdown_guard: None,
+            symbol_drawdown_soft_bps: 0,
+            symbol_drawdown_hard_bps: 0,
             position_allocations,
             capital_usdt_ticks: None,
             states,
@@ -1406,6 +1423,17 @@ impl SimulationEngine {
         }
         self.portfolio_drawdown_guard = PortfolioDrawdownGuard::new(capital, soft, hard)
             .map_err(SimulationError::InvalidConfig)?;
+        let symbol_count = i64::try_from(self.states.len().max(1)).unwrap_or(i64::MAX);
+        self.symbol_drawdown_soft_bps = if soft == 0 {
+            0
+        } else {
+            (soft / symbol_count).max(1)
+        };
+        self.symbol_drawdown_hard_bps = if hard == 0 {
+            0
+        } else {
+            (hard / symbol_count).max(self.symbol_drawdown_soft_bps.saturating_add(1))
+        };
         self.capital_usdt_ticks = Some(capital);
         Ok(self)
     }
@@ -1416,6 +1444,74 @@ impl SimulationEngine {
             self.portfolio_drawdown_guard.as_mut(),
             s.unrealized_valuation_complete.then_some(s.net_pnl_ticks),
         )
+    }
+
+    fn update_symbol_pnl_peak(&mut self, symbol: &str) {
+        if let Some(state) = self.states.get_mut(symbol) {
+            let net_pnl = state
+                .market_pnl_ticks
+                .saturating_add(state.strategy_pnl_ticks)
+                .saturating_add(state.funding_pnl_ticks)
+                .saturating_sub(state.fees_ticks);
+            state.peak_net_pnl_ticks = state.peak_net_pnl_ticks.max(net_pnl);
+        }
+    }
+
+    fn symbol_capital(&self, symbol: &str) -> i64 {
+        self.position_allocations
+            .get(symbol)
+            .map(|allocation| allocation.budget_usdt_ticks)
+            .filter(|capital| *capital > 0)
+            .or_else(|| {
+                self.capital_usdt_ticks.map(|capital| {
+                    capital / i64::try_from(self.states.len().max(1)).unwrap_or(1).max(1)
+                })
+            })
+            .unwrap_or(0)
+    }
+
+    fn symbol_drawdown_bps(&self, symbol: &str) -> i64 {
+        let Some(state) = self.states.get(symbol) else {
+            return 0;
+        };
+        let capital = self.symbol_capital(symbol);
+        if capital <= 0 {
+            return 0;
+        }
+        let current = state
+            .market_pnl_ticks
+            .saturating_add(state.strategy_pnl_ticks)
+            .saturating_add(state.funding_pnl_ticks)
+            .saturating_sub(state.fees_ticks);
+        let loss_from_peak = state.peak_net_pnl_ticks.saturating_sub(current).max(0);
+        (i128::from(loss_from_peak)
+            .saturating_mul(10_000)
+            .checked_div(i128::from(capital.max(1)))
+            .unwrap_or(0))
+        .clamp(0, i128::from(i64::MAX)) as i64
+    }
+
+    fn symbol_risk_scaled_quantity(&self, symbol: &str, quantity: i64) -> i64 {
+        if quantity <= 0
+            || self.symbol_drawdown_soft_bps <= 0
+            || self.symbol_drawdown_hard_bps <= self.symbol_drawdown_soft_bps
+        {
+            return quantity.max(0);
+        }
+        let drawdown = self.symbol_drawdown_bps(symbol);
+        if drawdown <= self.symbol_drawdown_soft_bps {
+            return quantity;
+        }
+        if drawdown >= self.symbol_drawdown_hard_bps {
+            return 0;
+        }
+        // A linear schedule preserves some opportunity after a soft breach
+        // but drives risk to zero at the hard boundary.
+        let span = i128::from(self.symbol_drawdown_hard_bps - self.symbol_drawdown_soft_bps);
+        let remaining = i128::from(self.symbol_drawdown_hard_bps - drawdown);
+        let scale_bps = 5_000_i128 * remaining / span;
+        let scaled = i128::from(quantity) * scale_bps / 10_000_i128;
+        scaled.clamp(1, i128::from(quantity)) as i64
     }
 
     pub fn with_strategy_variant(mut self, variant: SimulationPolicyVariant) -> Self {
@@ -2139,6 +2235,10 @@ impl SimulationEngine {
                     SimulationRiskState::HaltMarketData
                 } else if !anchor_allowed {
                     SimulationRiskState::HaltAnchor
+                } else if self.symbol_drawdown_hard_bps > 0
+                    && self.symbol_drawdown_bps(symbol) >= self.symbol_drawdown_hard_bps
+                {
+                    SimulationRiskState::ReduceOnlySymbolDrawdown
                 } else if self.strategy_variant.uses_tail_guard() && m5_tail_reduce_only(state) {
                     SimulationRiskState::ReduceOnlyTailRisk
                 } else if !funding_known {
@@ -2202,6 +2302,7 @@ impl SimulationEngine {
                     risk_state.label(),
                     entry_block_reason,
                 );
+                let symbol_drawdown_bps = self.symbol_drawdown_bps(symbol);
 
                 SymbolMetrics {
                     symbol: symbol.clone(),
@@ -2267,6 +2368,7 @@ impl SimulationEngine {
                         .saturating_add(state.strategy_pnl_ticks)
                         .saturating_add(state.funding_pnl_ticks)
                         .saturating_sub(state.fees_ticks),
+                    symbol_drawdown_bps,
                     risk_metrics: None,
                     anchor_age_ms,
                     anchor_final_close: state.anchor.observed_at_ms == 0
@@ -2898,6 +3000,7 @@ impl SimulationEngine {
     fn rebalance_symbol(&mut self, symbol: &str, timestamp_ms: u64) -> Vec<SimulationRecord> {
         let decision_id = self.next_decision_id;
         self.next_decision_id = self.next_decision_id.saturating_add(1);
+        self.update_symbol_pnl_peak(symbol);
         let allocation = self.position_allocations.get(symbol);
         let max_position = allocation
             .map(|allocation| allocation.max_position)
@@ -2905,6 +3008,10 @@ impl SimulationEngine {
         let requested_quantity = allocation
             .map(|allocation| allocation.requested_quantity)
             .unwrap_or(self.requested_quantity);
+        let symbol_drawdown_bps = self.symbol_drawdown_bps(symbol);
+        let symbol_reduce_only = self.symbol_drawdown_hard_bps > 0
+            && symbol_drawdown_bps >= self.symbol_drawdown_hard_bps;
+        let requested_quantity = self.symbol_risk_scaled_quantity(symbol, requested_quantity);
         let strategy_variant = self.strategy_variant;
         let portfolio_drawdown_action = self.observe_portfolio_drawdown();
         self.update_adaptive_threshold_controller(
@@ -2953,10 +3060,13 @@ impl SimulationEngine {
                 .as_ref()
                 .is_some_and(|overlay| overlay.reduce_only);
             let portfolio_reduce_only = portfolio_drawdown_action.blocks_new_risk();
-            let entries_allowed = session_allowed && funding_allowed && !portfolio_reduce_only;
+            let entries_allowed = session_allowed
+                && funding_allowed
+                && !portfolio_reduce_only
+                && !symbol_reduce_only;
             let tail_reduce_only = strategy_variant.uses_tail_guard() && m5_tail_reduce_only(state);
             if !entries_allowed || tail_reduce_only {
-                let should_reduce = (portfolio_reduce_only && state.position != 0)
+                let should_reduce = ((portfolio_reduce_only || symbol_reduce_only) && state.position != 0)
                     || position_requires_reduction(
                         state.position,
                         session_allowed,
@@ -2971,6 +3081,8 @@ impl SimulationEngine {
                         state.working.is_some(),
                         if portfolio_reduce_only {
                             portfolio_drawdown_action.label()
+                        } else if symbol_reduce_only {
+                            "symbol_drawdown_hard_stop"
                         } else {
                             entry_restriction_reason(
                                 state.position,
@@ -3102,8 +3214,27 @@ impl SimulationEngine {
                     } else if m7_blocked {
                         None
                     } else {
-                        let fill_probability_bps =
-                            fill_probability_bps(quantity, book.bid_quantity, book.ask_quantity);
+                        let buy_queue_ahead = if state.local_book.is_valid() {
+                            state.local_book.quantity_at(true, book.bid_price_ticks)
+                        } else {
+                            book.bid_quantity
+                        };
+                        let sell_queue_ahead = if state.local_book.is_valid() {
+                            state.local_book.quantity_at(false, book.ask_price_ticks)
+                        } else {
+                            book.ask_quantity
+                        };
+                        // Use the worse side for the shared conditional-value
+                        // gate. Without a side-specific hazard model, the more
+                        // liquid side must not subsidise the less observable
+                        // queue.
+                        let fill_probability_bps = queue_aware_fill_probability_bps(
+                            quantity,
+                            book.bid_quantity,
+                            book.ask_quantity,
+                            buy_queue_ahead,
+                            sell_queue_ahead,
+                        );
                         let (buy_micro_adverse_bps, sell_micro_adverse_bps) =
                             side_adverse_selection_bps(book.bid_quantity, book.ask_quantity);
                         let (buy_pico_adverse_bps, sell_pico_adverse_bps) =
@@ -3176,7 +3307,20 @@ impl SimulationEngine {
                                 .operational
                                 .max_signal_age_ms,
                         });
-                        input.and_then(AnchorMakerStrategy::generate_adaptive_intent)
+                        input
+                            .and_then(AnchorMakerStrategy::generate_adaptive_intent)
+                            .and_then(|mut intent| {
+                                if strategy_variant == SimulationPolicyVariant::CoreV1 {
+                                    if let Some(threshold) = threshold {
+                                        intent.quantity = core_v1_margin_scaled_quantity(
+                                            state,
+                                            intent,
+                                            threshold,
+                                        );
+                                    }
+                                }
+                                (intent.quantity > 0).then_some(intent)
+                            })
                     };
                     let reason = if intent.is_some() {
                         "admissible"
@@ -3963,7 +4107,14 @@ fn m9_intent_for_state(
         .calibration
         .snapshot(ppm_to_pico_bps(fee_ppm.saturating_mul(2)));
     let Some(calibration) = calibration_snapshot.calibration else {
-        return (None, false, "m9_calibration_unavailable");
+        // Separate a causal warm-up state from a malformed/invalid snapshot.
+        // They must not share one rejection bucket when judging whether M9 has
+        // enough evidence to become a challenger.
+        let reason = match calibration_snapshot.status {
+            CalibrationStatus::InsufficientHistory => "m9_calibration_warming_up",
+            CalibrationStatus::Calibrated => "m9_calibration_invalid",
+        };
+        return (None, false, reason);
     };
     let decision = decide_m9(
         M9Input {
@@ -4434,6 +4585,7 @@ fn entry_block_reason_for(
 ) -> &'static str {
     match risk_state {
         SimulationRiskState::ReduceOnlyEquitySession => "equity_session_open",
+        SimulationRiskState::ReduceOnlySymbolDrawdown => "symbol_drawdown_hard_stop",
         SimulationRiskState::ReduceOnlyFundingDeadline => "funding_deadline",
         SimulationRiskState::ReduceOnlyFundingRisk => "funding_cost_exceeds_edge",
         SimulationRiskState::NoEntryFunding => "funding_entry_blocked",
@@ -5007,6 +5159,51 @@ fn m5_tail_reduce_only(state: &SimulationSymbolState) -> bool {
     m5_tail_stress_bps(state) >= M5_TAIL_REDUCE_ONLY_BPS
 }
 
+fn core_v1_margin_scaled_quantity(
+    state: &SimulationSymbolState,
+    intent: OrderIntent,
+    threshold: AdaptiveThreshold,
+) -> i64 {
+    if intent.reduce_only || intent.quantity <= 0 {
+        return intent.quantity;
+    }
+    let Some(fair_value) = fair_value_for_state(state) else {
+        return intent.quantity;
+    };
+    let edge = match intent.side {
+        Side::Buy => edge_pico_bps(fair_value.price.0, intent.price),
+        Side::Sell => edge_pico_bps(intent.price, fair_value.price.0),
+    };
+    let Some(edge) = edge.filter(|edge| *edge > 0) else {
+        return intent.quantity;
+    };
+    let Some(hurdle) = threshold.required_pico_bps().filter(|hurdle| *hurdle > 0) else {
+        return intent.quantity;
+    };
+    fractional_edge_quantity(edge, hurdle, intent.quantity)
+}
+
+/// Fractional-Kelly-inspired sizing without claiming a return distribution.
+/// A marginal edge receives 25% of the admissible quote, while an edge far
+/// above its causal hurdle approaches 100%. The function is deterministic,
+/// monotone in edge, and never increases the quantity supplied by admission.
+fn fractional_edge_quantity(edge_pico_bps: i64, hurdle_pico_bps: i64, quantity: i64) -> i64 {
+    if edge_pico_bps <= 0 || hurdle_pico_bps <= 0 || quantity <= 0 {
+        return quantity.max(0);
+    }
+    if edge_pico_bps < hurdle_pico_bps {
+        // Defense in depth: the sizing layer must never turn a stale or
+        // inconsistent fair-value calculation into a live admissible quote.
+        return 0;
+    }
+    let margin = i128::from(edge_pico_bps - hurdle_pico_bps);
+    let edge = i128::from(edge_pico_bps);
+    let scale_bps = 2_500_i128 + margin * 7_500_i128 / edge;
+    (i128::from(quantity) * scale_bps / 10_000_i128)
+        .clamp(1, i128::from(quantity))
+        .min(i128::from(i64::MAX)) as i64
+}
+
 fn m7_entry_admissible(state: &SimulationSymbolState, threshold_pico_bps: i64) -> bool {
     let Some(book) = state.book else {
         return false;
@@ -5098,6 +5295,33 @@ fn fill_probability_bps(quantity: i64, bid_quantity: i64, ask_quantity: i64) -> 
     // This is an explicitly conservative top-of-book proxy. It is not claimed
     // to be a calibrated fill hazard until completed fills are observed.
     (10_000_i64 - participation_bps * 8 / 10).clamp(500, 9_500) as u16
+}
+
+/// Conservative queue-survival proxy used by fill-aware challengers.
+///
+/// If `Q` is the observable queue ahead, `D` is displayed depth, and `q` is
+/// our order size, `p = D / (D + Q + 2q)` is a bounded surrogate for a
+/// first-passage queue model. It is not called a calibrated probability; it
+/// prevents a top-of-book ratio from implying 95% fill likelihood while a
+/// large queue is visibly ahead of us.
+fn queue_aware_fill_probability_bps(
+    quantity: i64,
+    bid_quantity: i64,
+    ask_quantity: i64,
+    buy_queue_ahead: i64,
+    sell_queue_ahead: i64,
+) -> u16 {
+    if quantity <= 0 || bid_quantity <= 0 || ask_quantity <= 0 {
+        return 0;
+    }
+    let side_probability = |depth: i64, queue: i64| {
+        let denominator = i128::from(depth.max(1))
+            .saturating_add(i128::from(queue.max(0)))
+            .saturating_add(i128::from(quantity.max(1)).saturating_mul(2));
+        (i128::from(depth) * 10_000 / denominator).clamp(500, 9_500) as i64
+    };
+    side_probability(bid_quantity, buy_queue_ahead)
+        .min(side_probability(ask_quantity, sell_queue_ahead)) as u16
 }
 
 fn local_day(timestamp_ms: u64) -> u64 {

@@ -457,9 +457,11 @@ fn build_engine(
             .map(|allocations| {
                 allocations
                     .values()
-                    .map(|allocation| allocation.budget_usdt_ticks)
-                    .sum::<i64>()
+                    .try_fold(0_i64, |total, allocation| {
+                        total.checked_add(allocation.budget_usdt_ticks)
+                    })
             })
+            .flatten()
             .filter(|capital| *capital > 0)
             .ok_or(SimulationError::InvalidConfig(
                 "portfolio drawdown guard requires allocated capital",
@@ -484,6 +486,8 @@ fn validate(config: &SimulationBatchConfig) -> Result<(), SimulationError> {
         || config.experiment_plan_digest.trim().is_empty()
         || config.universe_id.trim().is_empty()
         || config.market_id.trim().is_empty()
+        || config.threshold_scale_ppm <= 0
+        || config.threshold_scale_ppm > 1_000_000
         || config.funding_lead_ms == 0
         || config.max_subscriptions_per_shard == 0
         || config.market_event_queue_capacity == 0
@@ -501,6 +505,17 @@ fn validate(config: &SimulationBatchConfig) -> Result<(), SimulationError> {
     if config.specs.iter().any(|spec| spec.label.trim().is_empty()) {
         return Err(SimulationError::InvalidConfig(
             "batch execution labels must be non-empty",
+        ));
+    }
+    if config.environment == BinanceEnvironment::Production
+        && config
+            .specs
+            .iter()
+            .any(|spec| spec.variant == SimulationPolicyVariant::CoreV1)
+        && config.threshold_scale_ppm < 1_000_000
+    {
+        return Err(SimulationError::InvalidConfig(
+            "CORE_V1 production evidence hurdle cannot be scaled below 100%",
         ));
     }
     if config.execution_filters.len() != config.symbols.len()
