@@ -1008,8 +1008,8 @@ pub(super) fn empirical_fill_probability_lcb_bps_for_side(
     };
     if side_trials >= MIN_EMPIRICAL_FILL_TRIALS {
         return Some(
-            wilson_lower_probability_bps(side_fills.min(side_trials), side_trials)
-                .clamp(0, 10_000) as u16,
+            wilson_lower_probability_bps(side_fills.min(side_trials), side_trials).clamp(0, 10_000)
+                as u16,
         );
     }
     empirical_fill_probability_lcb_bps(state)
@@ -1135,9 +1135,8 @@ fn conservative_markout_upper_from_samples(
     let conditional_q90 = positive[percentile_index];
     let probability_upper_bps =
         wilson_upper_probability_bps(positive.len() as u64, samples.len() as u64);
-    let conservative =
-        (i128::from(conditional_q90) * i128::from(probability_upper_bps) / 10_000)
-            .clamp(0, i128::from(i64::MAX)) as i64;
+    let conservative = (i128::from(conditional_q90) * i128::from(probability_upper_bps) / 10_000)
+        .clamp(0, i128::from(i64::MAX)) as i64;
     ewma.max(conservative)
 }
 

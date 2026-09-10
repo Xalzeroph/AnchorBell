@@ -1921,8 +1921,9 @@ impl SimulationEngine {
                 let adverse_markout_bps =
                     pico_bps_to_bps(adverse_markout_upper_pico_bps).clamp(0, 100);
                 let directional_markout_bps = pico_bps_to_bps(
-                    conservative_adverse_markout_pico_bps_for_side(state, Side::Buy)
-                        .max(conservative_adverse_markout_pico_bps_for_side(state, Side::Sell)),
+                    conservative_adverse_markout_pico_bps_for_side(state, Side::Buy).max(
+                        conservative_adverse_markout_pico_bps_for_side(state, Side::Sell),
+                    ),
                 )
                 .clamp(0, 100);
                 let residual_regime_bps = pico_bps_to_bps(
