@@ -4970,12 +4970,37 @@ fn m5_tail_risk_pico(state: &SimulationSymbolState) -> i64 {
 }
 
 fn m5_quote_quantity(state: &SimulationSymbolState, requested_quantity: i64) -> i64 {
-    match m5_tail_stress_bps(state) {
-        stress if stress >= M5_TAIL_HALT_BPS => 0,
-        stress if stress >= M5_TAIL_REDUCE_ONLY_BPS => requested_quantity / 4,
-        stress if stress >= M5_TAIL_CAUTION_BPS => requested_quantity / 2,
-        _ => requested_quantity,
+    m5_scaled_quantity(m5_tail_stress_bps(state), requested_quantity)
+}
+
+fn m5_scaled_quantity(stress: i64, requested_quantity: i64) -> i64 {
+    if requested_quantity <= 0 {
+        return 0;
     }
+    if stress >= M5_TAIL_HALT_BPS {
+        return 0;
+    }
+    if stress <= M5_TAIL_CAUTION_BPS {
+        return requested_quantity;
+    }
+    if stress >= M5_TAIL_REDUCE_ONLY_BPS {
+        return requested_quantity / 4;
+    }
+
+    // Use a continuous risk budget between the caution and reduce-only
+    // boundaries. The old step function changed quantity from 100% to 50%
+    // at exactly 35 bps and from 50% to 25% at 60 bps, creating artificial
+    // quote churn and discontinuous fill selection. The affine scale is
+    // monotone in stress, bounded in [25%, 100%], and remains conservative
+    // relative to the old policy at the reduce-only boundary.
+    let span = M5_TAIL_REDUCE_ONLY_BPS - M5_TAIL_CAUTION_BPS;
+    let remaining = M5_TAIL_REDUCE_ONLY_BPS - stress;
+    let scale_bps = 2_500_i128
+        + i128::from(remaining.max(0)) * 7_500_i128 / i128::from(span.max(1));
+    let scaled = i128::from(requested_quantity) * scale_bps / 10_000_i128;
+    scaled
+        .clamp(1, i128::from(requested_quantity))
+        .min(i128::from(i64::MAX)) as i64
 }
 
 fn m5_tail_reduce_only(state: &SimulationSymbolState) -> bool {
