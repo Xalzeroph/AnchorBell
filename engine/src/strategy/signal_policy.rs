@@ -328,8 +328,8 @@ pub fn decide(input: SignalInput) -> SignalDecision {
     } else {
         AdaptiveThreshold::bps_to_pico(input.inventory_skew_bps)
     };
-    let side_specific_fill = input.buy_fill_probability_bps != 0
-        || input.sell_fill_probability_bps != 0;
+    let side_specific_fill =
+        input.buy_fill_probability_bps != 0 || input.sell_fill_probability_bps != 0;
     let buy_fill_probability_bps = if side_specific_fill {
         input.buy_fill_probability_bps
     } else {

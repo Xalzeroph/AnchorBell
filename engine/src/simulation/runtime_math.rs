@@ -472,7 +472,10 @@ pub(super) fn residual_regime_risk_pico_bps(state: &SimulationSymbolState, side:
     };
     let directional_curvature = match side {
         Side::Buy => state.ewma_residual_curvature_pico_bps.max(0),
-        Side::Sell => state.ewma_residual_curvature_pico_bps.saturating_neg().max(0),
+        Side::Sell => state
+            .ewma_residual_curvature_pico_bps
+            .saturating_neg()
+            .max(0),
     };
     let drift = expansion
         .max(i128::from(directional_drift))
@@ -985,6 +988,33 @@ pub(super) fn empirical_fill_probability_lcb_bps(state: &SimulationSymbolState) 
     Some(wilson_lower_probability_bps(successes, trials).clamp(0, 10_000) as u16)
 }
 
+/// Direction-specific lifecycle lower bound. Before one side has enough
+/// observations, retain the aggregate lower bound only as a conservative
+/// floor; opposite-side evidence can reduce this value but can never
+/// increase the sparse side's estimated fill probability.
+pub(super) fn empirical_fill_probability_lcb_bps_for_side(
+    state: &SimulationSymbolState,
+    side: Side,
+) -> Option<u16> {
+    let (side_trials, side_fills) = match side {
+        Side::Buy => (
+            state.calibration.order_placed_buy_times_ms.len() as u64,
+            state.calibration.fill_buy_times_ms.len() as u64,
+        ),
+        Side::Sell => (
+            state.calibration.order_placed_sell_times_ms.len() as u64,
+            state.calibration.fill_sell_times_ms.len() as u64,
+        ),
+    };
+    if side_trials >= MIN_EMPIRICAL_FILL_TRIALS {
+        return Some(
+            wilson_lower_probability_bps(side_fills.min(side_trials), side_trials)
+                .clamp(0, 10_000) as u16,
+        );
+    }
+    empirical_fill_probability_lcb_bps(state)
+}
+
 /// Fuse model-based queue survival with observed lifecycle evidence. The
 /// minimum is a robust intersection of two different information sources:
 /// neither a favorable book snapshot nor a short run of fills can overrule a
@@ -1002,11 +1032,129 @@ pub(super) fn effective_fill_probability_bps_by_side(
     state: &SimulationSymbolState,
     queue_probabilities: (u16, u16),
 ) -> (u16, u16) {
-    let empirical = empirical_fill_probability_lcb_bps(state);
+    let buy_empirical = empirical_fill_probability_lcb_bps_for_side(state, Side::Buy);
+    let sell_empirical = empirical_fill_probability_lcb_bps_for_side(state, Side::Sell);
     (
-        empirical.map_or(queue_probabilities.0, |value| queue_probabilities.0.min(value)),
-        empirical.map_or(queue_probabilities.1, |value| queue_probabilities.1.min(value)),
+        buy_empirical.map_or(queue_probabilities.0, |value| {
+            queue_probabilities.0.min(value)
+        }),
+        sell_empirical.map_or(queue_probabilities.1, |value| {
+            queue_probabilities.1.min(value)
+        }),
     )
+}
+
+pub(super) fn update_markout_feedback(
+    state: &mut SimulationSymbolState,
+    mark_price_ticks: i64,
+    timestamp_ms: u64,
+) {
+    if mark_price_ticks <= 0 {
+        return;
+    }
+    while let Some(observation) = state.pending_markouts.front().copied() {
+        if timestamp_ms < observation.due_at_ms {
+            break;
+        }
+        state.pending_markouts.pop_front();
+        let adverse_ticks = match observation.side {
+            Side::Buy => i128::from(observation.fill_price_ticks) - i128::from(mark_price_ticks),
+            Side::Sell => i128::from(mark_price_ticks) - i128::from(observation.fill_price_ticks),
+        };
+        let sample_micro_bps = if adverse_ticks > 0 && observation.fill_price_ticks > 0 {
+            (adverse_ticks * 10_000 * i128::from(MICRO_BPS_SCALE)
+                / i128::from(observation.fill_price_ticks))
+            .clamp(0, i128::from(i64::MAX)) as i64
+        } else {
+            0
+        };
+        let sample_pico_bps = (i128::from(sample_micro_bps)
+            * i128::from(PICO_BPS_SCALE / MICRO_BPS_SCALE))
+        .clamp(0, i128::from(i64::MAX)) as i64;
+        state.calibration.observe_directional_markout(
+            timestamp_ms,
+            observation.side,
+            sample_pico_bps,
+        );
+        state.ewma_adverse_markout_micro_bps =
+            ewma_micro(state.ewma_adverse_markout_micro_bps, sample_micro_bps);
+        state.evaluated_markouts = state.evaluated_markouts.saturating_add(1);
+        if sample_micro_bps > 0 {
+            state.adverse_markouts = state.adverse_markouts.saturating_add(1);
+        }
+    }
+}
+
+/// Returns a one-sided, finite-sample upper estimate of adverse selection.
+///
+/// The markout deque contains one non-negative observation per completed
+/// horizon. We estimate `P(markout > 0)` with a 95% Wilson upper bound and
+/// multiply it by the empirical 90th percentile of positive markouts. Taking
+/// the maximum with the EWMA makes the admission cost monotone: new evidence
+/// can only add protection, while the raw EWMA remains available for
+/// diagnostics and adaptation-lag analysis.
+pub(super) fn conservative_adverse_markout_pico_bps(state: &SimulationSymbolState) -> i64 {
+    let ewma = state.ewma_adverse_markout_pico_bps.max(0);
+    conservative_markout_upper_from_samples(&state.calibration.adverse_markout_pico_bps, ewma)
+}
+
+pub(super) fn conservative_adverse_markout_pico_bps_for_side(
+    state: &SimulationSymbolState,
+    side: Side,
+) -> i64 {
+    let samples = match side {
+        Side::Buy => &state.calibration.adverse_markout_buy_pico_bps,
+        Side::Sell => &state.calibration.adverse_markout_sell_pico_bps,
+    };
+    if samples.len() < MIN_MARKOUT_FEEDBACK_SAMPLES {
+        return conservative_adverse_markout_pico_bps(state);
+    }
+    conservative_markout_upper_from_samples(samples, 0)
+}
+
+fn conservative_markout_upper_from_samples(
+    samples: &std::collections::VecDeque<i64>,
+    ewma: i64,
+) -> i64 {
+    let ewma = ewma.max(0);
+    if samples.len() < MIN_MARKOUT_FEEDBACK_SAMPLES {
+        return ewma;
+    }
+    let mut positive = samples
+        .iter()
+        .copied()
+        .filter(|sample| *sample > 0)
+        .collect::<Vec<_>>();
+    if positive.is_empty() {
+        return ewma;
+    }
+    positive.sort_unstable();
+    let percentile_index = ((positive.len() * 9).saturating_add(9) / 10)
+        .saturating_sub(1)
+        .min(positive.len() - 1);
+    let conditional_q90 = positive[percentile_index];
+    let probability_upper_bps =
+        wilson_upper_probability_bps(positive.len() as u64, samples.len() as u64);
+    let conservative =
+        (i128::from(conditional_q90) * i128::from(probability_upper_bps) / 10_000)
+            .clamp(0, i128::from(i64::MAX)) as i64;
+    ewma.max(conservative)
+}
+
+fn wilson_upper_probability_bps(successes: u64, trials: u64) -> i64 {
+    if trials == 0 {
+        return 0;
+    }
+    let n = trials as f64;
+    let p = successes.min(trials) as f64 / n;
+    let z = 1.96_f64;
+    let z_squared = z * z;
+    let denominator = 1.0 + z_squared / n;
+    let center = p + z_squared / (2.0 * n);
+    let margin = z * (p * (1.0 - p) / n + z_squared / (4.0 * n * n)).sqrt();
+    ((center + margin) / denominator * 10_000.0)
+        .ceil()
+        .clamp(0.0, 10_000.0) as i64
 }
 
 pub(super) fn local_day(timestamp_ms: u64) -> u64 {

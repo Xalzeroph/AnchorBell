@@ -55,6 +55,7 @@ resize an order.
 | L4 | Inventory control | Position cap, skew and reduction priority | `strategy/inventory.rs`, runtime | Convex risk budget and monotone reducing path |
 | L4 | Cross-symbol/region risk | Common-mode concentration and region factor | runtime | Robust covariance shrinkage and factor-neutral allocation |
 | L4 | Tail and drawdown | F5 tail, symbol/portfolio drawdown and hard stops | runtime, `portfolio_guard.rs` | Expected shortfall, path-dependent drawdown and ruin bounds |
+| L4 | Portfolio risk budget | Cross-symbol concentration, residual-regime risk and common trend | runtime, capital allocator | Risk-budget allocation with robust peer factor surcharge |
 | L4 | Funding/deadline flatten | M8 funding overlay and earliest deadline | `m8.rs`, runtime, `flatten.rs` | Event-time funding uncertainty and deadline-constrained control |
 | L5 | PnL/accounting | Realized, unrealized, funding, fees and strategy alpha | runtime, `execution/pnl.rs` | Strict attribution: market beta versus execution residual |
 | L5 | Lifecycle/reconciliation | Order state, position truth and recovery | `execution/reconciliation.rs`, `recovery.rs` | Unknown-state monotonic risk reduction |
@@ -82,9 +83,10 @@ The implementation order is causal and conservative:
    hysteresis; signed residual drift, absolute expansion, sign-persistence
    and reversion evidence as separate causal processes. The Core V1 budget
    applies a sample-shrunk continuous scale; it does not turn uncertain
-   residual dynamics into an unlogged hard gate. Directional queue survival and
-   directional markout bounds are kept separate, so one side's adverse flow
-   cannot erase the opposite side's evidence.
+   residual dynamics into an unlogged hard gate. Directional queue survival,
+   lifecycle fill hazards and markout bounds are kept separate, so one side's
+   adverse flow cannot erase the opposite side's evidence; sparse sides retain
+   only the aggregate lower-bound floor until their own evidence is sufficient.
 4. **Hierarchical cross-section:** symbol estimates shrink toward their
    region factor only when peer observations are present; a single symbol
    cannot set the portfolio's belief.

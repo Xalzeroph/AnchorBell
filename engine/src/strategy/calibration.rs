@@ -64,6 +64,16 @@ pub struct CalibrationState {
     pub order_placed_times_ms: VecDeque<u64>,
     #[serde(default)]
     pub fill_times_ms: VecDeque<u64>,
+    /// Directional lifecycle streams used for side-specific fill hazards.
+    /// The aggregate streams remain for compatibility and global diagnostics.
+    #[serde(default)]
+    pub order_placed_buy_times_ms: VecDeque<u64>,
+    #[serde(default)]
+    pub order_placed_sell_times_ms: VecDeque<u64>,
+    #[serde(default)]
+    pub fill_buy_times_ms: VecDeque<u64>,
+    #[serde(default)]
+    pub fill_sell_times_ms: VecDeque<u64>,
     pub reversion_events: u64,
     pub return_abs_pico_bps: VecDeque<i64>,
     pub spread_pico_bps: VecDeque<i64>,
@@ -95,6 +105,10 @@ impl CalibrationState {
             fill_events: 0,
             order_placed_times_ms: VecDeque::new(),
             fill_times_ms: VecDeque::new(),
+            order_placed_buy_times_ms: VecDeque::new(),
+            order_placed_sell_times_ms: VecDeque::new(),
+            fill_buy_times_ms: VecDeque::new(),
+            fill_sell_times_ms: VecDeque::new(),
             reversion_events: 0,
             return_abs_pico_bps: VecDeque::new(),
             spread_pico_bps: VecDeque::new(),
@@ -169,12 +183,26 @@ impl CalibrationState {
     }
 
     pub fn observe_order_placed(&mut self, time: u64) {
+        self.observe_order_placed_inner(time, None);
+    }
+
+    pub fn observe_order_placed_side(&mut self, time: u64, side: Side) {
+        self.observe_order_placed_inner(time, Some(side));
+    }
+
+    fn observe_order_placed_inner(&mut self, time: u64, side: Option<Side>) {
         if self.frozen {
             return;
         }
         self.touch(time);
         self.orders_placed = self.orders_placed.saturating_add(1);
         Self::push(&mut self.order_placed_times_ms, time);
+        if let Some(side) = side {
+            match side {
+                Side::Buy => Self::push(&mut self.order_placed_buy_times_ms, time),
+                Side::Sell => Self::push(&mut self.order_placed_sell_times_ms, time),
+            }
+        }
     }
 
     pub fn observe_fill(
@@ -184,12 +212,38 @@ impl CalibrationState {
         quantity: i64,
         displayed_depth: i64,
     ) {
+        self.observe_fill_inner(time, None, quantity, displayed_depth);
+    }
+
+    pub fn observe_fill_side(
+        &mut self,
+        time: u64,
+        side: Side,
+        quantity: i64,
+        displayed_depth: i64,
+    ) {
+        self.observe_fill_inner(time, Some(side), quantity, displayed_depth);
+    }
+
+    fn observe_fill_inner(
+        &mut self,
+        time: u64,
+        side: Option<Side>,
+        quantity: i64,
+        displayed_depth: i64,
+    ) {
         if self.frozen {
             return;
         }
         self.touch(time);
         self.fill_events = self.fill_events.saturating_add(1);
         Self::push(&mut self.fill_times_ms, time);
+        if let Some(side) = side {
+            match side {
+                Side::Buy => Self::push(&mut self.fill_buy_times_ms, time),
+                Side::Sell => Self::push(&mut self.fill_sell_times_ms, time),
+            }
+        }
         if displayed_depth > 0 && quantity > 0 {
             let participation = (i128::from(quantity) * 10_000 / i128::from(displayed_depth))
                 .clamp(0, 10_000) as i64;

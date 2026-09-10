@@ -848,11 +848,9 @@ fn directional_markout_bounds_do_not_mix_sides_after_warmup() {
     let mut engine = engine();
     let state = engine.states.get_mut("CXMTUSDT").expect("test symbol");
     for index in 0..8 {
-        state.calibration.observe_directional_markout(
-            index + 1,
-            Side::Buy,
-            20 * PICO_BPS_SCALE,
-        );
+        state
+            .calibration
+            .observe_directional_markout(index + 1, Side::Buy, 20 * PICO_BPS_SCALE);
         state
             .calibration
             .observe_directional_markout(index + 100, Side::Sell, PICO_BPS_SCALE);
@@ -910,6 +908,31 @@ fn empirical_fill_lower_bound_only_activates_after_lifecycle_floor() {
     }
     assert_eq!(empirical_fill_probability_lcb_bps(state), Some(0));
     assert_eq!(effective_fill_probability_bps(state, 9_500), 0);
+}
+
+#[test]
+fn empirical_fill_lower_bound_is_directional() {
+    let mut engine = engine();
+    let state = engine.states.get_mut("CXMTUSDT").expect("test symbol");
+    for index in 0..MIN_EMPIRICAL_FILL_TRIALS {
+        let buy_time = index + 1;
+        state
+            .calibration
+            .observe_order_placed_side(buy_time, Side::Buy);
+        state
+            .calibration
+            .observe_fill_side(buy_time + 1, Side::Buy, 10, 100);
+        let sell_time = index + 100;
+        state
+            .calibration
+            .observe_order_placed_side(sell_time, Side::Sell);
+    }
+    let buy = empirical_fill_probability_lcb_bps_for_side(state, Side::Buy).unwrap();
+    let sell = empirical_fill_probability_lcb_bps_for_side(state, Side::Sell).unwrap();
+    assert!(buy > sell);
+    let effective = effective_fill_probability_bps_by_side(state, (9_500, 9_500));
+    assert_eq!(effective.0, buy);
+    assert_eq!(effective.1, sell);
 }
 
 #[test]

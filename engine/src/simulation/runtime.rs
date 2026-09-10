@@ -1164,6 +1164,11 @@ pub struct SymbolMetrics {
     /// Wilson lower bound of observed order-level fills. `None` means the
     /// rolling lifecycle sample has not reached the minimum evidence floor.
     pub empirical_fill_probability_lcb_bps: Option<u16>,
+    /// Direction-specific Wilson lower bounds. Sparse sides conservatively
+    /// fall back to the aggregate lower bound and never borrow a favorable
+    /// bound from the opposite side.
+    pub buy_empirical_fill_probability_lcb_bps: Option<u16>,
+    pub sell_empirical_fill_probability_lcb_bps: Option<u16>,
     pub fair_value_ticks: Option<i64>,
     pub fair_value_confidence_bps: Option<i64>,
     pub market_regime: Option<String>,
@@ -1915,12 +1920,30 @@ impl SimulationEngine {
                 let adverse_markout_upper_pico_bps = conservative_adverse_markout_pico_bps(state);
                 let adverse_markout_bps =
                     pico_bps_to_bps(adverse_markout_upper_pico_bps).clamp(0, 100);
+                let directional_markout_bps = pico_bps_to_bps(
+                    conservative_adverse_markout_pico_bps_for_side(state, Side::Buy)
+                        .max(conservative_adverse_markout_pico_bps_for_side(state, Side::Sell)),
+                )
+                .clamp(0, 100);
+                let residual_regime_bps = pico_bps_to_bps(
+                    residual_regime_risk_pico_bps(state, Side::Buy)
+                        .max(residual_regime_risk_pico_bps(state, Side::Sell)),
+                )
+                .clamp(0, 100);
+                let market_trend_bps = pico_bps_to_bps(
+                    self.market_trend_conflict_pico_bps(symbol, Side::Buy)
+                        .max(self.market_trend_conflict_pico_bps(symbol, Side::Sell)),
+                )
+                .clamp(0, 100);
                 let risk_bps = 1_i64
                     .saturating_add(state.ewma_abs_return_bps.saturating_mul(3))
                     .saturating_add(state.ewma_spread_bps)
                     .saturating_add(gap_bps / 2)
                     .saturating_add(tail_bps / 2)
                     .saturating_add(adverse_markout_bps.saturating_mul(2))
+                    .saturating_add(directional_markout_bps)
+                    .saturating_add(residual_regime_bps)
+                    .saturating_add(market_trend_bps / 2)
                     .saturating_add(fee_drag_bps)
                     .saturating_add(post_fee_loss_bps)
                     .max(1);
@@ -2624,6 +2647,10 @@ impl SimulationEngine {
                         fill_probability_bps(quote_quantity, book.bid_quantity, book.ask_quantity)
                     }),
                     empirical_fill_probability_lcb_bps: empirical_fill_probability_lcb_bps(state),
+                    buy_empirical_fill_probability_lcb_bps:
+                        empirical_fill_probability_lcb_bps_for_side(state, Side::Buy),
+                    sell_empirical_fill_probability_lcb_bps:
+                        empirical_fill_probability_lcb_bps_for_side(state, Side::Sell),
                     fair_value_ticks: fair_value.map(|estimate| estimate.price.0),
                     fair_value_confidence_bps: fair_value.map(|estimate| estimate.confidence_bps),
                     market_regime: fair_value.map(|estimate| estimate.regime.label().to_owned()),
@@ -3067,9 +3094,9 @@ impl SimulationEngine {
                 Side::Buy => book.bid_quantity,
                 Side::Sell => book.ask_quantity,
             };
-            state.calibration.observe_fill(
+            state.calibration.observe_fill_side(
                 trade.event_time_ms.max(trade.trade_time_ms),
-                order.placed_at_ms,
+                order.side,
                 quantity,
                 displayed_depth,
             );
@@ -3438,8 +3465,7 @@ impl SimulationEngine {
                         // processes. A shared minimum was safe but overly
                         // destructive: one congested side erased the other
                         // side's valid conditional value.
-                        let queue_fill_probabilities_bps =
-                            queue_aware_fill_probability_bps_by_side(
+                        let queue_fill_probabilities_bps = queue_aware_fill_probability_bps_by_side(
                             quantity,
                             book.bid_quantity,
                             book.ask_quantity,
@@ -4061,7 +4087,9 @@ impl SimulationEngine {
                 .saturating_add(self.realism.latency.total_entry_ms()),
             cancel_requested_at_ms: None,
         });
-        state.calibration.observe_order_placed(timestamp_ms);
+        state
+            .calibration
+            .observe_order_placed_side(timestamp_ms, intent.side);
         self.order_count = self.order_count.saturating_add(1);
         let state = self.states.get(symbol).expect("symbol state exists");
         vec![self.record(
@@ -5037,125 +5065,6 @@ fn residual_pico_bps_for_state(state: &SimulationSymbolState) -> Option<i64> {
     let fair_value = fair_value_for_state(state)?;
     let mid = clamp_i128((i128::from(book.bid_price_ticks) + i128::from(book.ask_price_ticks)) / 2);
     (mid > 0).then(|| bps_between_pico(fair_value.price.0, mid))
-}
-
-fn update_markout_feedback(
-    state: &mut SimulationSymbolState,
-    mark_price_ticks: i64,
-    timestamp_ms: u64,
-) {
-    if mark_price_ticks <= 0 {
-        return;
-    }
-    while let Some(observation) = state.pending_markouts.front().copied() {
-        if timestamp_ms < observation.due_at_ms {
-            break;
-        }
-        state.pending_markouts.pop_front();
-        let adverse_ticks = match observation.side {
-            Side::Buy => i128::from(observation.fill_price_ticks) - i128::from(mark_price_ticks),
-            Side::Sell => i128::from(mark_price_ticks) - i128::from(observation.fill_price_ticks),
-        };
-        let sample_micro_bps = if adverse_ticks > 0 && observation.fill_price_ticks > 0 {
-            (adverse_ticks * 10_000 * i128::from(MICRO_BPS_SCALE)
-                / i128::from(observation.fill_price_ticks))
-            .clamp(0, i128::from(i64::MAX)) as i64
-        } else {
-            0
-        };
-        let sample_pico_bps = (i128::from(sample_micro_bps)
-            * i128::from(PICO_BPS_SCALE / MICRO_BPS_SCALE))
-        .clamp(0, i128::from(i64::MAX)) as i64;
-        state.calibration.observe_directional_markout(
-            timestamp_ms,
-            observation.side,
-            sample_pico_bps,
-        );
-        state.ewma_adverse_markout_micro_bps =
-            ewma_micro(state.ewma_adverse_markout_micro_bps, sample_micro_bps);
-        state.evaluated_markouts = state.evaluated_markouts.saturating_add(1);
-        if sample_micro_bps > 0 {
-            state.adverse_markouts = state.adverse_markouts.saturating_add(1);
-        }
-    }
-}
-
-/// Returns a one-sided, finite-sample upper estimate of adverse selection.
-///
-/// The markout deque contains one non-negative observation per completed
-/// horizon. We estimate `P(markout > 0)` with a 95% Wilson upper bound and
-/// multiply it by the empirical 90th percentile of positive markouts. Taking
-/// the maximum with the EWMA makes the admission cost monotone: new evidence
-/// can only add protection, while the raw EWMA remains available for
-/// diagnostics and adaptation-lag analysis.
-fn conservative_adverse_markout_pico_bps(state: &SimulationSymbolState) -> i64 {
-    let ewma = state.ewma_adverse_markout_pico_bps.max(0);
-    conservative_markout_upper_from_samples(
-        &state.calibration.adverse_markout_pico_bps,
-        ewma,
-    )
-}
-
-fn conservative_adverse_markout_pico_bps_for_side(
-    state: &SimulationSymbolState,
-    side: Side,
-) -> i64 {
-    let samples = match side {
-        Side::Buy => &state.calibration.adverse_markout_buy_pico_bps,
-        Side::Sell => &state.calibration.adverse_markout_sell_pico_bps,
-    };
-    if samples.len() < MIN_MARKOUT_FEEDBACK_SAMPLES {
-        // Until the directional stream has its own finite-sample floor, retain
-        // the aggregate upper bound. This is conservative and avoids treating
-        // a sparse side as evidence of zero adverse selection.
-        return conservative_adverse_markout_pico_bps(state);
-    }
-    conservative_markout_upper_from_samples(samples, 0)
-}
-
-fn conservative_markout_upper_from_samples(
-    samples: &std::collections::VecDeque<i64>,
-    ewma: i64,
-) -> i64 {
-    let ewma = ewma.max(0);
-    if samples.len() < MIN_MARKOUT_FEEDBACK_SAMPLES {
-        return ewma;
-    }
-
-    let mut positive = samples
-        .iter()
-        .copied()
-        .filter(|sample| *sample > 0)
-        .collect::<Vec<_>>();
-    if positive.is_empty() {
-        return ewma;
-    }
-    positive.sort_unstable();
-    let percentile_index = ((positive.len() * 9).saturating_add(9) / 10)
-        .saturating_sub(1)
-        .min(positive.len() - 1);
-    let conditional_q90 = positive[percentile_index];
-    let probability_upper_bps =
-        wilson_upper_probability_bps(positive.len() as u64, samples.len() as u64);
-    let conservative = (i128::from(conditional_q90) * i128::from(probability_upper_bps) / 10_000)
-        .clamp(0, i128::from(i64::MAX)) as i64;
-    ewma.max(conservative)
-}
-
-fn wilson_upper_probability_bps(successes: u64, trials: u64) -> i64 {
-    if trials == 0 {
-        return 0;
-    }
-    let n = trials as f64;
-    let p = successes.min(trials) as f64 / n;
-    let z = 1.96_f64;
-    let z_squared = z * z;
-    let denominator = 1.0 + z_squared / n;
-    let center = p + z_squared / (2.0 * n);
-    let margin = z * (p * (1.0 - p) / n + z_squared / (4.0 * n * n)).sqrt();
-    ((center + margin) / denominator * 10_000.0)
-        .ceil()
-        .clamp(0.0, 10_000.0) as i64
 }
 
 fn apply_position_fill(
