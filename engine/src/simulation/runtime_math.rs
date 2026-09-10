@@ -464,7 +464,7 @@ pub(super) fn residual_regime_risk_pico_bps(state: &SimulationSymbolState, side:
             .saturating_neg()
             .max(0),
     };
-    let drift = i128::from(expansion.max(directional_drift));
+    let drift = expansion.max(i128::from(directional_drift));
     if drift <= 0 {
         return 0;
     }

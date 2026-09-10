@@ -391,24 +391,30 @@ impl CalibrationSnapshot {
             _ => None,
         };
         let mut parameters = Vec::new();
-        let mut add =
-            |name: &str, value: i64, unit: &str, count: u64, uncertainty: i64, streams: &[&str]| {
-                parameters.push(CalibrationParameter {
-                    parameter_name: name.to_owned(),
-                    value,
-                    unit: unit.to_owned(),
-                    estimator: "rolling_median_mad".to_owned(),
-                    sample_count: count,
-                    effective_sample_size: effective,
-                    window_start_event_time_ms: state.first_event_time_ms,
-                    window_end_event_time_ms: state.last_event_time_ms,
-                    uncertainty,
-                    source_streams: streams.iter().map(|stream| (*stream).to_owned()).collect(),
-                    model_version: CALIBRATION_MODEL_VERSION.to_owned(),
-                    snapshot_event_time_ms: state.last_event_time_ms,
-                });
-            };
+        let add = |parameters: &mut Vec<CalibrationParameter>,
+                   name: &str,
+                   value: i64,
+                   unit: &str,
+                   count: u64,
+                   uncertainty: i64,
+                   streams: &[&str]| {
+            parameters.push(CalibrationParameter {
+                parameter_name: name.to_owned(),
+                value,
+                unit: unit.to_owned(),
+                estimator: "rolling_median_mad".to_owned(),
+                sample_count: count,
+                effective_sample_size: effective,
+                window_start_event_time_ms: state.first_event_time_ms,
+                window_end_event_time_ms: state.last_event_time_ms,
+                uncertainty,
+                source_streams: streams.iter().map(|stream| (*stream).to_owned()).collect(),
+                model_version: CALIBRATION_MODEL_VERSION.to_owned(),
+                snapshot_event_time_ms: state.last_event_time_ms,
+            });
+        };
         add(
+            &mut parameters,
             "half_life",
             half_life.unwrap_or(0) as i64,
             "ms",
@@ -417,6 +423,7 @@ impl CalibrationSnapshot {
             &["residual"],
         );
         add(
+            &mut parameters,
             "exit_lead",
             fill_horizon.unwrap_or(0) as i64,
             "ms",
@@ -425,6 +432,7 @@ impl CalibrationSnapshot {
             &["order_lifecycle"],
         );
         add(
+            &mut parameters,
             "fill_horizon",
             fill_horizon.unwrap_or(0) as i64,
             "ms",
@@ -433,6 +441,7 @@ impl CalibrationSnapshot {
             &["order_lifecycle"],
         );
         add(
+            &mut parameters,
             "fill_hazard",
             fill_hazard,
             "probability_bps",
@@ -444,6 +453,7 @@ impl CalibrationSnapshot {
             parameter.estimator = "rolling_wilson_lower_95pct".to_owned();
         }
         add(
+            &mut parameters,
             "fill_hazard_mle",
             fill_hazard_mle,
             "probability_bps",
@@ -455,6 +465,7 @@ impl CalibrationSnapshot {
             parameter.estimator = "rolling_binomial_mle".to_owned();
         }
         add(
+            &mut parameters,
             "null_random_walk_weight",
             null_weight,
             "bps",
@@ -463,6 +474,7 @@ impl CalibrationSnapshot {
             &["residual"],
         );
         add(
+            &mut parameters,
             "uncertainty",
             pico_to_bps_ceil(uncertainty_pico),
             "bps",
@@ -471,6 +483,7 @@ impl CalibrationSnapshot {
             &["residual", "spread", "markout"],
         );
         add(
+            &mut parameters,
             "adverse_selection",
             pico_to_bps_ceil(markout_center),
             "bps",
@@ -479,6 +492,7 @@ impl CalibrationSnapshot {
             &["markout"],
         );
         add(
+            &mut parameters,
             "exit_participation",
             participation.unwrap_or(0),
             "probability_bps",
@@ -487,6 +501,7 @@ impl CalibrationSnapshot {
             &["depth", "fills"],
         );
         add(
+            &mut parameters,
             "min_residual",
             min_residual,
             "pico_bps",
@@ -495,6 +510,7 @@ impl CalibrationSnapshot {
             &["residual", "spread", "markout", "fee"],
         );
         add(
+            &mut parameters,
             "min_robust_lcb",
             min_lcb,
             "pico_bps",
