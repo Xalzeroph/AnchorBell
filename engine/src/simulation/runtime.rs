@@ -17,6 +17,9 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 mod decision_audit;
+#[path = "runtime_diagnostics.rs"]
+mod diagnostics;
+pub use diagnostics::{GateRejectionRecord, SimulationSummary};
 
 use super::portfolio_guard::{
     PortfolioDrawdownAction, PortfolioDrawdownGuard, PortfolioDrawdownSnapshot,
@@ -43,7 +46,7 @@ use crate::{
     orderbook::LocalOrderBook,
     risk::evaluate_funding_overlay,
     runtime::{
-        io::{send_line, spawn_line_writer, write_json_atomic, AsyncLineWriter},
+        io::{send_line, snapshot_interval, spawn_line_writer, write_json_atomic, AsyncLineWriter},
         CausalLedger, DataQuality, EventEnvelope, EventSource,
     },
     strategy::{
@@ -854,45 +857,6 @@ struct RecordFields<'a> {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct SimulationSummary {
-    pub event_count: u64,
-    pub order_count: u64,
-    pub fill_count: u64,
-    pub filled_quantity: i64,
-    pub rejected_entries: u64,
-    /// Rejections partitioned by the owning layer (strategy/risk/execution).
-    pub gate_rejections: BTreeMap<String, u64>,
-    pub gate_rejection_records: Vec<GateRejectionRecord>,
-    pub realized_pnl_ticks: i64,
-    pub unrealized_pnl_ticks: i64,
-    pub market_pnl_ticks: i64,
-    pub strategy_pnl_ticks: i64,
-    pub funding_pnl_ticks: i64,
-    pub gross_pnl_ticks: i64,
-    pub fees_ticks: i64,
-    pub net_pnl_ticks: i64,
-    pub maker_fee_ppm: i64,
-    pub taker_fee_ppm: i64,
-    pub unrealized_valuation_complete: bool,
-    pub current_absolute_position: i64,
-    pub peak_absolute_position: i64,
-    pub working_orders: u64,
-    pub flat_at_end: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct GateRejectionRecord {
-    pub reason: String,
-    pub symbol: String,
-    pub market: String,
-    pub method: String,
-    pub source: String,
-    pub threshold: Option<i64>,
-    pub observed_value: Option<i64>,
-    pub timestamp_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct FinalSettlement {
     pub records: Vec<SimulationRecord>,
     pub summary: SimulationSummary,
@@ -1176,7 +1140,8 @@ pub struct SimulationEngine {
     filled_quantity: i64,
     rejected_entries: u64,
     gate_rejections: BTreeMap<String, u64>,
-    gate_rejection_records: Vec<GateRejectionRecord>,
+    gate_rejection_records: VecDeque<GateRejectionRecord>,
+    gate_rejection_records_truncated: bool,
     market_id: String,
     method_id: String,
     funding_lead_ms: u64,
@@ -1313,7 +1278,8 @@ impl SimulationEngine {
             filled_quantity: 0,
             rejected_entries: 0,
             gate_rejections: BTreeMap::new(),
-            gate_rejection_records: Vec::new(),
+            gate_rejection_records: VecDeque::new(),
+            gate_rejection_records_truncated: false,
             market_id: String::new(),
             method_id: String::new(),
             funding_lead_ms: 0,
@@ -1411,7 +1377,7 @@ impl SimulationEngine {
     }
 
     fn observe_portfolio_drawdown(&mut self) -> PortfolioDrawdownAction {
-        let s = self.summary();
+        let s = self.accounting_summary();
         PortfolioDrawdownGuard::observe_optional(
             self.portfolio_drawdown_guard.as_mut(),
             s.unrealized_valuation_complete.then_some(s.net_pnl_ticks),
@@ -1901,91 +1867,6 @@ impl SimulationEngine {
         }
     }
 
-    fn reject_entry(&mut self, owner: &str) {
-        self.rejected_entries = self.rejected_entries.saturating_add(1);
-        *self.gate_rejections.entry(owner.to_owned()).or_default() += 1;
-    }
-
-    fn reject_entry_structured(
-        &mut self,
-        symbol: &str,
-        reason: &str,
-        source: &str,
-        threshold: Option<i64>,
-        observed_value: Option<i64>,
-        timestamp_ms: u64,
-    ) {
-        self.reject_entry(reason);
-        self.gate_rejection_records.push(GateRejectionRecord {
-            reason: reason.to_owned(),
-            symbol: symbol.to_owned(),
-            market: self.market_id.clone(),
-            method: self.method_id.clone(),
-            source: source.to_owned(),
-            threshold,
-            observed_value,
-            timestamp_ms,
-        });
-    }
-
-    pub fn summary(&self) -> SimulationSummary {
-        let mut current_absolute_position = 0_i64;
-        let mut realized_pnl_ticks = 0_i64;
-        let mut unrealized_pnl_ticks = 0_i64;
-        let mut market_pnl_ticks = 0_i64;
-        let mut strategy_pnl_ticks = 0_i64;
-        let mut funding_pnl_ticks = 0_i64;
-        let mut fees_ticks = 0_i64;
-        let mut working_orders = 0_u64;
-        let mut unrealized_valuation_complete = true;
-        for state in self.states.values() {
-            current_absolute_position = current_absolute_position
-                .saturating_add(state.position.checked_abs().unwrap_or(i64::MAX));
-            realized_pnl_ticks = realized_pnl_ticks.saturating_add(state.realized_pnl_ticks);
-            market_pnl_ticks = market_pnl_ticks.saturating_add(state.market_pnl_ticks);
-            strategy_pnl_ticks = strategy_pnl_ticks.saturating_add(state.strategy_pnl_ticks);
-            funding_pnl_ticks = funding_pnl_ticks.saturating_add(state.funding_pnl_ticks);
-            fees_ticks = fees_ticks.saturating_add(state.fees_ticks);
-            working_orders += u64::from(state.working.is_some());
-            if state.position != 0 {
-                match unrealized_pnl(state, self.quantity_scale) {
-                    Some(pnl) => unrealized_pnl_ticks = unrealized_pnl_ticks.saturating_add(pnl),
-                    None => unrealized_valuation_complete = false,
-                }
-            }
-        }
-        let flat_at_end = current_absolute_position == 0 && working_orders == 0;
-        SimulationSummary {
-            event_count: self.event_count,
-            order_count: self.order_count,
-            fill_count: self.fill_count,
-            filled_quantity: self.filled_quantity,
-            rejected_entries: self.rejected_entries,
-            gate_rejections: self.gate_rejections.clone(),
-            gate_rejection_records: self.gate_rejection_records.clone(),
-            realized_pnl_ticks,
-            unrealized_pnl_ticks,
-            market_pnl_ticks,
-            strategy_pnl_ticks,
-            funding_pnl_ticks,
-            gross_pnl_ticks: market_pnl_ticks
-                .saturating_add(strategy_pnl_ticks)
-                .saturating_add(funding_pnl_ticks),
-            fees_ticks,
-            net_pnl_ticks: market_pnl_ticks
-                .saturating_add(strategy_pnl_ticks)
-                .saturating_add(funding_pnl_ticks)
-                .saturating_sub(fees_ticks),
-            maker_fee_ppm: self.fee_ppm,
-            taker_fee_ppm: self.emergency_policy.taker_fee_ppm,
-            unrealized_valuation_complete,
-            current_absolute_position,
-            peak_absolute_position: self.peak_absolute_position,
-            working_orders,
-            flat_at_end,
-        }
-    }
-
     pub fn checkpoint_view(
         &self,
         source_label: &str,
@@ -2390,7 +2271,7 @@ impl SimulationEngine {
     }
 
     pub fn performance_point(&self, observed_at_ms: u64) -> PerformancePoint {
-        let summary = self.summary();
+        let summary = self.accounting_summary();
         PerformancePoint {
             observed_at_ms,
             market_pnl_ticks: summary.market_pnl_ticks,
@@ -5618,7 +5499,7 @@ pub async fn run_simulation(
     } = spawn_line_writer(config.fx_output_path.clone(), 4_096, 1 << 20, 64).await;
     let metrics_output_path = config.metrics_output_path.clone();
     let mut metrics_interval =
-        tokio::time::interval(Duration::from_millis(config.metrics_refresh_ms.max(250)));
+        snapshot_interval(Duration::from_millis(config.metrics_refresh_ms.max(250)));
     let mut last_received_at_ms = 0_u64;
     let mut event_sequence = 0_u64;
     let (fx_tx, mut fx_rx) = mpsc::channel::<FxUpdate>(128);

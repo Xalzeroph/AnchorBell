@@ -800,3 +800,85 @@ mod walkforward_regression_tests {
         assert!(!SimulationPolicyVariant::M8FundingDisabled.uses_funding_controller());
     }
 }
+
+#[test]
+fn rejection_diagnostics_stay_bounded_without_losing_total_counts() {
+    let mut engine = engine();
+    for timestamp in 0..4096 {
+        engine.reject_entry_structured(
+            "CXMTUSDT",
+            "equity_session_open",
+            "risk",
+            Some(5),
+            Some(2),
+            timestamp,
+        );
+    }
+    let summary = engine.summary();
+    assert_eq!(engine.gate_rejection_records.len(), 1024);
+    assert_eq!(summary.rejected_entries, 4096);
+    assert_eq!(summary.gate_rejections["equity_session_open"], 4096);
+    assert_eq!(summary.gate_rejection_records.len(), 1024);
+    assert!(summary.gate_rejection_records_truncated);
+    assert_eq!(
+        summary.gate_rejection_records.first().unwrap().timestamp_ms,
+        3072
+    );
+    assert_eq!(
+        summary.gate_rejection_records.last().unwrap().timestamp_ms,
+        4095
+    );
+}
+
+#[test]
+fn accounting_path_omits_diagnostics_but_preserves_all_financial_fields() {
+    let mut engine = engine();
+    engine.reject_entry_structured("CXMTUSDT", "equity_session_open", "risk", None, None, 1);
+    let state = engine.states.get_mut("CXMTUSDT").unwrap();
+    state.market_pnl_ticks = -25;
+    state.strategy_pnl_ticks = 50;
+    state.funding_pnl_ticks = 5;
+    state.fees_ticks = 3;
+    state.position = 1;
+    state.book = None;
+    let fast = engine.accounting_summary();
+    assert!(fast.gate_rejections.is_empty());
+    assert!(fast.gate_rejection_records.is_empty());
+    assert!(!fast.unrealized_valuation_complete);
+    assert_eq!(fast.net_pnl_ticks, 27);
+    let mut full = serde_json::to_value(engine.summary()).unwrap();
+    let mut fast = serde_json::to_value(fast).unwrap();
+    for key in ["gate_rejections", "gate_rejection_records"] {
+        full.as_object_mut().unwrap().remove(key);
+        fast.as_object_mut().unwrap().remove(key);
+    }
+    assert_eq!(fast, full);
+}
+
+#[test]
+#[ignore = "manual accounting hot-path benchmark"]
+fn accounting_history_benchmark() {
+    let mut engine = engine();
+    for timestamp in 0..8192 {
+        engine.reject_entry_structured(
+            "CXMTUSDT",
+            "equity_session_open",
+            "risk",
+            Some(5),
+            Some(2),
+            timestamp,
+        );
+    }
+    let start = std::time::Instant::now();
+    for _ in 0..100 {
+        std::hint::black_box(engine.accounting_summary());
+    }
+    eprintln!(
+        "ACCOUNTING_100_SNAPSHOTS_US={}",
+        start.elapsed().as_micros()
+    );
+    eprintln!(
+        "DIAGNOSTIC_JSON_BYTES={}",
+        serde_json::to_vec(&engine.summary()).unwrap().len()
+    );
+}
