@@ -627,19 +627,17 @@ pub(super) fn m5_tail_stress_pico(state: &SimulationSymbolState) -> i64 {
         _ => i64::MAX,
     };
     let spread = state.ewma_spread_pico_bps.saturating_mul(4);
-    // Historical runs exposed a failure mode that volatility-only tail
-    // controls missed: CXMT/MINIMAX/ZHONGJIU could show a large apparent
-    // anchor edge while anchor/index/mark disagreed enough to classify the
-    // fair value as dislocated. Treat that cross-source dispersion as risk,
-    // not as free mean-reversion alpha. This makes the existing M5 policy
-    // shrink or reduce-only exactly when the reference model loses consensus.
-    let reference_dispersion = fair_value_for_state(state)
-        .map(|estimate| estimate.dispersion_pico_bps)
-        .unwrap_or(i64::MAX);
+    // The external close anchor is intentionally static while the underlying
+    // equity venue is closed. Its displacement from the live Binance index is
+    // the CORE_V1 mean-reversion signal, not an independent tail observation.
+    // Charging that same displacement here creates a circular veto: the anchor
+    // creates the edge, fair-value fusion reports it as dislocated, and M5 then
+    // blocks every entry before the edge can be tested. Anchor validity and the
+    // adaptive threshold already protect against stale/uncertain references;
+    // M5 must measure only live-market stress and execution uncertainty.
     volatility
         .max(mark_index)
         .max(spread)
-        .max(reference_dispersion)
 }
 
 pub(super) fn m5_tail_stress_bps(state: &SimulationSymbolState) -> i64 {

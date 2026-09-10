@@ -722,6 +722,23 @@ fn tail_quantity_scaling_is_continuous_monotone_and_bounded() {
 }
 
 #[test]
+fn m5_tail_guard_does_not_double_count_closed_session_anchor_edge() {
+    let mut engine = engine().with_strategy_variant(SimulationPolicyVariant::CoreV1);
+    feed(
+        &mut engine,
+        br#"{"e":"markPriceUpdate","E":1,"s":"CXMTUSDT","p":"120","i":"120","T":1,"r":"0"}"#,
+    );
+    feed(
+        &mut engine,
+        br#"{"e":"bookTicker","u":1,"E":2,"T":2,"s":"CXMTUSDT","b":"120","B":"100","a":"120","A":"100"}"#,
+    );
+
+    let state = engine.states.get("CXMTUSDT").expect("symbol state");
+    assert_eq!(m5_tail_stress_bps(state), 0);
+    assert!(!m5_tail_reduce_only(state));
+}
+
+#[test]
 fn fractional_edge_sizing_is_conservative_and_monotone() {
     let hurdle = 100 * PICO_BPS_SCALE;
     let quantity = 10_000;
