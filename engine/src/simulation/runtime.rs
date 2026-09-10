@@ -4636,17 +4636,17 @@ fn maker_exit_intent_for_state(
             max_age_ms: 0,
         })
         .or(Some(ExitConstraints {
-                min_price: 1,
-                max_price: i64::MAX,
-                price_tick: 1,
-                min_quantity: 1,
-                max_quantity: position_quantity,
-                quantity_step: 1,
-                min_notional: 1,
-                quantity_scale,
-                observed_at_ms: timestamp_ms,
-                max_age_ms: 0,
-            }));
+            min_price: 1,
+            max_price: i64::MAX,
+            price_tick: 1,
+            min_quantity: 1,
+            max_quantity: position_quantity,
+            quantity_step: 1,
+            min_notional: 1,
+            quantity_scale,
+            observed_at_ms: timestamp_ms,
+            max_age_ms: 0,
+        }));
     let decision = decide_maker_exit(MakerExitInput {
         symbol: state.symbol_id,
         position: state.position,
