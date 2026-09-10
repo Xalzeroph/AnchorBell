@@ -1722,10 +1722,22 @@ mod tests {
             .unwrap()
             .scaled(8, 8)
             .unwrap();
-        assert_eq!(filters.normalize_price(827_850_001, true, true), Ok(827_850_000));
-        assert_eq!(filters.normalize_price(827_850_001, false, true), Ok(827_850_100));
-        assert_eq!(filters.normalize_price(827_850_001, true, false), Ok(827_850_100));
-        assert_eq!(filters.normalize_price(827_850_001, false, false), Ok(827_850_000));
+        assert_eq!(
+            filters.normalize_price(827_850_001, true, true),
+            Ok(827_850_000)
+        );
+        assert_eq!(
+            filters.normalize_price(827_850_001, false, true),
+            Ok(827_850_100)
+        );
+        assert_eq!(
+            filters.normalize_price(827_850_001, true, false),
+            Ok(827_850_100)
+        );
+        assert_eq!(
+            filters.normalize_price(827_850_001, false, false),
+            Ok(827_850_000)
+        );
     }
 
     #[test]

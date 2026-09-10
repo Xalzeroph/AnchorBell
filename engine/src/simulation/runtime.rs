@@ -1846,10 +1846,8 @@ impl SimulationEngine {
             if position == 0 {
                 continue;
             }
-            let desired = force_reduce_only_taker_intent(
-                &self.states[&symbol],
-                self.emergency_policy,
-            );
+            let desired =
+                force_reduce_only_taker_intent(&self.states[&symbol], self.emergency_policy);
             if let Some(intent) = desired {
                 records.extend(self.place_symbol(&symbol, intent, timestamp_ms, true, None));
             } else {
@@ -3233,7 +3231,13 @@ impl SimulationEngine {
                 symbol,
                 decision_reason,
                 "strategy_risk_gate",
-                rejection_threshold_bps(self, symbol, timestamp_ms, requested_quantity, max_position),
+                rejection_threshold_bps(
+                    self,
+                    symbol,
+                    timestamp_ms,
+                    requested_quantity,
+                    max_position,
+                ),
                 rejection_observed_edge_bps(self, symbol),
                 timestamp_ms,
             );
@@ -3337,11 +3341,8 @@ impl SimulationEngine {
         decision_id: Option<u64>,
     ) -> Vec<SimulationRecord> {
         if let Some(filters) = self.execution_filters.get(symbol).copied() {
-            match filters.normalize_price(
-                intent.price,
-                intent.side == Side::Buy,
-                intent.post_only,
-            ) {
+            match filters.normalize_price(intent.price, intent.side == Side::Buy, intent.post_only)
+            {
                 Ok(price) => intent.price = price,
                 Err(reason) => {
                     self.reject_entry_structured(
@@ -4264,10 +4265,9 @@ fn force_reduce_only_taker_intent(
     if opposing_depth <= 0 || policy.max_participation_bps == 0 {
         return None;
     }
-    let participation_quantity = (i128::from(opposing_depth)
-        * i128::from(policy.max_participation_bps)
-        / 10_000)
-    .clamp(0, i128::from(i64::MAX)) as i64;
+    let participation_quantity =
+        (i128::from(opposing_depth) * i128::from(policy.max_participation_bps) / 10_000)
+            .clamp(0, i128::from(i64::MAX)) as i64;
     let quantity = position_quantity.min(participation_quantity);
     if quantity <= 0 {
         return None;
@@ -4282,15 +4282,9 @@ fn force_reduce_only_taker_intent(
         }
     };
     let (side, price) = if state.position > 0 {
-        (
-            Side::Sell,
-            aggressive_price(book.bid_price_ticks, false),
-        )
+        (Side::Sell, aggressive_price(book.bid_price_ticks, false))
     } else {
-        (
-            Side::Buy,
-            aggressive_price(book.ask_price_ticks, true),
-        )
+        (Side::Buy, aggressive_price(book.ask_price_ticks, true))
     };
     Some(OrderIntent::emergency_reduce_only_taker(
         state.symbol_id,
@@ -4536,15 +4530,10 @@ fn rejection_threshold_bps(
     )
     .map(|threshold| scale_threshold_non_fee(threshold, engine.threshold_scale_ppm))
     .and_then(AdaptiveThreshold::required_pico_bps)
-    .map(|required| {
-        pico_bps_to_bps(required.saturating_sub(state.adaptive_relief_pico_bps))
-    })
+    .map(|required| pico_bps_to_bps(required.saturating_sub(state.adaptive_relief_pico_bps)))
 }
 
-fn rejection_observed_edge_bps(
-    engine: &SimulationEngine,
-    symbol: &str,
-) -> Option<i64> {
+fn rejection_observed_edge_bps(engine: &SimulationEngine, symbol: &str) -> Option<i64> {
     let state = engine.states.get(symbol)?;
     let book = state.book?;
     let fair_value = fair_value_for_state(state)?.price.0;
