@@ -4987,16 +4987,12 @@ fn m5_scaled_quantity(stress: i64, requested_quantity: i64) -> i64 {
         return requested_quantity / 4;
     }
 
-    // Use a continuous risk budget between the caution and reduce-only
-    // boundaries. The old step function changed quantity from 100% to 50%
-    // at exactly 35 bps and from 50% to 25% at 60 bps, creating artificial
-    // quote churn and discontinuous fill selection. The affine scale is
-    // monotone in stress, bounded in [25%, 100%], and remains conservative
-    // relative to the old policy at the reduce-only boundary.
+    // Scale continuously from 100% at caution to 25% at reduce-only,
+    // avoiding the old steps and quote churn while preserving the boundary risk budget.
     let span = M5_TAIL_REDUCE_ONLY_BPS - M5_TAIL_CAUTION_BPS;
     let remaining = M5_TAIL_REDUCE_ONLY_BPS - stress;
-    let scale_bps = 2_500_i128
-        + i128::from(remaining.max(0)) * 7_500_i128 / i128::from(span.max(1));
+    let scale_bps =
+        2_500_i128 + i128::from(remaining.max(0)) * 7_500_i128 / i128::from(span.max(1));
     let scaled = i128::from(requested_quantity) * scale_bps / 10_000_i128;
     scaled
         .clamp(1, i128::from(requested_quantity))
