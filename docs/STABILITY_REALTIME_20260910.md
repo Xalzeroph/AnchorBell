@@ -62,3 +62,19 @@ python3 scripts/architecture_gate.py
 python3 scripts/resource_gate.py
 node --check engine/web/app.js
 ```
+
+## Follow-up: first depth diff after snapshot recovery
+
+Post-deployment observation found repeated REST snapshot installations for some
+symbols. A regression reproduced an inconsistency: buffered replay accepted the
+existing `pu` bridge policy, while the first live diff after a snapshot rejected
+that same sequence. Both paths now share the existing bridge predicate. Duplicate
+updates remain idempotent and later diffs still require exact `pu` continuity;
+an unproven first-event gap still invalidates the book.
+
+Tests compare complete books produced by live and buffered application for a
+snapshot at the previous update boundary and inside the previous-to-current
+interval, including an intervening duplicate. A negative test preserves gap
+rejection. This aligns the existing replay policy across recovery paths; the
+exchange documentation describes absolute level quantities and subsequent `pu`
+continuity: [Binance local order book guide](https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/websocket-market-streams/How-to-manage-a-local-order-book-correctly).
