@@ -17,6 +17,15 @@ def regular(path):
     return stat.S_ISREG(path.lstat().st_mode)
 
 
+def sync_directory(path):
+    if os.name == "posix":
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
 def write_json(path, value):
     temporary = path.with_name(path.name + f".tmp.{os.getpid()}")
     with temporary.open("w", encoding="utf-8") as stream:
@@ -24,6 +33,7 @@ def write_json(path, value):
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary, path)
+    sync_directory(path.parent)
 
 
 def maintain(root, *, apply=False, max_bytes=8 * 1024**3,
@@ -85,6 +95,7 @@ def maintain(root, *, apply=False, max_bytes=8 * 1024**3,
                     audit.write(json.dumps(entry) + "\n")
                     audit.flush()
                     os.fsync(audit.fileno())
+                    sync_directory(root)
                     write_json(path.parent / "retention-status.json", {
                         "raw_archives_pruned": True,
                         "raw_replay_complete": False,
@@ -93,6 +104,7 @@ def maintain(root, *, apply=False, max_bytes=8 * 1024**3,
                         "audit_path": "../retention-audit.jsonl",
                     })
                     path.unlink()
+                    sync_directory(path.parent)
                     entry["action"] = "deleted"
                     audit.write(json.dumps(entry) + "\n")
                     audit.flush()
