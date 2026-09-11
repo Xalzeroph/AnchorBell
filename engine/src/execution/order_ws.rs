@@ -151,7 +151,7 @@ impl BinanceOrderWebSocket {
             .ok_or(OrderTransportError::CorrelationMismatch)?
             .to_string();
         self.socket
-            .send(Message::Text(payload.to_string()))
+            .send(Message::Text(payload.to_string().into()))
             .await
             .map_err(|error| OrderTransportError::WebSocket(Box::new(error)))?;
 
