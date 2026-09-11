@@ -890,6 +890,7 @@ pub struct SimulationSummary {
     /// Rejections partitioned by the owning layer (strategy/risk/execution).
     pub gate_rejections: BTreeMap<String, u64>,
     pub gate_rejection_records: Vec<GateRejectionRecord>,
+    pub gate_rejection_records_truncated: bool,
     pub realized_pnl_ticks: i64,
     pub unrealized_pnl_ticks: i64,
     pub market_pnl_ticks: i64,
@@ -1270,7 +1271,8 @@ pub struct SimulationEngine {
     filled_quantity: i64,
     rejected_entries: u64,
     gate_rejections: BTreeMap<String, u64>,
-    gate_rejection_records: Vec<GateRejectionRecord>,
+    gate_rejection_records: VecDeque<GateRejectionRecord>,
+    gate_rejection_records_truncated: bool,
     market_id: String,
     method_id: String,
     funding_lead_ms: u64,
@@ -1419,7 +1421,8 @@ impl SimulationEngine {
             filled_quantity: 0,
             rejected_entries: 0,
             gate_rejections: BTreeMap::new(),
-            gate_rejection_records: Vec::new(),
+            gate_rejection_records: VecDeque::new(),
+            gate_rejection_records_truncated: false,
             market_id: String::new(),
             method_id: String::new(),
             funding_lead_ms: 0,
@@ -2192,7 +2195,11 @@ impl SimulationEngine {
         timestamp_ms: u64,
     ) {
         self.reject_entry(reason);
-        self.gate_rejection_records.push(GateRejectionRecord {
+        if self.gate_rejection_records.len() == 1024 {
+            self.gate_rejection_records.pop_front();
+            self.gate_rejection_records_truncated = true;
+        }
+        self.gate_rejection_records.push_back(GateRejectionRecord {
             reason: reason.to_owned(),
             symbol: symbol.to_owned(),
             market: self.market_id.clone(),
@@ -2238,7 +2245,8 @@ impl SimulationEngine {
             filled_quantity: self.filled_quantity,
             rejected_entries: self.rejected_entries,
             gate_rejections: self.gate_rejections.clone(),
-            gate_rejection_records: self.gate_rejection_records.clone(),
+            gate_rejection_records: self.gate_rejection_records.iter().cloned().collect(),
+            gate_rejection_records_truncated: self.gate_rejection_records_truncated,
             realized_pnl_ticks,
             unrealized_pnl_ticks,
             market_pnl_ticks,

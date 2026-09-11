@@ -278,6 +278,13 @@ fn maybe_deep_recompress(path: &Path, current_bytes: u64) -> Result<(i32, u64), 
     }
 }
 
+/// Emit a current snapshot after a stall, without replaying obsolete ticks.
+pub(crate) fn snapshot_interval(period: std::time::Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval
+}
+
 pub async fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), io::Error> {
     let bytes = serde_json::to_vec(value).map_err(|error| io::Error::other(error.to_string()))?;
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -405,5 +412,24 @@ mod tests {
         assert_eq!(metadata["compression"], "zstd");
         assert_eq!(metadata["line_count"], 2);
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod snapshot_scheduling_tests {
+    use super::snapshot_interval;
+    use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn snapshots_do_not_replay_a_backlog_of_missed_ticks() {
+        let mut interval = snapshot_interval(Duration::from_millis(100));
+        interval.tick().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        interval.tick().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), interval.tick())
+                .await
+                .is_err()
+        );
     }
 }

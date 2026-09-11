@@ -30,7 +30,7 @@ use crate::{
     },
     orderbook::{LocalOrderBook, OrderBookError},
     runtime::{
-        io::{send_line, spawn_line_writer, write_json_atomic, AsyncLineWriter},
+        io::{send_line, snapshot_interval, spawn_line_writer, write_json_atomic, AsyncLineWriter},
         load_index_anchor_set, DataQuality, EventEnvelope, EventSource,
     },
     simulation::engine::{
@@ -1002,13 +1002,16 @@ pub async fn run(
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     let mut metrics_interval =
-        tokio::time::interval(Duration::from_millis(config.metrics_refresh_ms.max(250)));
+        snapshot_interval(Duration::from_millis(config.metrics_refresh_ms.max(250)));
     let mut last_received_at_ms = 0_u64;
     let mut event_sequence = 0_u64;
     let mut last_checkpoint_at_ms = 0_u64;
     let mut fx_latest = BTreeMap::<String, FxUpdate>::new();
     let run_result = tokio::time::timeout(run_duration, async {
         loop {
+            if futures_util::FutureExt::now_or_never(shutdown.as_mut()).is_some() {
+                return Ok::<(), SimulationError>(());
+            }
             tokio::select! {
                 biased;
                 _ = &mut shutdown => {

@@ -26,3 +26,6 @@ zstd = "0.13"
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
