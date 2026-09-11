@@ -758,6 +758,44 @@ fn fractional_edge_sizing_is_conservative_and_monotone() {
 }
 
 #[test]
+fn margin_sizing_preserves_zero_when_edge_is_below_hurdle() {
+    let mut engine = engine();
+    feed(
+        &mut engine,
+        br#"{"e":"markPriceUpdate","E":1,"s":"CXMTUSDT","p":"100","i":"100","T":600000,"r":"0"}"#,
+    );
+    feed(&mut engine, br#"{"e":"bookTicker","u":1,"E":2,"T":2,"s":"CXMTUSDT","b":"100","B":"100","a":"100","A":"100"}"#);
+    let state = &engine.states["CXMTUSDT"];
+    let fair = fair_value_for_state(state).unwrap().price.0;
+    for intent in [
+        OrderIntent::maker_buy(0, fair - 1, 10_000),
+        OrderIntent::maker_sell(0, fair + 1, 10_000),
+    ] {
+        let edge = match intent.side {
+            Side::Buy => edge_pico_bps(fair, intent.price).unwrap(),
+            Side::Sell => edge_pico_bps(intent.price, fair).unwrap(),
+        };
+        assert!(edge > 0);
+        let threshold =
+            AdaptiveThreshold::from_pico_components(edge + 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+                .unwrap();
+        assert_eq!(core_v1_margin_scaled_quantity(state, intent, threshold), 0);
+        let reduction = OrderIntent {
+            reduce_only: true,
+            ..intent
+        };
+        assert_eq!(
+            core_v1_margin_scaled_quantity(state, reduction, threshold),
+            intent.quantity
+        );
+        let threshold =
+            AdaptiveThreshold::from_pico_components(edge, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0).unwrap();
+        assert!((1..=intent.quantity)
+            .contains(&core_v1_margin_scaled_quantity(state, intent, threshold)));
+    }
+}
+
+#[test]
 fn cross_symbol_concentration_penalty_is_smooth_and_preserves_reductions() {
     let flat = cross_symbol_concentration_scaled_quantity(0, 0, Side::Buy, 10_000);
     let concentrated = cross_symbol_concentration_scaled_quantity(10_000, 0, Side::Buy, 10_000);

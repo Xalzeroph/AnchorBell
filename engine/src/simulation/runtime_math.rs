@@ -712,6 +712,9 @@ pub(super) fn core_v1_margin_scaled_quantity(
         return intent.quantity;
     };
     let edge_scaled_quantity = fractional_edge_quantity(edge, hurdle, intent.quantity);
+    if edge_scaled_quantity == 0 {
+        return 0;
+    }
     let evidence_scale = reversion_evidence_scale_ppm(state);
     let evidence_scaled = (i128::from(edge_scaled_quantity) * i128::from(evidence_scale)
         / i128::from(1_000_000_i64))

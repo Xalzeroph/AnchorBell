@@ -15,8 +15,6 @@ use tokio::{io::AsyncWriteExt, sync::mpsc, task::JoinHandle};
 
 const LINE_WRITER_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 const INITIAL_ZSTD_LEVEL: i32 = 3;
-const DEEP_ZSTD_LEVEL: i32 = 9;
-const DEEP_RECOMPRESS_MIN_SAVINGS_BPS: u64 = 100;
 
 pub struct AsyncLineWriter {
     pub sender: mpsc::Sender<String>,
@@ -215,13 +213,13 @@ fn compress_segment_blocking(
     }
     std::fs::rename(&temporary_archive, &archive_path)
         .map_err(|error| io_context("publish zstd line-writer archive", &archive_path, error))?;
-    let (compression_level, compressed_bytes) =
-        maybe_deep_recompress(&archive_path, compressed_bytes)?;
+    // Keep live rotation to a single pass; re-decoding/recompressing here
+    // stalls the bounded writer and backpressures market consumption.
     let metadata = serde_json::json!({
         "schema_version": 1,
         "compression": "zstd",
-        "compression_level": compression_level,
-        "compression_stage": if compression_level == DEEP_ZSTD_LEVEL { "deep" } else { "base" },
+        "compression_level": INITIAL_ZSTD_LEVEL,
+        "compression_stage": "base",
         "uncompressed_bytes": uncompressed_bytes,
         "compressed_bytes": compressed_bytes,
         "line_count": line_count,
@@ -237,45 +235,6 @@ fn compress_segment_blocking(
     std::fs::remove_file(&raw_path)
         .map_err(|error| io_context("remove verified raw line-writer segment", &raw_path, error))?;
     Ok(())
-}
-fn maybe_deep_recompress(path: &Path, current_bytes: u64) -> Result<(i32, u64), io::Error> {
-    // A second pass is deliberately bounded: recompressing compressed bytes
-    // indefinitely cannot improve entropy and can make archives larger.
-    if current_bytes < 1024 {
-        return Ok((INITIAL_ZSTD_LEVEL, current_bytes));
-    }
-    let temporary = path.with_extension("zst.deep.tmp");
-    let input = File::open(path)
-        .map_err(|error| io_context("open base zstd archive for deep pass", path, error))?;
-    let mut decoder = zstd::stream::read::Decoder::new(input)
-        .map_err(|error| io_context("create deep zstd decoder", path, error))?;
-    let archive = File::create(&temporary)
-        .map_err(|error| io_context("create deep zstd temporary archive", &temporary, error))?;
-    let mut encoder = zstd::stream::write::Encoder::new(archive, DEEP_ZSTD_LEVEL)
-        .map_err(|error| io_context("create deep zstd encoder", &temporary, error))?;
-    io::copy(&mut decoder, &mut encoder)
-        .map_err(|error| io_context("deep zstd recompression", path, error))?;
-    let archive = encoder
-        .finish()
-        .map_err(|error| io_context("finish deep zstd archive", &temporary, error))?;
-    archive
-        .sync_all()
-        .map_err(|error| io_context("sync deep zstd archive", &temporary, error))?;
-    let deep_bytes = archive
-        .metadata()
-        .map_err(|error| io_context("inspect deep zstd archive", &temporary, error))?
-        .len();
-    let required_savings = 10_000_u64.saturating_sub(DEEP_RECOMPRESS_MIN_SAVINGS_BPS);
-    if deep_bytes > 0
-        && deep_bytes.saturating_mul(10_000) < current_bytes.saturating_mul(required_savings)
-    {
-        std::fs::rename(&temporary, path)
-            .map_err(|error| io_context("publish deep zstd archive", path, error))?;
-        Ok((DEEP_ZSTD_LEVEL, deep_bytes))
-    } else {
-        let _ = std::fs::remove_file(&temporary);
-        Ok((INITIAL_ZSTD_LEVEL, current_bytes))
-    }
 }
 
 /// Emit a current snapshot after a stall, without replaying obsolete ticks.
@@ -401,8 +360,16 @@ mod tests {
         let raw = root.join("records.jsonl.segment-000000");
         let archive = raw.with_file_name("records.jsonl.segment-000000.zst");
         let metadata = raw.with_file_name("records.jsonl.segment-000000.zst.meta.json");
-        let original = b"{\"kind\":\"fill\",\"quantity\":3}\n{ \"kind\": \"cancel\" }\n";
-        std::fs::write(&raw, original).unwrap();
+        let original = (0..10_000)
+            .map(|i| {
+                format!(
+                    "{{\"kind\":\"fill\",\"sequence\":{i},\"quantity\":{}}}\n",
+                    i * 31
+                )
+            })
+            .collect::<String>()
+            .into_bytes();
+        std::fs::write(&raw, &original).unwrap();
         compress_segment_blocking(raw.clone(), archive.clone(), metadata.clone()).unwrap();
         let restored = zstd::stream::decode_all(File::open(&archive).unwrap()).unwrap();
         assert_eq!(restored, original);
@@ -410,7 +377,11 @@ mod tests {
         let metadata: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&metadata).unwrap()).unwrap();
         assert_eq!(metadata["compression"], "zstd");
-        assert_eq!(metadata["line_count"], 2);
+        assert_eq!(metadata["line_count"], 10_000);
+        assert_eq!(
+            metadata["compression_level"], 3,
+            "live rotation must not wait for a second compression pass"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }
