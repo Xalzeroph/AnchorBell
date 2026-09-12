@@ -176,18 +176,33 @@ impl AdaptiveThreshold {
         {
             return None;
         }
-        let additive = self
-            .exact_pico_bps
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| *index != 10)
-            .fold(0_i128, |total, (_, value)| {
-                total.saturating_add(i128::from(*value))
-            });
+        // Floors, process volatility, and model uncertainty are competing
+        // hurdles: the edge must clear the largest one, not pay the same
+        // uncertainty multiple times. Execution costs and directional
+        // surcharges remain additive because they are separately paid.
+        let base_hurdle = self.exact_pico_bps[0]
+            .max(self.exact_pico_bps[1])
+            .max(self.exact_pico_bps[3]);
+        let additive_costs = [
+            self.exact_pico_bps[1],
+            self.exact_pico_bps[2],
+            self.exact_pico_bps[4],
+            self.exact_pico_bps[5],
+            self.exact_pico_bps[6],
+            self.exact_pico_bps[7],
+            self.exact_pico_bps[8],
+            self.exact_pico_bps[9],
+            self.exact_pico_bps[11],
+        ]
+        .into_iter()
+        .fold(0_i128, |total, value| {
+            total.saturating_add(i128::from(value))
+        });
         Some(
-            additive
-                .max(i128::from(self.exact_pico_bps[10]))
-                .clamp(0, i128::from(i64::MAX)) as i64,
+            (i128::from(base_hurdle)
+                .saturating_add(additive_costs)
+                .max(i128::from(self.exact_pico_bps[10])))
+            .clamp(0, i128::from(i64::MAX)) as i64,
         )
     }
 

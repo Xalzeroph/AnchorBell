@@ -14,7 +14,9 @@
 
 ## Automatic retention
 
-Install `deploy/anchorbell-retention.service` and `.timer` into systemd and
+Install `scripts/simulation_retention.py` to
+`/opt/anchorbell-maintenance/simulation_retention.py`, install
+`deploy/anchorbell-retention.service` and `.timer` into systemd and
 enable the timer. It runs every 15 minutes as the simulation user, with bounded
 CPU/memory and idle I/O priority. A manual read-only preview is:
 
@@ -56,6 +58,20 @@ Keep the old binary and batch results when deploying. Build into a staging
 target, stop the simulation gracefully, install the verified binary, then start
 a new batch. Verify the manifest build identity, service restarts, event progress
 and latency. Never delete old batches to make the latest run look clean.
+
+### September 12 integration
+
+Before deployment the server had newer uncommitted strategy changes on top of
+`8f2c08d9`. A snapshot of those changes was merged into the repair branch, including
+the newer economic-boundary rule: quantity is zero at or below the edge hurdle.
+The regression preserves that rule. Metrics serialization was moved unchanged
+into `runtime_metrics.rs` to keep the combined runtime within the source budget.
+
+The deployed executable lives under `/opt/anchorbell-releases/<commit>/` and is
+selected by `anchorbell-simulation.service.d/30-verified-release.conf`. The
+server's original working tree and its uncommitted changes remain untouched.
+Future deployments must update this override to the new verified release;
+rebuilding the old checkout alone does not change the running version.
 
 ## Verification
 

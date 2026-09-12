@@ -16,8 +16,8 @@ use tokio::{process::Command, sync::mpsc};
 use crate::{
     analytics_evidence::{EvidenceAccumulator, EvidenceConfig},
     analytics_validation::{
-        evaluate_simulation_promotion, SimulationPromotionGate, SimulationPromotionInput,
-        ValidationSummary,
+        evaluate_simulation_promotion_with_anchor_authority, SimulationPromotionGate,
+        SimulationPromotionInput, ValidationSummary,
     },
     backtest::realism::{LatencyModel, QueueModel, RealisticFillModel},
     execution::{BinanceEnvironment, SessionCheckpoint},
@@ -769,6 +769,7 @@ pub async fn run(
         dropped: evidence_dropped,
     } = spawn_line_writer(Some(evidence_path), 16_384, 1 << 20, 256).await;
     let mut evidence = EvidenceAccumulator::new(config.evidence.clone());
+    evidence.set_anchor_authority(false);
     let evidence_summary_path = config.output_root.join("evidence-summary.json");
     let analytics_validation_summary = ValidationSummary::default();
     let analytics_validation_path = config.output_root.join("analytics-validation-summary.json");
@@ -1597,7 +1598,8 @@ pub async fn run(
             .map(|ledger| ledger.summary.net_pnl_ticks)
             .sum(),
     };
-    let promotion_gate = evaluate_simulation_promotion(promotion_input);
+    let promotion_gate =
+        evaluate_simulation_promotion_with_anchor_authority(promotion_input, false);
     write_json_atomic(
         &config.output_root.join("promotion-gate.json"),
         &promotion_gate,

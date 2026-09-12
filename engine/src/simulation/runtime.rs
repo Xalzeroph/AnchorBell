@@ -19,6 +19,7 @@ use tokio::sync::mpsc;
 mod decision_audit;
 mod runtime_accounting;
 mod runtime_math;
+mod runtime_metrics;
 
 use super::portfolio_guard::{
     PortfolioDrawdownAction, PortfolioDrawdownGuard, PortfolioDrawdownSnapshot,
@@ -760,6 +761,9 @@ struct SimulationSymbolState {
     symbol_id: u32,
     calibration: CalibrationState,
     anchor: AnchorSnapshot,
+    /// Operational confidence horizon used only for fair-value weighting when
+    /// the anchor source does not publish an explicit expiry.
+    anchor_confidence_horizon_ms: u64,
     book: Option<BookState>,
     local_book: LocalOrderBook,
     last_book_update_id: Option<u64>,
@@ -1323,6 +1327,7 @@ impl SimulationEngine {
                         symbol_id: stable_symbol_id(&symbol),
                         calibration: CalibrationState::new(symbol.clone()),
                         anchor,
+                        anchor_confidence_horizon_ms: max_anchor_age_ms,
                         book: None,
                         local_book: LocalOrderBook::default(),
                         last_book_update_id: None,
@@ -2281,375 +2286,6 @@ impl SimulationEngine {
             .collect()
     }
 
-    pub fn metrics_snapshot(
-        &self,
-        observed_at_ms: u64,
-        last_received_at_ms: u64,
-    ) -> MetricsSnapshot {
-        let symbols = self
-            .states
-            .iter()
-            .map(|(symbol, state)| {
-                let (requested_quantity, max_position) = self
-                    .position_allocations
-                    .get(symbol)
-                    .map(|allocation| (allocation.requested_quantity, allocation.max_position))
-                    .unwrap_or((self.requested_quantity, self.max_position));
-                let quote_quantity = state
-                    .book
-                    .map(|book| {
-                        liquidity_adjusted_quantity(
-                            requested_quantity,
-                            book.bid_quantity,
-                            book.ask_quantity,
-                        )
-                    })
-                    .unwrap_or(requested_quantity);
-                let (bid_price_ticks, ask_price_ticks) = state
-                    .book
-                    .map(|book| (Some(book.bid_price_ticks), Some(book.ask_price_ticks)))
-                    .unwrap_or((None, None));
-                let fair_value = fair_value_for_state(state);
-                let threshold_diagnostic = dynamic_threshold_diagnostic_for(
-                    state,
-                    self.strategy_variant,
-                    self.strategy.entry_threshold_bps,
-                    self.fee_ppm,
-                    quote_quantity,
-                    max_position,
-                    self.last_event_at_ms,
-                );
-                let threshold = threshold_diagnostic
-                    .threshold
-                    .map(|threshold| scale_threshold_non_fee(threshold, self.threshold_scale_ppm));
-                let calendar_state = calendar_state_for(symbol, self.last_event_at_ms);
-                let data_quality =
-                    data_quality_for(state, self.last_event_at_ms, self.max_mark_index_gap_bps);
-                let equity_entry_allowed = !self.live_risk_gates
-                    || simulation_session_allows_entry(symbol, self.last_event_at_ms);
-                let funding_known = !self.live_risk_gates
-                    || (state.next_funding_time_ms > self.last_event_at_ms
-                        && state.latest_funding_rate_e8.is_some());
-                let anchor_allowed = state
-                    .anchor
-                    .valid_at(self.last_event_at_ms, self.max_anchor_age_ms)
-                    && (!self.live_risk_gates
-                        || state.anchor.observed_at_ms == 0
-                        || simulation_anchor_usable(
-                            symbol,
-                            state.anchor.observed_at_ms,
-                            self.last_event_at_ms,
-                        ));
-                let funding_decision =
-                    m8_funding_decision(state, self.last_event_at_ms, max_position, self.fee_ppm);
-                let funding_overlay = evaluate_funding_overlay(
-                    funding_decision.action,
-                    if state.latest_funding_rate_e8.is_some() {
-                        crate::m8::FundingRateStatus::Observed
-                    } else {
-                        crate::m8::FundingRateStatus::Missing
-                    },
-                    funding_decision.funding_carry_bps,
-                    state.position,
-                );
-                let funding_controller_active = self.funding_controller_active();
-                let funding_allowed = !self.live_risk_gates
-                    || if funding_controller_active {
-                        funding_overlay.allow_base_strategy
-                    } else {
-                        self.funding_entry_allowed_for_strategy(state, self.last_event_at_ms)
-                    };
-                let risk_state = if !equity_entry_allowed {
-                    SimulationRiskState::ReduceOnlyEquitySession
-                } else if !matches!(data_quality, DataQualityStatus::Fresh) {
-                    SimulationRiskState::HaltMarketData
-                } else if !anchor_allowed {
-                    SimulationRiskState::HaltAnchor
-                } else if self.symbol_drawdown_hard_bps > 0
-                    && self.symbol_drawdown_bps(symbol) >= self.symbol_drawdown_hard_bps
-                {
-                    SimulationRiskState::ReduceOnlySymbolDrawdown
-                } else if self.strategy_variant.uses_tail_guard() && m5_tail_reduce_only(state) {
-                    SimulationRiskState::ReduceOnlyTailRisk
-                } else if !funding_known {
-                    SimulationRiskState::HaltFundingMetadata
-                } else if funding_controller_active {
-                    match funding_overlay.state {
-                        crate::risk::FundingRiskState::ReduceOnly => {
-                            SimulationRiskState::ReduceOnlyFundingRisk
-                        }
-                        crate::risk::FundingRiskState::Adverse => {
-                            SimulationRiskState::NoEntryFunding
-                        }
-                        crate::risk::FundingRiskState::Halt => {
-                            SimulationRiskState::HaltFundingMetadata
-                        }
-                        crate::risk::FundingRiskState::Neutral
-                        | crate::risk::FundingRiskState::Favorable => SimulationRiskState::Trading,
-                    }
-                } else if !funding_allowed {
-                    SimulationRiskState::ReduceOnlyFundingDeadline
-                } else {
-                    SimulationRiskState::Trading
-                };
-                let anchor_age_ms = (state.anchor.observed_at_ms > 0).then(|| {
-                    self.last_event_at_ms
-                        .saturating_sub(state.anchor.observed_at_ms)
-                });
-                // Signal age is measured entirely on the exchange clock.
-                // Receipt timestamps remain transport telemetry only.
-                let mark_age_ms = (state.last_mark_time_ms > 0).then(|| {
-                    self.last_event_at_ms
-                        .saturating_sub(state.last_mark_time_ms)
-                });
-                let book_age_ms = (state.last_book_event_at_ms > 0).then(|| {
-                    self.last_event_at_ms
-                        .saturating_sub(state.last_book_event_at_ms)
-                });
-                let reference_ticks = fair_value
-                    .map(|estimate| estimate.price.0)
-                    .unwrap_or(state.anchor.close_price_ticks);
-                let buy_edge_pico_bps =
-                    bid_price_ticks.and_then(|price| edge_pico_bps(reference_ticks, price));
-                let sell_edge_pico_bps =
-                    ask_price_ticks.and_then(|price| edge_pico_bps(price, reference_ticks));
-                let buy_edge_bps = buy_edge_pico_bps.map(pico_bps_to_bps);
-                let sell_edge_bps = sell_edge_pico_bps.map(pico_bps_to_bps);
-                let buy_edge_micro_bps = buy_edge_pico_bps.map(pico_bps_to_micro);
-                let sell_edge_micro_bps = sell_edge_pico_bps.map(pico_bps_to_micro);
-                let adverse_markout_upper_pico_bps = conservative_adverse_markout_pico_bps(state);
-                let entry_block_reason = entry_block_reason_for(
-                    state,
-                    risk_state,
-                    threshold,
-                    threshold_diagnostic.status,
-                    state.adaptive_relief_pico_bps,
-                    buy_edge_pico_bps,
-                    sell_edge_pico_bps,
-                );
-
-                let labels = PortfolioDrawdownGuard::metric_labels(
-                    self.portfolio_drawdown_guard.as_ref(),
-                    risk_state.label(),
-                    entry_block_reason,
-                );
-                let symbol_drawdown_bps = self.symbol_drawdown_bps(symbol);
-
-                SymbolMetrics {
-                    symbol: symbol.clone(),
-                    position_mode: self
-                        .position_allocations
-                        .get(symbol)
-                        .map(|allocation| allocation.mode.clone()),
-                    allocated_capital_usdt_ticks: self
-                        .position_allocations
-                        .get(symbol)
-                        .filter(|allocation| allocation.budget_usdt_ticks > 0)
-                        .map(|allocation| allocation.budget_usdt_ticks),
-                    allocated_capital_usdt: self
-                        .position_allocations
-                        .get(symbol)
-                        .filter(|allocation| allocation.budget_usdt_ticks > 0)
-                        .map(|allocation| {
-                            crate::execution::binance_wire::format_ticks(
-                                allocation.budget_usdt_ticks,
-                                self.price_scale,
-                            )
-                        }),
-                    target_quantity: self
-                        .position_allocations
-                        .get(symbol)
-                        .map(|allocation| allocation.requested_quantity),
-                    target_quantity_units: self.position_allocations.get(symbol).map(
-                        |allocation| {
-                            crate::execution::binance_wire::format_ticks(
-                                allocation.requested_quantity,
-                                self.quantity_scale,
-                            )
-                        },
-                    ),
-                    position_notional_usdt_ticks: state.mark_price_ticks.map(|price| {
-                        clamp_i128(
-                            i128::from(price.abs()) * i128::from(state.position.abs())
-                                / quantity_scale_multiplier(self.quantity_scale),
-                        )
-                    }),
-                    position_notional_usdt: state.mark_price_ticks.map(|price| {
-                        let notional_ticks = clamp_i128(
-                            i128::from(price.abs()) * i128::from(state.position.abs())
-                                / quantity_scale_multiplier(self.quantity_scale),
-                        );
-                        crate::execution::binance_wire::format_ticks(
-                            notional_ticks,
-                            self.price_scale,
-                        )
-                    }),
-                    position: state.position,
-                    fills: state.fills,
-                    winning_fills: state.winning_fills,
-                    losing_fills: state.losing_fills,
-                    realized_pnl_ticks: state.realized_pnl_ticks,
-                    unrealized_pnl_ticks: unrealized_pnl(state, self.quantity_scale).unwrap_or(0),
-                    market_pnl_ticks: state.market_pnl_ticks,
-                    strategy_pnl_ticks: state.strategy_pnl_ticks,
-                    funding_pnl_ticks: state.funding_pnl_ticks,
-                    fees_ticks: state.fees_ticks,
-                    net_pnl_ticks: state
-                        .market_pnl_ticks
-                        .saturating_add(state.strategy_pnl_ticks)
-                        .saturating_add(state.funding_pnl_ticks)
-                        .saturating_sub(state.fees_ticks),
-                    symbol_drawdown_bps,
-                    risk_metrics: None,
-                    anchor_age_ms,
-                    anchor_final_close: state.anchor.observed_at_ms == 0
-                        || anchor_refresh_allowed(symbol, state.anchor.observed_at_ms),
-                    calendar_state: calendar_state.to_owned(),
-                    next_funding_time_ms: state.next_funding_time_ms,
-                    latest_funding_rate_e8: state.latest_funding_rate_e8,
-                    funding_flatten_deadline_ms: (!funding_controller_active)
-                        .then(|| {
-                            funding_flatten_deadline(
-                                state.next_funding_time_ms,
-                                self.funding_lead_ms,
-                            )
-                        })
-                        .flatten(),
-                    funding_action: if self.strategy_variant.uses_funding_controller()
-                        && !self.funding_controller_enabled
-                    {
-                        "Ablated".to_owned()
-                    } else {
-                        format!("{:?}", funding_decision.action)
-                    },
-                    funding_carry_bps: if funding_controller_active {
-                        funding_decision.funding_carry_bps
-                    } else {
-                        0
-                    },
-                    funding_net_edge_bps: if funding_controller_active {
-                        funding_decision.net_edge_bps
-                    } else {
-                        0
-                    },
-                    risk_state: labels.0.to_owned(),
-                    entry_block_reason: labels.1.to_owned(),
-                    data_quality,
-                    mark_age_ms,
-                    book_age_ms,
-                    bid_price_ticks,
-                    ask_price_ticks,
-                    anchor_price_ticks: state.anchor.close_price_ticks,
-                    mark_price_ticks: state.mark_price_ticks,
-                    index_price_ticks: state.index_price_ticks,
-                    ewma_abs_return_bps: state.ewma_abs_return_bps,
-                    ewma_spread_bps: state.ewma_spread_bps,
-                    ewma_abs_return_micro_bps: state.ewma_abs_return_micro_bps,
-                    ewma_spread_micro_bps: state.ewma_spread_micro_bps,
-                    ewma_abs_return_pico_bps: state.ewma_abs_return_pico_bps,
-                    ewma_spread_pico_bps: state.ewma_spread_pico_bps,
-                    ewma_signed_return_pico_bps: state.ewma_signed_return_pico_bps,
-                    ewma_signed_residual_pico_bps: state.ewma_signed_residual_pico_bps,
-                    ewma_residual_drift_pico_bps: state.ewma_residual_drift_pico_bps,
-                    ewma_signed_residual_drift_pico_bps: state.ewma_signed_residual_drift_pico_bps,
-                    ewma_residual_curvature_pico_bps: state.ewma_residual_curvature_pico_bps,
-                    ewma_residual_persistence_ppm: state.ewma_residual_persistence_ppm,
-                    residual_regime_risk_pico_bps: residual_regime_risk_pico_bps(state, Side::Buy)
-                        .max(residual_regime_risk_pico_bps(state, Side::Sell)),
-                    residual_regime_scale_ppm: residual_regime_scale_ppm(state),
-                    trend_persistence_bps: trend_persistence_bps(state),
-                    buy_trend_conflict_pico_bps: trend_conflict_pico_bps(state, Side::Buy),
-                    sell_trend_conflict_pico_bps: trend_conflict_pico_bps(state, Side::Sell),
-                    buy_market_trend_conflict_pico_bps: self
-                        .market_trend_conflict_pico_bps(symbol, Side::Buy),
-                    sell_market_trend_conflict_pico_bps: self
-                        .market_trend_conflict_pico_bps(symbol, Side::Sell),
-                    reversion_evidence_lower_bps: reversion_evidence_lower_bps(state),
-                    reversion_evidence_scale_ppm: reversion_evidence_scale_ppm(state),
-                    ewma_adverse_markout_bps: pico_bps_to_bps(state.ewma_adverse_markout_pico_bps),
-                    ewma_adverse_markout_micro_bps: pico_bps_to_micro(
-                        state.ewma_adverse_markout_pico_bps,
-                    ),
-                    ewma_adverse_markout_pico_bps: state.ewma_adverse_markout_pico_bps,
-                    adverse_markout_upper_pico_bps,
-                    buy_adverse_markout_upper_pico_bps:
-                        conservative_adverse_markout_pico_bps_for_side(state, Side::Buy),
-                    sell_adverse_markout_upper_pico_bps:
-                        conservative_adverse_markout_pico_bps_for_side(state, Side::Sell),
-                    evaluated_markouts: state.evaluated_markouts,
-                    adverse_markouts: state.adverse_markouts,
-                    adaptive_relief_bps: state.adaptive_relief_bps,
-                    adaptive_relief_micro_bps: state.adaptive_relief_micro_bps,
-                    adaptive_relief_pico_bps: state.adaptive_relief_pico_bps,
-                    buy_edge_bps,
-                    sell_edge_bps,
-                    buy_edge_micro_bps,
-                    sell_edge_micro_bps,
-                    buy_edge_pico_bps,
-                    sell_edge_pico_bps,
-                    liquidity_ratio_bps: state.book.map(|book| {
-                        liquidity_ratio_bps(quote_quantity, book.bid_quantity, book.ask_quantity)
-                    }),
-                    liquidity_penalty_bps: state.book.map(|book| {
-                        liquidity_penalty_bps(quote_quantity, book.bid_quantity, book.ask_quantity)
-                    }),
-                    liquidity_fill_probability_bps: state.book.map(|book| {
-                        fill_probability_bps(quote_quantity, book.bid_quantity, book.ask_quantity)
-                    }),
-                    empirical_fill_probability_lcb_bps: empirical_fill_probability_lcb_bps(state),
-                    buy_empirical_fill_probability_lcb_bps:
-                        empirical_fill_probability_lcb_bps_for_side(state, Side::Buy),
-                    sell_empirical_fill_probability_lcb_bps:
-                        empirical_fill_probability_lcb_bps_for_side(state, Side::Sell),
-                    fair_value_ticks: fair_value.map(|estimate| estimate.price.0),
-                    fair_value_confidence_bps: fair_value.map(|estimate| estimate.confidence_bps),
-                    market_regime: fair_value.map(|estimate| estimate.regime.label().to_owned()),
-                    threshold_status: threshold_diagnostic.status.label().to_owned(),
-                    threshold_prior_used: threshold_diagnostic.prior_used,
-                    threshold_missing_component: threshold_diagnostic
-                        .missing_component
-                        .map(str::to_owned),
-                    m9_calibration: state
-                        .calibration
-                        .snapshot(ppm_to_pico_bps(self.fee_ppm.saturating_mul(2))),
-                    threshold: threshold.map(threshold_metrics),
-                }
-            })
-            .collect();
-        MetricsSnapshot {
-            observed_at_ms,
-            strategy_variant: self.strategy_variant.label().to_owned(),
-            last_market_event_at_ms: self.last_event_at_ms,
-            last_received_at_ms,
-            summary: self.summary(),
-            symbols,
-            history: Vec::new(),
-            risk_metrics: None,
-            portfolio_drawdown: self
-                .portfolio_drawdown_guard
-                .as_ref()
-                .map(PortfolioDrawdownGuard::snapshot),
-            calendar_snapshot: "sse-hkex-2026".to_owned(),
-            maker_fee_source: self.fee_schedule_source.clone(),
-            taker_fee_source: self.fee_schedule_source.clone(),
-            funding_model: "m8_exact_mark_settlement_plus_strategy_funding_controller".to_owned(),
-            capital_usdt_ticks: self.capital_usdt_ticks,
-            capital_usdt: self.capital_usdt_ticks.map(|capital| {
-                crate::execution::binance_wire::format_ticks(capital, self.price_scale)
-            }),
-            model_assumptions: ModelAssumptions {
-                fill_model:
-                    "stateful_fifo_observed_depth_plus_synthetic_queue_then_aggregate_trade"
-                        .to_owned(),
-                queue_ahead: self.realism.queue.visible_ahead,
-                trade_through: self.realism.queue.trade_through,
-                market_to_decision_ms: self.realism.latency.market_to_decision_ms,
-                decision_to_exchange_ms: self.realism.latency.decision_to_exchange_ms,
-                cancel_to_exchange_ms: self.realism.latency.cancel_to_exchange_ms,
-            },
-        }
-    }
-
     pub fn performance_point(&self, observed_at_ms: u64) -> PerformancePoint {
         let summary = self.accounting_summary();
         PerformancePoint {
@@ -3250,9 +2886,9 @@ impl SimulationEngine {
             let entries_allowed =
                 session_allowed && funding_allowed && !portfolio_reduce_only && !symbol_reduce_only;
             let tail_reduce_only = strategy_variant.uses_tail_guard() && m5_tail_reduce_only(state);
-            if !entries_allowed || tail_reduce_only {
-                let should_reduce = ((portfolio_reduce_only || symbol_reduce_only)
-                    && state.position != 0)
+            if state.position != 0 || !entries_allowed || tail_reduce_only {
+                let should_reduce = state.position != 0
+                    || ((portfolio_reduce_only || symbol_reduce_only) && state.position != 0)
                     || position_requires_reduction(
                         state.position,
                         session_allowed,
@@ -3274,6 +2910,7 @@ impl SimulationEngine {
                                 state.position,
                                 session_allowed,
                                 funding_allowed,
+                                tail_reduce_only,
                             )
                         },
                     )
@@ -3303,24 +2940,28 @@ impl SimulationEngine {
                     self.fee_ppm,
                     self.funding_lead_ms,
                 );
+                let threshold_diagnostic = dynamic_threshold_diagnostic_for(
+                    state,
+                    strategy_variant,
+                    self.strategy.entry_threshold_bps,
+                    self.fee_ppm,
+                    requested_quantity,
+                    max_position,
+                    timestamp_ms,
+                );
                 let evidence_ok = reduce_only
-                    || dynamic_threshold_for(
-                        state,
-                        strategy_variant,
-                        self.strategy.entry_threshold_bps,
-                        self.fee_ppm,
-                        requested_quantity,
-                        max_position,
-                        timestamp_ms,
-                    )
-                    .map(|value| scale_threshold_non_fee(value, self.threshold_scale_ppm))
-                    .and_then(|value| value.required_pico_bps())
-                    .is_some_and(|value| {
-                        m7_entry_admissible(
-                            state,
-                            value.saturating_sub(state.adaptive_relief_pico_bps),
-                        )
-                    });
+                    || threshold_diagnostic
+                        .threshold
+                        .map(|value| scale_threshold_non_fee(value, self.threshold_scale_ppm))
+                        .and_then(|value| value.required_pico_bps())
+                        .is_some_and(|value| {
+                            m7_entry_admissible(
+                                state,
+                                value.saturating_sub(state.adaptive_relief_pico_bps),
+                            )
+                        })
+                    || (threshold_diagnostic.status == ThresholdStatus::WarmingUp
+                        && m7_warmup_probe_admissible(state, self.strategy.entry_threshold_bps));
                 if intent.is_some() && !evidence_ok {
                     (None, false, state.working.is_some(), "m7_evidence_gate")
                 } else {
@@ -3370,7 +3011,7 @@ impl SimulationEngine {
                     } else {
                         quantity
                     };
-                    let threshold = dynamic_threshold_for(
+                    let threshold_diagnostic = dynamic_threshold_diagnostic_for(
                         state,
                         strategy_variant,
                         self.strategy.entry_threshold_bps,
@@ -3378,14 +3019,20 @@ impl SimulationEngine {
                         quantity,
                         max_position,
                         timestamp_ms,
-                    )
-                    .map(|threshold| scale_threshold_non_fee(threshold, self.threshold_scale_ppm));
+                    );
+                    let threshold = threshold_diagnostic.threshold.map(|threshold| {
+                        scale_threshold_non_fee(threshold, self.threshold_scale_ppm)
+                    });
                     let m7_required_pico_bps = threshold
                         .and_then(|value| value.required_pico_bps())
                         .map(|required| required.saturating_sub(state.adaptive_relief_pico_bps))
                         .unwrap_or(0);
+                    let warmup_probe = strategy_variant.uses_evidence_gate()
+                        && threshold_diagnostic.status == ThresholdStatus::WarmingUp
+                        && m7_warmup_probe_admissible(state, self.strategy.entry_threshold_bps);
                     let m7_blocked = strategy_variant.uses_evidence_gate()
-                        && !m7_entry_admissible(state, m7_required_pico_bps);
+                        && !m7_entry_admissible(state, m7_required_pico_bps)
+                        && !warmup_probe;
                     let intent = if strategy_variant == SimulationPolicyVariant::M0Fixed {
                         if m7_blocked {
                             None
@@ -3546,8 +3193,22 @@ impl SimulationEngine {
                                     Side::Sell => trend_conflict_pico_bps(state, Side::Sell)
                                         .max(market_sell_trend_conflict_pico_bps),
                                 };
-                                intent.quantity =
-                                    trend_conflict_scaled_quantity(trend_conflict, intent.quantity);
+                                let threshold_baseline = threshold
+                                    .as_ref()
+                                    .map(|value| {
+                                        let components = value.components_pico_bps();
+                                        components[1].saturating_add(components[6])
+                                    })
+                                    .unwrap_or(0);
+                                let trend_baseline = state
+                                    .ewma_abs_return_pico_bps
+                                    .saturating_add(state.ewma_spread_pico_bps)
+                                    .max(threshold_baseline.max(1));
+                                intent.quantity = trend_conflict_scaled_quantity(
+                                    trend_conflict,
+                                    trend_baseline,
+                                    intent.quantity,
+                                );
                                 intent.quantity = cross_symbol_concentration_scaled_quantity(
                                     portfolio_inventory_imbalance_bps,
                                     state.position,
@@ -3557,12 +3218,23 @@ impl SimulationEngine {
                                 (intent.quantity > 0).then_some(intent)
                             })
                     };
-                    let reason = if intent.is_some() {
-                        "admissible"
-                    } else if strategy_variant.uses_evidence_gate() {
+                    let inventory_blocked = strategy_variant.uses_evidence_gate()
+                        && intent.as_ref().is_some_and(|intent| {
+                            inventory_adverse_drift_blocked(state, max_position, intent.side)
+                        });
+                    let intent = intent.filter(|_| !inventory_blocked);
+                    let reason = if inventory_blocked {
+                        "inventory_adverse_drift_guard"
+                    } else if intent.is_some() {
+                        if warmup_probe {
+                            "m7_warmup_probe"
+                        } else {
+                            "admissible"
+                        }
+                    } else if m7_blocked {
                         "m7_evidence_gate"
                     } else {
-                        "signal_below_threshold"
+                        "signal_below_threshold_or_size"
                     };
                     (intent, false, state.working.is_some(), reason)
                 }
@@ -3592,6 +3264,13 @@ impl SimulationEngine {
                         .unwrap_or(self.max_position.saturating_sub(current_position));
                     let requested_price = intent.price;
                     let requested_quantity = intent.quantity;
+                    // The optimizer chooses a continuous economic quantity,
+                    // while the exchange exposes a discrete feasible set. If
+                    // the minimum tradable quantity remains inside the explicit
+                    // position capacity, projection to that quantity is valid;
+                    // otherwise the feasible set is empty and normalization
+                    // rejects it without weakening the risk limit.
+                    let economic_quantity_cap = maximum_quantity;
                     let projected = filters
                         .normalize_price(intent.price, intent.side == Side::Buy, intent.post_only)
                         .and_then(|price| {
@@ -3599,7 +3278,7 @@ impl SimulationEngine {
                                 .normalize_quantity(
                                     intent.quantity,
                                     price,
-                                    maximum_quantity,
+                                    economic_quantity_cap,
                                     self.quantity_scale,
                                 )
                                 .map(|quantity| (price, quantity))
@@ -3624,7 +3303,20 @@ impl SimulationEngine {
             }
         }
         if desired.is_none() {
-            let outcome = if has_working {
+            // A transient M7 evidence dip is not enough to destroy a valid
+            // maker queue position. Re-evaluate the quote through the same
+            // freshness, passivity, anchor-edge, and cooldown checks used by
+            // soft signal hysteresis. Hard risk/data/funding gates still
+            // cancel immediately.
+            let soft_gate_hold = has_working
+                && matches!(
+                    decision_reason,
+                    "signal_below_threshold_or_size" | "m7_evidence_gate"
+                )
+                && self.working_quote_soft_hysteresis_allowed(symbol, timestamp_ms);
+            let outcome = if soft_gate_hold {
+                "held_soft_hysteresis"
+            } else if has_working {
                 "cancel_pending"
             } else {
                 "rejected"
@@ -3661,6 +3353,9 @@ impl SimulationEngine {
                 }));
                 record
             };
+            if soft_gate_hold {
+                return vec![decision_record];
+            }
             let rejection_source = if decision_reason.starts_with("exchange_") {
                 "binance_exchange_filters_pre_admission"
             } else {
@@ -3738,18 +3433,32 @@ impl SimulationEngine {
         if same_order {
             return vec![decision_record];
         }
-        // Preserve queue priority unless the desired price moved materially.
-        // A timer-only reprice needlessly cancels a live maker order and loses
-        // its place in queue; a one-bps move is the minimum economic reason to
-        // pay that queue-loss cost.
+        // A pending cancel is still a live exchange order. Do not issue
+        // replacement attempts against it on every market event; the exchange
+        // acknowledgement is the only transition that can free the symbol.
+        if self.states[symbol]
+            .working
+            .as_ref()
+            .is_some_and(|order| order.cancel_requested_at_ms.is_some())
+        {
+            return vec![decision_record];
+        }
+        // Replacing a maker quote destroys FIFO priority and exposes the symbol
+        // to the cancel/arrival race. The decision is therefore economic:
+        // reprice only when the quote movement exceeds the modeled value of
+        // the queue ahead, the current churn cooldown, and the latency window.
         let hold_existing_quote = has_working
             && !reduce_only
             && self.states[symbol].working.as_ref().is_some_and(|order| {
-                order.side == desired.side
-                    && order.remaining_quantity >= desired.quantity
-                    && (timestamp_ms.saturating_sub(order.placed_at_ms)
-                        < self.quote_reprice_min_interval_ms
-                        || bps_between(order.price_ticks, desired.price).abs() < 1)
+                !Self::maker_quote_replacement_is_worthwhile(
+                    order,
+                    &desired,
+                    &self.states[symbol],
+                    timestamp_ms,
+                    self.quote_reprice_min_interval_ms,
+                    self.realism.latency.cancel_to_exchange_ms,
+                    self.realism.latency.total_entry_ms(),
+                )
             });
         if hold_existing_quote {
             return vec![decision_record];
@@ -3769,6 +3478,138 @@ impl SimulationEngine {
             Some(decision_id),
         ));
         records
+    }
+
+    /// Decide whether a same-side maker quote has enough expected
+    /// repositioning value to justify abandoning its queue position.
+    ///
+    /// All costs are derived from the current spread, the order's remaining
+    /// queue, order age, and configured latencies. This intentionally avoids
+    /// a universal timer or fixed bps threshold: a one-tick move can be worth
+    /// replacing in an empty queue, while a larger move can still be held when
+    /// the order is buried behind a deep queue and the latency race is costly.
+    /// Keep a valid passive quote through a transient soft-signal dip.
+    fn working_quote_soft_hysteresis_allowed(&self, symbol: &str, timestamp_ms: u64) -> bool {
+        let Some(state) = self.states.get(symbol) else {
+            return false;
+        };
+        let Some(order) = state.working.as_ref() else {
+            return false;
+        };
+        if order.cancel_requested_at_ms.is_some()
+            || self.quote_reprice_min_interval_ms == 0
+            || timestamp_ms.saturating_sub(order.placed_at_ms) >= self.quote_reprice_min_interval_ms
+        {
+            return false;
+        }
+        let Some(book) = state.book else {
+            return false;
+        };
+        let passive = match order.side {
+            Side::Buy => order.price_ticks < book.ask_price_ticks,
+            Side::Sell => order.price_ticks > book.bid_price_ticks,
+        };
+        if !passive
+            || data_quality_for(state, timestamp_ms, self.max_mark_index_gap_bps)
+                != DataQualityStatus::Fresh
+            || !state.anchor.valid_at(timestamp_ms, self.max_anchor_age_ms)
+        {
+            return false;
+        }
+        let Some(fair_value_ticks) = fair_value_for_state(state).map(|estimate| estimate.price.0)
+        else {
+            return false;
+        };
+        let edge = match order.side {
+            Side::Buy => edge_pico_bps(fair_value_ticks, order.price_ticks),
+            Side::Sell => edge_pico_bps(order.price_ticks, fair_value_ticks),
+        }
+        .unwrap_or(0)
+        .max(0);
+        let floor = i128::from(self.strategy.entry_threshold_bps.max(0))
+            .saturating_mul(i128::from(PICO_BPS_SCALE));
+        i128::from(edge) >= floor
+    }
+
+    fn maker_quote_replacement_is_worthwhile(
+        order: &WorkingOrder,
+        desired: &OrderIntent,
+        state: &SimulationSymbolState,
+        timestamp_ms: u64,
+        min_interval_ms: u64,
+        cancel_latency_ms: u64,
+        entry_latency_ms: u64,
+    ) -> bool {
+        if order.cancel_requested_at_ms.is_some() {
+            return false;
+        }
+        if order.side != desired.side || order.reduce_only != desired.reduce_only {
+            return true;
+        }
+        if order.remaining_quantity < desired.quantity {
+            return true;
+        }
+        if order.price_ticks == desired.price {
+            return false;
+        }
+        let Some(book) = state.book else {
+            // A valid desired intent normally implies a book. If it is absent,
+            // fail open for replacement rather than keep an unverified stale quote.
+            return true;
+        };
+        let quote_move_pico_bps = bps_between_pico(order.price_ticks, desired.price);
+        if quote_move_pico_bps == i64::MAX {
+            return true;
+        }
+        // A resting maker quote that has crossed the current opposite touch is
+        // no longer a valid passive order. This is a hard invalidation and
+        // must not be delayed by queue value or the reprice cooldown.
+        let hard_invalidated = match order.side {
+            Side::Buy => order.price_ticks >= book.ask_price_ticks,
+            Side::Sell => order.price_ticks <= book.bid_price_ticks,
+        };
+        if hard_invalidated {
+            return true;
+        }
+        let spread_pico_bps = bps_between_pico(book.ask_price_ticks, book.bid_price_ticks);
+        if spread_pico_bps == i64::MAX {
+            return true;
+        }
+
+        let remaining = i128::from(order.remaining_quantity.max(1));
+        let queue_ahead = i128::from(order.queue_ahead_remaining.max(0));
+        let queue_total = queue_ahead.saturating_add(remaining).max(1);
+        let queue_cost = (i128::from(spread_pico_bps) * queue_ahead / queue_total)
+            .clamp(0, i128::from(i64::MAX)) as i64;
+
+        let age_ms = timestamp_ms.saturating_sub(order.placed_at_ms);
+        let cooldown_cost = if min_interval_ms == 0 || age_ms >= min_interval_ms {
+            0
+        } else {
+            let remaining_cooldown = min_interval_ms.saturating_sub(age_ms);
+            let numerator =
+                i128::from(spread_pico_bps).saturating_mul(i128::from(remaining_cooldown));
+            (numerator / i128::from(min_interval_ms)).clamp(0, i128::from(i64::MAX)) as i64
+        };
+
+        let latency_ms = cancel_latency_ms.saturating_add(entry_latency_ms);
+        let latency_cost = if latency_ms == 0 {
+            0
+        } else {
+            let denominator = i128::from(latency_ms).saturating_add(i128::from(age_ms.max(1)));
+            ((i128::from(spread_pico_bps) * i128::from(latency_ms) / denominator)
+                .clamp(0, i128::from(i64::MAX)) as i64)
+                // Latency is an execution-risk surcharge, not a reason to
+                // retain a materially stale quote forever. Cap it at half of
+                // the observed repositioning value so queue economics remain
+                // the deciding factor for ordinary valid maker quotes.
+                .min(quote_move_pico_bps / 2)
+        };
+
+        i128::from(quote_move_pico_bps)
+            > i128::from(queue_cost)
+                .saturating_add(i128::from(cooldown_cost))
+                .saturating_add(i128::from(latency_cost))
     }
 
     fn place_symbol(
@@ -4408,8 +4249,8 @@ fn m9_intent_for_state(
         // They must not share one rejection bucket when judging whether M9 has
         // enough evidence to become a challenger.
         let reason = match calibration_snapshot.status {
-            CalibrationStatus::InsufficientHistory => "m9_calibration_warming_up",
-            CalibrationStatus::Calibrated => "m9_calibration_invalid",
+            CalibrationStatus::InsufficientHistory => "insufficient_history",
+            CalibrationStatus::Calibrated => "calibration_unavailable",
         };
         return (None, false, reason);
     };
@@ -4478,7 +4319,7 @@ fn m9_intent_for_state(
             price: book.bid_price_ticks,
             quantity: decision.quantity,
             post_only: true,
-            reduce_only: false,
+            reduce_only: true,
         }),
         M9Action::ReduceSell => Some(OrderIntent {
             symbol: state.symbol_id,
@@ -4486,11 +4327,29 @@ fn m9_intent_for_state(
             price: book.ask_price_ticks,
             quantity: decision.quantity,
             post_only: true,
-            reduce_only: false,
+            reduce_only: true,
         }),
         M9Action::NoAction => None,
     };
     (intent, reduce_only, decision.reason)
+}
+
+fn position_has_adverse_fair_value(state: &SimulationSymbolState) -> bool {
+    if state.position == 0 {
+        return false;
+    }
+    let Some(book) = state.book else {
+        return false;
+    };
+    let Some(fair_value) = fair_value_for_state(state) else {
+        return false;
+    };
+    let mid = (book.bid_price_ticks + book.ask_price_ticks) / 2;
+    if state.position > 0 {
+        fair_value.price.0 <= mid
+    } else {
+        fair_value.price.0 >= mid
+    }
 }
 
 fn position_requires_reduction(
@@ -4508,11 +4367,14 @@ fn entry_restriction_reason(
     position: i64,
     session_allowed: bool,
     funding_allowed: bool,
+    tail_reduce_only: bool,
 ) -> &'static str {
     if position == 0 && !session_allowed {
         "equity_session_open"
     } else if position == 0 && !funding_allowed {
         "funding_entry_blocked"
+    } else if tail_reduce_only {
+        "tail_risk_guard"
     } else {
         "entry_restricted_without_position_reduction"
     }
@@ -4683,6 +4545,7 @@ fn maker_exit_intent_for_state(
         }),
         constraints,
         working,
+        allow_reversion_exit: position_has_adverse_fair_value(state),
     });
     match decision {
         MakerExitDecision::Submit(intent) => (Some(intent), "maker_exit_submit"),
@@ -4693,7 +4556,7 @@ fn maker_exit_intent_for_state(
                 price: order.price_ticks,
                 quantity: order.remaining_quantity,
                 post_only: true,
-                reduce_only: false,
+                reduce_only: true,
             }),
             "maker_exit_keep_working",
         ),
@@ -4969,6 +4832,13 @@ fn data_quality_for(
     if state.last_mark_time_ms == 0
         || now_ms < state.last_mark_time_ms
         || now_ms.saturating_sub(state.last_mark_time_ms)
+            > binance_runtime_config().operational.max_signal_age_ms
+    {
+        return DataQualityStatus::Stale;
+    }
+    if state.last_book_event_at_ms == 0
+        || now_ms < state.last_book_event_at_ms
+        || now_ms.saturating_sub(state.last_book_event_at_ms)
             > binance_runtime_config().operational.max_signal_age_ms
     {
         return DataQualityStatus::Stale;
@@ -5661,6 +5531,13 @@ mod risk_window_regression_tests {
         let metrics = calculate_risk_metrics(&[(0, 1_000), (30_000, 1_100)], 10_000);
         assert!((metrics.total_return_pct - 1.0).abs() < 1e-9);
         assert!((metrics.max_drawdown_pct - 0.0).abs() < 1e-9);
+    }
+    #[test]
+    fn flat_tail_restriction_reports_tail_risk() {
+        assert_eq!(
+            entry_restriction_reason(0, true, true, true),
+            "tail_risk_guard"
+        );
     }
 }
 

@@ -19,13 +19,17 @@ pub(super) fn fair_value_for_state(state: &SimulationSymbolState) -> Option<Fair
     let index = state.index_price_ticks?;
     let mark = state.mark_price_ticks?;
     let mid = book.bid_price_ticks.checked_add(book.ask_price_ticks)? / 2;
-    FairValueEstimate::from_market_precise(
+    FairValueEstimate::from_market_precise_with_anchor_lifetime_and_age(
         crate::strategy::PriceTicks(state.anchor.close_price_ticks),
         crate::strategy::PriceTicks(index),
         crate::strategy::PriceTicks(mark),
         crate::strategy::PriceTicks(mid),
         state.ewma_abs_return_pico_bps,
         state.ewma_spread_pico_bps,
+        state.anchor.observed_at_ms,
+        state.anchor.valid_until_ms,
+        state.last_mark_time_ms,
+        state.anchor_confidence_horizon_ms,
     )
 }
 
@@ -94,14 +98,18 @@ pub(super) fn dynamic_threshold_diagnostic_for(
     let cost_pico_bps = ppm_to_pico_bps(fee_ppm.saturating_mul(2));
     let fair_value_confidence_pico_bps = fair_value_for_state(state)
         .map(|estimate| {
-            i128::from(estimate.confidence_bps).saturating_mul(i128::from(PICO_BPS_SCALE))
+            // Fair-value confidence already contains live volatility and
+            // spread. Remove those terms here so the threshold does not pay
+            // for the same uncertainty twice; the threshold adds them below.
+            i128::from(estimate.confidence_pico_bps)
+                .saturating_sub(i128::from(volatility_pico_bps))
+                .saturating_sub(i128::from(state.ewma_spread_pico_bps / 2))
+                .max(0)
         })
-        .unwrap_or(i128::from(gap_pico_bps))
-        .clamp(0, i128::from(i64::MAX)) as i64;
-    let confidence_component_pico_bps = 5 * i128::from(PICO_BPS_SCALE)
-        + i128::from(fair_value_confidence_pico_bps).min(50 * i128::from(PICO_BPS_SCALE));
+        .unwrap_or(i128::from(gap_pico_bps) / 2)
+        .clamp(0, i128::from(i64::MAX));
     let uncertainty_pico_bps = (i128::from(gap_pico_bps) / 2)
-        .max(confidence_component_pico_bps)
+        .max(fair_value_confidence_pico_bps)
         .clamp(0, i128::from(i64::MAX)) as i64;
     let spread_pico_bps = if state.ewma_spread_pico_bps == 0 {
         THRESHOLD_PRIOR_SPREAD_PICO_BPS
@@ -187,11 +195,10 @@ pub(super) fn dynamic_threshold_diagnostic_for(
         } else {
             deadline_risk_pico_bps
         },
-        if variant == SimulationPolicyVariant::M0Fixed {
-            0
-        } else {
-            5 * PICO_BPS_SCALE
-        },
+        // The configured entry floor is the explicit base hurdle. A second
+        // fixed safety margin would double-count it and suppress ordinary
+        // positive-edge opportunities.
+        0,
         if variant == SimulationPolicyVariant::M0Fixed {
             0
         } else {
@@ -716,11 +723,24 @@ pub(super) fn core_v1_margin_scaled_quantity(
         return 0;
     }
     let evidence_scale = reversion_evidence_scale_ppm(state);
-    let evidence_scaled = (i128::from(edge_scaled_quantity) * i128::from(evidence_scale)
-        / i128::from(1_000_000_i64))
-    .clamp(1, i128::from(edge_scaled_quantity)) as i64;
+    let evidence_scaled = if edge_scaled_quantity > 0 && evidence_scale > 0 {
+        (i128::from(edge_scaled_quantity) * i128::from(evidence_scale) / i128::from(1_000_000_i64))
+            .clamp(1, i128::from(edge_scaled_quantity)) as i64
+    } else {
+        0
+    };
+    let threshold_components = threshold.components_pico_bps();
+    let risk_baseline = state
+        .ewma_abs_return_pico_bps
+        .saturating_add(state.ewma_spread_pico_bps)
+        .max(
+            threshold_components[1]
+                .saturating_add(threshold_components[6])
+                .max(1),
+        );
     residual_regime_scaled_quantity(
         residual_regime_risk_pico_bps(state, intent.side),
+        risk_baseline,
         evidence_scaled,
     )
 }
@@ -737,15 +757,19 @@ pub(super) fn fractional_edge_quantity(
     if edge_pico_bps <= 0 || hurdle_pico_bps <= 0 || quantity <= 0 {
         return quantity.max(0);
     }
-    if edge_pico_bps < hurdle_pico_bps {
-        // Defense in depth: the sizing layer must never turn a stale or
-        // inconsistent fair-value calculation into a live admissible quote.
+    if edge_pico_bps <= hurdle_pico_bps {
+        // At the economic boundary the marginal expected value is zero.
+        // Do not manufacture a probe with an arbitrary minimum fraction.
         return 0;
     }
     let margin = i128::from(edge_pico_bps - hurdle_pico_bps);
     let edge = i128::from(edge_pico_bps);
-    let scale_bps = 2_500_i128 + margin * 7_500_i128 / edge;
-    (i128::from(quantity) * scale_bps / 10_000_i128)
+    let scale_ppm = margin
+        .saturating_mul(1_000_000_i128)
+        .checked_div(edge)
+        .unwrap_or(0)
+        .clamp(0, 1_000_000_i128);
+    (i128::from(quantity) * scale_ppm / 1_000_000_i128)
         .clamp(1, i128::from(quantity))
         .min(i128::from(i64::MAX)) as i64
 }
@@ -784,14 +808,25 @@ pub(super) fn cross_symbol_concentration_scaled_quantity(
 /// monotone, explainable, and never amplifies a signal. At the cap it keeps a
 /// small residual quote rather than converting a soft risk signal into an
 /// undocumented hard gate; hard data/tail gates remain authoritative.
-pub(super) fn trend_conflict_scaled_quantity(conflict_pico_bps: i64, quantity: i64) -> i64 {
+pub(super) fn trend_conflict_scaled_quantity(
+    conflict_pico_bps: i64,
+    baseline_pico_bps: i64,
+    quantity: i64,
+) -> i64 {
     if quantity <= 0 || conflict_pico_bps <= 0 {
         return quantity.max(0);
     }
-    let conflict = i128::from(conflict_pico_bps.min(TREND_CONFLICT_CAP_PICO_BPS));
-    let cap = i128::from(TREND_CONFLICT_CAP_PICO_BPS.max(1));
-    let scale_bps = 10_000_i128 - 5_000_i128 * conflict / cap;
-    (i128::from(quantity) * scale_bps / 10_000_i128).clamp(1, i128::from(quantity)) as i64
+    if baseline_pico_bps <= 0 {
+        return 0;
+    }
+    let conflict = i128::from(conflict_pico_bps.max(0));
+    let baseline = i128::from(baseline_pico_bps.max(0));
+    let scale_ppm = baseline
+        .saturating_mul(1_000_000_i128)
+        .checked_div(baseline.saturating_add(conflict))
+        .unwrap_or(0)
+        .clamp(0, 1_000_000_i128);
+    (i128::from(quantity) * scale_ppm / 1_000_000_i128).clamp(1, i128::from(quantity)) as i64
 }
 
 /// Convert the queue-survival estimate into a continuous execution-size
@@ -800,12 +835,11 @@ pub(super) fn trend_conflict_scaled_quantity(conflict_pico_bps: i64, quantity: i
 /// high probability recovers the full signal quantity. The affine map is
 /// monotone and uses the same conservative 25% floor as the evidence model.
 pub(super) fn fill_probability_scaled_quantity(fill_probability_bps: u16, quantity: i64) -> i64 {
-    if quantity <= 0 {
+    if quantity <= 0 || fill_probability_bps == 0 {
         return quantity.max(0);
     }
     let probability = i128::from(fill_probability_bps.min(10_000));
-    let scale_ppm = i128::from(MIN_EVIDENCE_SCALE_PPM)
-        + (1_000_000_i128 - i128::from(MIN_EVIDENCE_SCALE_PPM)) * probability / 10_000;
+    let scale_ppm = probability.saturating_mul(1_000_000_i128) / 10_000;
     (i128::from(quantity) * scale_ppm / 1_000_000_i128).clamp(1, i128::from(quantity)) as i64
 }
 
@@ -813,14 +847,44 @@ pub(super) fn fill_probability_scaled_quantity(fill_probability_bps: u16, quanti
 /// floor matches the existing evidence-aware sizing floor: uncertain regime
 /// state can reduce a new quote to a probe, but it cannot silently create a
 /// hard entry gate or interfere with reduce-only cleanup.
-pub(super) fn residual_regime_scaled_quantity(risk_pico_bps: i64, quantity: i64) -> i64 {
+pub(super) fn residual_regime_scaled_quantity(
+    risk_pico_bps: i64,
+    baseline_pico_bps: i64,
+    quantity: i64,
+) -> i64 {
     if quantity <= 0 || risk_pico_bps <= 0 {
         return quantity.max(0);
     }
-    let risk = i128::from(risk_pico_bps.min(RESIDUAL_REGIME_CAP_PICO_BPS));
-    let cap = i128::from(RESIDUAL_REGIME_CAP_PICO_BPS.max(1));
-    let scale_ppm = 1_000_000_i128 - risk * i128::from(1_000_000 - MIN_EVIDENCE_SCALE_PPM) / cap;
+    if baseline_pico_bps <= 0 {
+        return 0;
+    }
+    let risk = i128::from(risk_pico_bps.max(0));
+    let baseline = i128::from(baseline_pico_bps.max(0));
+    let scale_ppm = baseline
+        .saturating_mul(1_000_000_i128)
+        .checked_div(baseline.saturating_add(risk))
+        .unwrap_or(0)
+        .clamp(0, 1_000_000_i128);
     (i128::from(quantity) * scale_ppm / 1_000_000_i128).clamp(1, i128::from(quantity)) as i64
+}
+
+pub(super) fn m7_warmup_probe_admissible(
+    state: &SimulationSymbolState,
+    entry_floor_bps: i64,
+) -> bool {
+    let Some(book) = state.book else {
+        return false;
+    };
+    let Some(fair_value_ticks) = fair_value_for_state(state).map(|estimate| estimate.price.0)
+    else {
+        return false;
+    };
+    let mid = book.bid_price_ticks.saturating_add(book.ask_price_ticks) / 2;
+    if mid <= 0 || fair_value_ticks <= 0 || entry_floor_bps < 0 {
+        return false;
+    }
+    i128::from(bps_between_pico(mid, fair_value_ticks))
+        >= i128::from(entry_floor_bps).saturating_mul(i128::from(PICO_BPS_SCALE))
 }
 
 pub(super) fn m7_entry_admissible(state: &SimulationSymbolState, threshold_pico_bps: i64) -> bool {
@@ -840,6 +904,30 @@ pub(super) fn m7_entry_admissible(state: &SimulationSymbolState, threshold_pico_
     residual_pico_bps >= threshold_pico_bps
         && !(residual_pico_bps >= 500 * PICO_BPS_SCALE
             && m5_tail_stress_pico(state) >= M5_TAIL_CAUTION_BPS * PICO_BPS_SCALE)
+}
+
+/// Hard inventory brake for a mean-reversion quote that keeps adding to
+/// an already material position while the local move and residual both worsen.
+/// The test is direction-aware and only applies to the risk-increasing side;
+/// reduce-only intents remain eligible for cleanup.
+pub(super) fn inventory_adverse_drift_blocked(
+    state: &SimulationSymbolState,
+    _max_position: i64,
+    side: Side,
+) -> bool {
+    let same_direction = match side {
+        Side::Buy => state.position > 0,
+        Side::Sell => state.position < 0,
+    };
+    if !same_direction {
+        return false;
+    }
+    let trend_conflict = trend_conflict_pico_bps(state, side) > 0;
+    let residual_is_worsening = match side {
+        Side::Buy => state.ewma_signed_residual_drift_pico_bps > 0,
+        Side::Sell => state.ewma_signed_residual_drift_pico_bps < 0,
+    };
+    trend_conflict && residual_is_worsening
 }
 
 pub(super) fn ppm_to_bps(ppm: i64) -> i64 {

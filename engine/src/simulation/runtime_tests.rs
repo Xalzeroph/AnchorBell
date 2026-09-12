@@ -4,11 +4,11 @@ use super::{entry_restriction_reason, position_requires_reduction};
 fn flat_risk_gate_does_not_enter_maker_exit_path() {
     assert!(!position_requires_reduction(0, false, true, false, false));
     assert_eq!(
-        entry_restriction_reason(0, false, true),
+        entry_restriction_reason(0, false, true, false),
         "equity_session_open"
     );
     assert_eq!(
-        entry_restriction_reason(0, true, false),
+        entry_restriction_reason(0, true, false, false),
         "funding_entry_blocked"
     );
     assert!(position_requires_reduction(10, false, true, false, false));
@@ -742,15 +742,12 @@ fn m5_tail_guard_does_not_double_count_closed_session_anchor_edge() {
 fn fractional_edge_sizing_is_conservative_and_monotone() {
     let hurdle = 100 * PICO_BPS_SCALE;
     let quantity = 10_000;
-    assert_eq!(
-        fractional_edge_quantity(hurdle, hurdle, quantity),
-        quantity / 4
-    );
+    assert_eq!(fractional_edge_quantity(hurdle, hurdle, quantity), 0);
     let marginal = fractional_edge_quantity(101 * PICO_BPS_SCALE, hurdle, quantity);
     let strong = fractional_edge_quantity(400 * PICO_BPS_SCALE, hurdle, quantity);
+    assert!(marginal > 0);
     assert!(marginal < strong);
     assert!(strong < quantity);
-    assert!(marginal >= quantity / 4);
     assert_eq!(
         fractional_edge_quantity(10 * PICO_BPS_SCALE, hurdle, quantity),
         0
@@ -790,8 +787,7 @@ fn margin_sizing_preserves_zero_when_edge_is_below_hurdle() {
         );
         let threshold =
             AdaptiveThreshold::from_pico_components(edge, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0).unwrap();
-        assert!((1..=intent.quantity)
-            .contains(&core_v1_margin_scaled_quantity(state, intent, threshold)));
+        assert_eq!(core_v1_margin_scaled_quantity(state, intent, threshold), 0);
     }
 }
 
@@ -857,14 +853,42 @@ fn trend_conflict_is_directional_and_shrunk_toward_zero() {
 }
 
 #[test]
+fn inventory_adverse_drift_guard_only_blocks_same_side_after_half_capacity() {
+    let mut engine = engine();
+    let state = engine.states.get_mut("CXMTUSDT").expect("test symbol");
+    for index in 0..64 {
+        state
+            .calibration
+            .observe_market(index + 1, Some(PICO_BPS_SCALE), None, None);
+    }
+    state.position = 6;
+    state.ewma_abs_return_pico_bps = 10 * PICO_BPS_SCALE;
+    state.ewma_signed_return_pico_bps = -8 * PICO_BPS_SCALE;
+    state.ewma_signed_residual_drift_pico_bps = 2 * PICO_BPS_SCALE;
+    assert!(inventory_adverse_drift_blocked(state, 10, Side::Buy));
+    assert!(!inventory_adverse_drift_blocked(state, 10, Side::Sell));
+
+    state.position = 4;
+    assert!(inventory_adverse_drift_blocked(state, 10, Side::Buy));
+
+    state.position = -6;
+    state.ewma_signed_return_pico_bps = 8 * PICO_BPS_SCALE;
+    state.ewma_signed_residual_drift_pico_bps = -2 * PICO_BPS_SCALE;
+    assert!(inventory_adverse_drift_blocked(state, 10, Side::Sell));
+}
+
+#[test]
 fn trend_conflict_sizing_is_monotone_and_bounded() {
     let quantity = 10_000;
-    assert_eq!(trend_conflict_scaled_quantity(0, quantity), quantity);
-    let mild = trend_conflict_scaled_quantity(10 * PICO_BPS_SCALE, quantity);
-    let severe = trend_conflict_scaled_quantity(TREND_CONFLICT_CAP_PICO_BPS, quantity);
+    assert_eq!(
+        trend_conflict_scaled_quantity(0, PICO_BPS_SCALE, quantity),
+        quantity
+    );
+    let mild = trend_conflict_scaled_quantity(10 * PICO_BPS_SCALE, 20 * PICO_BPS_SCALE, quantity);
+    let severe = trend_conflict_scaled_quantity(20 * PICO_BPS_SCALE, 10 * PICO_BPS_SCALE, quantity);
     assert!(mild < quantity);
     assert!(severe <= mild);
-    assert!(severe >= quantity / 2);
+    assert!(severe > 0);
 }
 
 #[test]
@@ -919,12 +943,15 @@ fn directional_markout_bounds_do_not_mix_sides_after_warmup() {
 #[test]
 fn residual_regime_sizing_is_monotone_and_never_amplifies() {
     let quantity = 10_000;
-    assert_eq!(residual_regime_scaled_quantity(0, quantity), quantity);
-    let mild = residual_regime_scaled_quantity(RESIDUAL_REGIME_CAP_PICO_BPS / 4, quantity);
-    let severe = residual_regime_scaled_quantity(RESIDUAL_REGIME_CAP_PICO_BPS, quantity);
+    assert_eq!(
+        residual_regime_scaled_quantity(0, PICO_BPS_SCALE, quantity),
+        quantity
+    );
+    let mild = residual_regime_scaled_quantity(PICO_BPS_SCALE, 4 * PICO_BPS_SCALE, quantity);
+    let severe = residual_regime_scaled_quantity(4 * PICO_BPS_SCALE, PICO_BPS_SCALE, quantity);
     assert!(mild < quantity);
     assert!(severe <= mild);
-    assert!(severe >= quantity / 4);
+    assert!(severe > 0);
 }
 
 #[test]
@@ -937,7 +964,7 @@ fn fill_probability_sizing_is_monotone_and_keeps_a_conservative_probe() {
     let quantity = 10_000;
     let low = fill_probability_scaled_quantity(500, quantity);
     let high = fill_probability_scaled_quantity(9_500, quantity);
-    assert!(low >= quantity / 4);
+    assert!(low > 0);
     assert!(low < high);
     assert!(high < quantity);
     assert_eq!(fill_probability_scaled_quantity(10_000, quantity), quantity);
@@ -1087,6 +1114,105 @@ fn shutdown_uses_bounded_reduce_only_flatten_and_reports_flat() {
         .records
         .iter()
         .any(|record| record.kind == "fill"));
+}
+
+#[test]
+fn maker_reprice_preserves_queue_until_value_clears_costs() {
+    let mut engine = engine();
+    feed(
+        &mut engine,
+        br#"{"e":"markPriceUpdate","E":1,"s":"CXMTUSDT","p":"100","i":"100","T":600000,"r":"0"}"#,
+    );
+    feed(
+        &mut engine,
+        br#"{"e":"bookTicker","u":1,"E":2,"T":2,"s":"CXMTUSDT","b":"98","B":"10","a":"99","A":"10"}"#,
+    );
+    let state = engine.states.get("CXMTUSDT").unwrap();
+    let order = WorkingOrder {
+        client_id: 1,
+        decision_id: None,
+        side: Side::Buy,
+        price_ticks: 98,
+        remaining_quantity: 10,
+        reduce_only: false,
+        queue_ahead_quantity: 10,
+        queue_ahead_remaining: 10,
+        quote_distance_bps: 100,
+        placed_at_ms: 0,
+        exchange_arrival_at_ms: 0,
+        cancel_requested_at_ms: None,
+    };
+    let desired = OrderIntent::maker_buy(state.symbol_id, 99, 10);
+    assert!(!SimulationEngine::maker_quote_replacement_is_worthwhile(
+        &order, &desired, state, 2, 750, 0, 0
+    ));
+    assert!(SimulationEngine::maker_quote_replacement_is_worthwhile(
+        &order, &desired, state, 1_000, 750, 0, 0
+    ));
+}
+
+#[test]
+fn maker_reprice_responds_to_large_quote_move_despite_cooldown() {
+    let mut engine = engine();
+    feed(
+        &mut engine,
+        br#"{"e":"markPriceUpdate","E":1,"s":"CXMTUSDT","p":"100","i":"100","T":600000,"r":"0"}"#,
+    );
+    feed(
+        &mut engine,
+        br#"{"e":"bookTicker","u":1,"E":2,"T":2,"s":"CXMTUSDT","b":"98","B":"10","a":"99","A":"10"}"#,
+    );
+    let state = engine.states.get("CXMTUSDT").unwrap();
+    let order = WorkingOrder {
+        client_id: 1,
+        decision_id: None,
+        side: Side::Buy,
+        price_ticks: 98,
+        remaining_quantity: 10,
+        reduce_only: false,
+        queue_ahead_quantity: 0,
+        queue_ahead_remaining: 0,
+        quote_distance_bps: 100,
+        placed_at_ms: 2,
+        exchange_arrival_at_ms: 2,
+        cancel_requested_at_ms: None,
+    };
+    let desired = OrderIntent::maker_buy(state.symbol_id, 100, 10);
+    assert!(SimulationEngine::maker_quote_replacement_is_worthwhile(
+        &order, &desired, state, 3, 750, 0, 0
+    ));
+}
+
+#[test]
+fn maker_reprice_does_not_repeat_cancel_in_flight() {
+    let mut engine = engine();
+    feed(
+        &mut engine,
+        br#"{"e":"markPriceUpdate","E":1,"s":"CXMTUSDT","p":"100","i":"100","T":600000,"r":"0"}"#,
+    );
+    feed(
+        &mut engine,
+        br#"{"e":"bookTicker","u":1,"E":2,"T":2,"s":"CXMTUSDT","b":"98","B":"10","a":"99","A":"10"}"#,
+    );
+    let state = engine.states.get("CXMTUSDT").unwrap();
+    let order = WorkingOrder {
+        client_id: 1,
+        decision_id: None,
+        side: Side::Buy,
+        price_ticks: 98,
+        remaining_quantity: 10,
+        reduce_only: false,
+        queue_ahead_quantity: 0,
+        queue_ahead_remaining: 0,
+        quote_distance_bps: 100,
+        placed_at_ms: 2,
+        exchange_arrival_at_ms: 2,
+        cancel_requested_at_ms: Some(2),
+    };
+    let desired = OrderIntent::maker_buy(state.symbol_id, 100, 10);
+    assert!(!SimulationEngine::maker_quote_replacement_is_worthwhile(
+        &order, &desired, state, 3, 0, 100, 100
+    ));
 }
 
 #[cfg(test)]

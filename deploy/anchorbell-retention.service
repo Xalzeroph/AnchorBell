@@ -5,7 +5,7 @@ Description=Retain AnchorBell trade results and prune expired raw archives
 Type=oneshot
 User=anchorbell
 Group=anchorbell
-ExecStart=/usr/bin/python3 /opt/anchorbell/scripts/simulation_retention.py --root /var/lib/anchorbell --apply
+ExecStart=/usr/bin/python3 /opt/anchorbell-maintenance/simulation_retention.py --root /var/lib/anchorbell --apply
 Nice=15
 IOSchedulingClass=idle
 CPUQuota=20%
@@ -15,4 +15,3 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=/var/lib/anchorbell
-
