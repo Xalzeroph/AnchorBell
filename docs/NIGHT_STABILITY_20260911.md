@@ -69,9 +69,31 @@ into `runtime_metrics.rs` to keep the combined runtime within the source budget.
 
 The deployed executable lives under `/opt/anchorbell-releases/<commit>/` and is
 selected by `anchorbell-simulation.service.d/30-verified-release.conf`. The
-server's original working tree and its uncommitted changes remain untouched.
+server's uncommitted strategy changes are preserved.
 Future deployments must update this override to the new verified release;
 rebuilding the old checkout alone does not change the running version.
+
+The stability patch is also synchronized into the original working tree while
+preserving its existing uncommitted strategy edits, so subsequent builds keep
+the fixes. The reviewed release branch records the combined source snapshot.
+
+## Dashboard response budget
+
+The run index retains financial totals for every run but includes only the
+latest run's last 120 rejection details. Older details remain on disk; the API
+sets its truncation flag and the UI explains the omission. This avoids returning
+about 20 MB of repeated historical rejection records on every refresh. The
+browser also skips refresh ticks while a previous request batch is pending. A
+15-second abort deadline covers response headers and JSON bodies; timeout keeps
+the last successful snapshot and permits the next refresh to retry.
+
+Additional checks:
+
+```sh
+cargo test --locked --bin anchorbell_dashboard
+node --test scripts/test_dashboard_refresh.cjs
+node --check engine/web/app.js
+```
 
 ## Verification
 

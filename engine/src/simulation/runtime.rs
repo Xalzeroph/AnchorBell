@@ -2187,6 +2187,9 @@ impl SimulationEngine {
     }
 
     fn reject_entry(&mut self, owner: &str) {
+        if owner.starts_with("maker_exit_") {
+            return;
+        }
         self.rejected_entries = self.rejected_entries.saturating_add(1);
         *self.gate_rejections.entry(owner.to_owned()).or_default() += 1;
     }
@@ -3314,7 +3317,11 @@ impl SimulationEngine {
                     "signal_below_threshold_or_size" | "m7_evidence_gate"
                 )
                 && self.working_quote_soft_hysteresis_allowed(symbol, timestamp_ms);
-            let outcome = if soft_gate_hold {
+            let position_management_wait = decision_reason.starts_with("maker_exit_");
+
+            let outcome = if position_management_wait {
+                "position_management_wait"
+            } else if soft_gate_hold {
                 "held_soft_hysteresis"
             } else if has_working {
                 "cancel_pending"
@@ -3361,20 +3368,22 @@ impl SimulationEngine {
             } else {
                 "strategy_risk_gate"
             };
-            self.reject_entry_structured(
-                symbol,
-                decision_reason,
-                rejection_source,
-                rejection_threshold_bps(
-                    self,
+            if !position_management_wait {
+                self.reject_entry_structured(
                     symbol,
+                    decision_reason,
+                    rejection_source,
+                    rejection_threshold_bps(
+                        self,
+                        symbol,
+                        timestamp_ms,
+                        requested_quantity,
+                        max_position,
+                    ),
+                    rejection_observed_edge_bps(self, symbol),
                     timestamp_ms,
-                    requested_quantity,
-                    max_position,
-                ),
-                rejection_observed_edge_bps(self, symbol),
-                timestamp_ms,
-            );
+                );
+            }
             if has_working {
                 let mut records = vec![decision_record];
                 records.extend(self.cancel_symbol(
