@@ -1,24 +1,13 @@
-pub mod analytics;
-pub mod analytics_evidence;
-pub mod analytics_validation;
-pub mod backtest;
-pub mod backtest_report;
-pub mod core;
-pub mod event;
+pub mod evolution;
 pub mod execution;
-pub mod historical;
-pub mod m8;
-pub mod market;
-mod network;
-pub mod observability;
-pub mod oos_validation;
-pub mod orderbook;
-pub mod platform;
-pub mod promotion_policy;
-pub mod replay;
-pub mod risk;
+pub mod ledger;
+pub mod model;
+pub mod policy;
 pub mod runtime;
-pub mod simulation;
-pub mod simulation_batch;
-pub mod strategy;
-pub mod validation_contracts;
+
+pub const ANCHORBELL_BUILD_SHA: &str = env!("ANCHORBELL_GIT_SHA");
+
+pub use model::{
+    Anchor, AnchorEpisode, BinanceContract, ClosedWindow, EvidenceFrame, ValidatedOrder,
+};
+pub use policy::{Decision, DecisionEngine, StrategyPlan};
