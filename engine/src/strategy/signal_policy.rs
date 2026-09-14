@@ -416,36 +416,38 @@ fn optimal_passive_maker_price(
     best
 }
 
-fn selected_fill_probability_bps(
+struct FillProbabilityInput {
     best_bid: i64,
     best_ask: i64,
     price_tick: i64,
     price: i64,
     base_probability_bps: u16,
     side_depth: i64,
-    best_queue_ahead: i64,
+    queue_ahead: i64,
     quantity: i64,
     buy: bool,
-) -> u16 {
-    if price_tick <= 0 {
-        return base_probability_bps;
+}
+
+fn selected_fill_probability_bps(input: FillProbabilityInput) -> u16 {
+    if input.price_tick <= 0 {
+        return input.base_probability_bps;
     }
-    let spread_ticks = (best_ask - best_bid) / price_tick;
+    let spread_ticks = (input.best_ask - input.best_bid) / input.price_tick;
     if spread_ticks <= 0 {
-        return base_probability_bps;
+        return input.base_probability_bps;
     }
-    let distance = if buy {
-        price.saturating_sub(best_bid)
+    let distance = if input.buy {
+        input.price.saturating_sub(input.best_bid)
     } else {
-        best_ask.saturating_sub(price)
+        input.best_ask.saturating_sub(input.price)
     };
-    let queue_ahead = if distance == 0 { best_queue_ahead } else { 0 };
+    let queue_ahead = if distance == 0 { input.queue_ahead } else { 0 };
     candidate_fill_probability_bps(
-        base_probability_bps,
-        side_depth,
+        input.base_probability_bps,
+        input.side_depth,
         queue_ahead,
-        quantity,
-        distance / price_tick,
+        input.quantity,
+        distance / input.price_tick,
         spread_ticks,
     )
 }
@@ -615,32 +617,32 @@ pub fn decide(input: SignalInput) -> SignalDecision {
     let sell_quantity = i128::from(quantity).min(sell_remaining);
     let buy_fill_probability = buy_price
         .map(|price| {
-            selected_fill_probability_bps(
-                input.best_bid.0,
-                input.best_ask.0,
-                input.price_tick,
+            selected_fill_probability_bps(FillProbabilityInput {
+                best_bid: input.best_bid.0,
+                best_ask: input.best_ask.0,
+                price_tick: input.price_tick,
                 price,
-                buy_fill_probability_bps,
-                input.bid_quantity,
-                input.buy_queue_ahead,
-                buy_quantity as i64,
-                true,
-            )
+                base_probability_bps: buy_fill_probability_bps,
+                side_depth: input.bid_quantity,
+                queue_ahead: input.buy_queue_ahead,
+                quantity: buy_quantity as i64,
+                buy: true,
+            })
         })
         .unwrap_or(0);
     let sell_fill_probability = sell_price
         .map(|price| {
-            selected_fill_probability_bps(
-                input.best_bid.0,
-                input.best_ask.0,
-                input.price_tick,
+            selected_fill_probability_bps(FillProbabilityInput {
+                best_bid: input.best_bid.0,
+                best_ask: input.best_ask.0,
+                price_tick: input.price_tick,
                 price,
-                sell_fill_probability_bps,
-                input.ask_quantity,
-                input.sell_queue_ahead,
-                sell_quantity as i64,
-                false,
-            )
+                base_probability_bps: sell_fill_probability_bps,
+                side_depth: input.ask_quantity,
+                queue_ahead: input.sell_queue_ahead,
+                quantity: sell_quantity as i64,
+                buy: false,
+            })
         })
         .unwrap_or(0);
     let buy_admissible = buy_price.is_some()
