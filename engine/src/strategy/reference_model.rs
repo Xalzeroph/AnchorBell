@@ -143,6 +143,64 @@ impl FairValueEstimate {
         volatility_pico_bps: i64,
         spread_pico_bps: i64,
     ) -> Option<Self> {
+        Self::from_market_precise_with_anchor_lifetime(
+            anchor,
+            index,
+            mark,
+            mid,
+            volatility_pico_bps,
+            spread_pico_bps,
+            0,
+            0,
+            0,
+        )
+    }
+
+    /// Compatibility entry point for callers without an operational
+    /// confidence horizon.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_market_precise_with_anchor_lifetime(
+        anchor: PriceTicks,
+        index: PriceTicks,
+        mark: PriceTicks,
+        mid: PriceTicks,
+        volatility_pico_bps: i64,
+        spread_pico_bps: i64,
+        anchor_observed_at_ms: u64,
+        anchor_valid_until_ms: u64,
+        now_ms: u64,
+    ) -> Option<Self> {
+        Self::from_market_precise_with_anchor_lifetime_and_age(
+            anchor,
+            index,
+            mark,
+            mid,
+            volatility_pico_bps,
+            spread_pico_bps,
+            anchor_observed_at_ms,
+            anchor_valid_until_ms,
+            now_ms,
+            0,
+        )
+    }
+
+    /// Estimate fair value while accounting for how much of the external
+    /// anchor's declared validity window remains. When the source does not
+    /// publish an expiry, the configured operational age becomes a confidence
+    /// horizon rather than a hard entry ban.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_market_precise_with_anchor_lifetime_and_age(
+        anchor: PriceTicks,
+        index: PriceTicks,
+        mark: PriceTicks,
+        mid: PriceTicks,
+        volatility_pico_bps: i64,
+        spread_pico_bps: i64,
+        anchor_observed_at_ms: u64,
+        anchor_valid_until_ms: u64,
+        now_ms: u64,
+        max_anchor_age_ms: u64,
+    ) -> Option<Self> {
         if [anchor.0, index.0, mark.0, mid.0]
             .iter()
             .any(|value| *value <= 0)
@@ -179,14 +237,53 @@ impl FairValueEstimate {
             FairValueRegime::Stressed => (750_000, 175_000, 75_000),
             FairValueRegime::Dislocated => (900_000, 75_000, 25_000),
         };
-        let weighted = i128::from(anchor.0) * anchor_weight
+        let confidence_horizon_ms = if anchor_valid_until_ms > anchor_observed_at_ms {
+            anchor_valid_until_ms - anchor_observed_at_ms
+        } else {
+            max_anchor_age_ms
+        };
+        let anchor_confidence_ppm = if anchor_observed_at_ms > 0
+            && confidence_horizon_ms > 0
+            && now_ms >= anchor_observed_at_ms
+        {
+            let age = now_ms.saturating_sub(anchor_observed_at_ms);
+            let remaining = confidence_horizon_ms.saturating_sub(age);
+            i128::from(remaining)
+                .saturating_mul(PPM_SCALE)
+                .checked_div(i128::from(confidence_horizon_ms))
+                .unwrap_or(0)
+                .clamp(0, PPM_SCALE)
+        } else {
+            PPM_SCALE
+        };
+        let effective_anchor_weight =
+            anchor_weight.saturating_mul(anchor_confidence_ppm) / PPM_SCALE;
+        let total_weight = effective_anchor_weight
+            .saturating_add(index_weight)
+            .saturating_add(mark_weight)
+            .max(1);
+        let weighted = i128::from(anchor.0) * effective_anchor_weight
             + i128::from(index.0) * index_weight
             + i128::from(mark.0) * mark_weight;
-        let price = weighted.checked_div(PPM_SCALE)?;
+        let price = weighted.checked_div(total_weight)?;
         if price <= 0 || price > i128::from(i64::MAX) {
             return None;
         }
-        let confidence_pico_bps = dispersion_pico_bps
+        // Confidence must follow the same evidence weights as fair value.
+        // Once an old static anchor has lost its effective weight, its historical
+        // disagreement is no longer current uncertainty. Keep live mark/index/mid
+        // dispersion fully active and let only the still-trusted anchor portion
+        // contribute to the uncertainty budget.
+        let live_dispersion_pico_bps = mark_gap.max(mid_gap);
+        let effective_anchor_disagreement_pico_bps = i128::from(index_gap)
+            .saturating_mul(anchor_confidence_ppm)
+            .checked_div(PPM_SCALE)
+            .unwrap_or(0)
+            .clamp(0, i128::from(i64::MAX))
+            as i64;
+        let effective_dispersion_pico_bps =
+            live_dispersion_pico_bps.max(effective_anchor_disagreement_pico_bps);
+        let confidence_pico_bps = effective_dispersion_pico_bps
             .saturating_add(volatility_pico_bps)
             .saturating_add(spread_pico_bps / 2);
         let confidence_bps = ((i128::from(confidence_pico_bps) + PICO_BPS_SCALE / 2)
@@ -322,6 +419,69 @@ mod tests {
         .unwrap();
         assert_eq!(estimate.regime, FairValueRegime::Calm);
         assert!(estimate.confidence_bps < 10);
+    }
+
+    #[test]
+    fn stale_anchor_weight_decays_into_live_market_evidence() {
+        let fresh = FairValueEstimate::from_market_precise_with_anchor_lifetime(
+            PriceTicks(100_000),
+            PriceTicks(120_000),
+            PriceTicks(125_000),
+            PriceTicks(124_000),
+            80 * PICO_BPS_SCALE as i64,
+            10 * PICO_BPS_SCALE as i64,
+            100,
+            1_100,
+            100,
+        )
+        .unwrap();
+        let stale = FairValueEstimate::from_market_precise_with_anchor_lifetime(
+            PriceTicks(100_000),
+            PriceTicks(120_000),
+            PriceTicks(125_000),
+            PriceTicks(124_000),
+            80 * PICO_BPS_SCALE as i64,
+            10 * PICO_BPS_SCALE as i64,
+            100,
+            1_100,
+            1_099,
+        )
+        .unwrap();
+        assert!(stale.price.0 > fresh.price.0);
+        assert!(stale.price.0 > 115_000);
+    }
+
+    #[test]
+    fn static_anchor_weight_decays_into_live_market_evidence() {
+        let fresh = FairValueEstimate::from_market_precise_with_anchor_lifetime_and_age(
+            PriceTicks(100_000),
+            PriceTicks(120_000),
+            PriceTicks(125_000),
+            PriceTicks(124_000),
+            80 * PICO_BPS_SCALE as i64,
+            10 * PICO_BPS_SCALE as i64,
+            100,
+            0,
+            100,
+            1_000,
+        )
+        .unwrap();
+        let stale = FairValueEstimate::from_market_precise_with_anchor_lifetime_and_age(
+            PriceTicks(100_000),
+            PriceTicks(120_000),
+            PriceTicks(125_000),
+            PriceTicks(124_000),
+            80 * PICO_BPS_SCALE as i64,
+            10 * PICO_BPS_SCALE as i64,
+            100,
+            0,
+            1_100,
+            1_000,
+        )
+        .unwrap();
+        assert!(stale.price.0 > fresh.price.0);
+        assert!(stale.price.0 > 120_000);
+        assert!(stale.confidence_bps < fresh.confidence_bps);
     }
 
     #[test]

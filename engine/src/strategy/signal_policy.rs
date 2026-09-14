@@ -176,18 +176,32 @@ impl AdaptiveThreshold {
         {
             return None;
         }
-        let additive = self
-            .exact_pico_bps
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| *index != 10)
-            .fold(0_i128, |total, (_, value)| {
-                total.saturating_add(i128::from(*value))
-            });
+        // Floors, process volatility, and model uncertainty are competing
+        // hurdles: the edge must clear the largest one, not pay the same
+        // uncertainty multiple times. Execution costs and directional
+        // surcharges remain additive because they are separately paid.
+        let base_hurdle = self.exact_pico_bps[0]
+            .max(self.exact_pico_bps[1])
+            .max(self.exact_pico_bps[3]);
+        let additive_costs = [
+            self.exact_pico_bps[2],
+            self.exact_pico_bps[4],
+            self.exact_pico_bps[5],
+            self.exact_pico_bps[6],
+            self.exact_pico_bps[7],
+            self.exact_pico_bps[8],
+            self.exact_pico_bps[9],
+            self.exact_pico_bps[11],
+        ]
+        .into_iter()
+        .fold(0_i128, |total, value| {
+            total.saturating_add(i128::from(value))
+        });
         Some(
-            additive
-                .max(i128::from(self.exact_pico_bps[10]))
-                .clamp(0, i128::from(i64::MAX)) as i64,
+            (i128::from(base_hurdle)
+                .saturating_add(additive_costs)
+                .max(i128::from(self.exact_pico_bps[10])))
+            .clamp(0, i128::from(i64::MAX)) as i64,
         )
     }
 
@@ -210,6 +224,14 @@ pub struct SignalInput {
     pub anchor: PriceTicks,
     pub best_bid: PriceTicks,
     pub best_ask: PriceTicks,
+    /// Exchange price tick used to choose a passive quote inside the spread.
+    /// Zero preserves the legacy top-of-book behavior for callers without
+    /// authoritative exchange filters.
+    pub price_tick: i64,
+    pub bid_quantity: i64,
+    pub ask_quantity: i64,
+    pub buy_queue_ahead: i64,
+    pub sell_queue_ahead: i64,
     pub index_price: PriceTicks,
     pub mark_price: PriceTicks,
     pub position: i64,
@@ -264,6 +286,168 @@ pub enum SignalDecision {
     BuyMaker { price: PriceTicks, quantity: i64 },
     SellMaker { price: PriceTicks, quantity: i64 },
     Blocked(SignalBlockReason),
+}
+
+fn queue_survival_probability_bps(depth: i64, queue_ahead: i64, quantity: i64) -> u16 {
+    if depth <= 0 || quantity <= 0 {
+        return 0;
+    }
+    (i128::from(depth) * 10_000
+        / (i128::from(depth)
+            + i128::from(queue_ahead.max(0))
+            + i128::from(quantity).saturating_mul(2)))
+    .clamp(500, 9_500) as u16
+}
+
+fn candidate_fill_probability_bps(
+    base_probability_bps: u16,
+    depth: i64,
+    queue_ahead: i64,
+    quantity: i64,
+    distance_from_touch: i64,
+    spread_ticks: i64,
+) -> u16 {
+    if spread_ticks <= 0 || distance_from_touch <= 0 {
+        return base_probability_bps;
+    }
+    let observed_base = i128::from(base_probability_bps.clamp(0, 10_000));
+    let queued_model = i128::from(queue_survival_probability_bps(depth, queue_ahead, quantity));
+    let queue_free_model = i128::from(queue_survival_probability_bps(depth, 0, quantity));
+    let queue_reset_gain = (queue_free_model - queued_model).max(0);
+    let queue_adjusted = (observed_base + queue_reset_gain).clamp(0, 10_000);
+    let progress =
+        (i128::from(distance_from_touch) * 10_000 / i128::from(spread_ticks)).clamp(0, 10_000);
+    (queue_adjusted + (10_000 - queue_adjusted) * progress / 10_000).clamp(0, 10_000) as u16
+}
+
+#[allow(clippy::too_many_arguments)]
+fn optimal_passive_maker_price(
+    best_bid: i64,
+    best_ask: i64,
+    price_tick: i64,
+    anchor: i64,
+    threshold: AdaptiveThreshold,
+    required_pico_bps: i128,
+    inventory_extra_pico_bps: i128,
+    base_fill_probability_bps: u16,
+    side_depth: i64,
+    best_queue_ahead: i64,
+    quantity: i64,
+    confidence_bps: u16,
+    fill_aware: bool,
+    buy: bool,
+) -> Option<i64> {
+    if best_bid <= 0 || best_ask < best_bid || anchor <= 0 {
+        return None;
+    }
+    if price_tick <= 0 {
+        return Some(if buy { best_bid } else { best_ask });
+    }
+
+    let spread_ticks = (best_ask - best_bid) / price_tick;
+    if spread_ticks <= 0 {
+        return None;
+    }
+
+    let threshold_numerator = required_pico_bps * i128::from(anchor);
+    let mut candidate = if buy { best_bid } else { best_ask };
+    let mut best = None;
+    let mut best_score = i128::MIN;
+    let mut best_edge = i128::MIN;
+
+    loop {
+        let non_crossing = if buy {
+            candidate < best_ask
+        } else {
+            candidate > best_bid
+        };
+        if non_crossing {
+            let distance = if buy {
+                candidate.saturating_sub(best_bid)
+            } else {
+                best_ask.saturating_sub(candidate)
+            };
+            let candidate_queue_ahead = if distance == 0 { best_queue_ahead } else { 0 };
+            let candidate_fill_probability = candidate_fill_probability_bps(
+                base_fill_probability_bps,
+                side_depth,
+                candidate_queue_ahead,
+                quantity,
+                distance / price_tick,
+                spread_ticks,
+            );
+            let edge_numerator = if buy {
+                (i128::from(anchor) - i128::from(candidate)).max(0) * 10_000 * PICO_BPS_SCALE
+            } else {
+                (i128::from(candidate) - i128::from(anchor)).max(0) * 10_000 * PICO_BPS_SCALE
+            };
+            if edge_numerator > threshold_numerator
+                && (!fill_aware
+                    || conditionally_admissible(
+                        edge_numerator,
+                        anchor,
+                        threshold,
+                        inventory_extra_pico_bps,
+                        candidate_fill_probability,
+                        confidence_bps,
+                    ))
+            {
+                let score =
+                    (edge_numerator - threshold_numerator) * i128::from(candidate_fill_probability);
+                if score > best_score || (score == best_score && edge_numerator > best_edge) {
+                    best_score = score;
+                    best_edge = edge_numerator;
+                    best = Some(candidate);
+                }
+            }
+        }
+
+        let next = if buy {
+            candidate.saturating_add(price_tick)
+        } else {
+            candidate.saturating_sub(price_tick)
+        };
+        if next == candidate || (buy && next >= best_ask) || (!buy && next <= best_bid) {
+            break;
+        }
+        candidate = next;
+    }
+
+    best
+}
+
+fn selected_fill_probability_bps(
+    best_bid: i64,
+    best_ask: i64,
+    price_tick: i64,
+    price: i64,
+    base_probability_bps: u16,
+    side_depth: i64,
+    best_queue_ahead: i64,
+    quantity: i64,
+    buy: bool,
+) -> u16 {
+    if price_tick <= 0 {
+        return base_probability_bps;
+    }
+    let spread_ticks = (best_ask - best_bid) / price_tick;
+    if spread_ticks <= 0 {
+        return base_probability_bps;
+    }
+    let distance = if buy {
+        price.saturating_sub(best_bid)
+    } else {
+        best_ask.saturating_sub(price)
+    };
+    let queue_ahead = if distance == 0 { best_queue_ahead } else { 0 };
+    candidate_fill_probability_bps(
+        base_probability_bps,
+        side_depth,
+        queue_ahead,
+        quantity,
+        distance / price_tick,
+        spread_ticks,
+    )
 }
 
 pub fn decide(input: SignalInput) -> SignalDecision {
@@ -369,59 +553,169 @@ pub fn decide(input: SignalInput) -> SignalDecision {
         } else {
             0
         };
-    let buy_edge_numerator = (i128::from(input.anchor.0) - i128::from(input.best_bid.0)).max(0)
-        * 10_000
-        * PICO_BPS_SCALE;
-    let sell_edge_numerator = (i128::from(input.best_ask.0) - i128::from(input.anchor.0)).max(0)
-        * 10_000
-        * PICO_BPS_SCALE;
-    let buy_threshold_numerator = buy_required_with_inventory * i128::from(input.anchor.0);
-    let sell_threshold_numerator = sell_required_with_inventory * i128::from(input.anchor.0);
     let quantity = input.requested_quantity.min(input.max_position);
     if quantity <= 0 {
         return SignalDecision::Blocked(SignalBlockReason::PositionLimit);
     }
-    if buy_edge_numerator >= buy_threshold_numerator
+    let buy_price = optimal_passive_maker_price(
+        input.best_bid.0,
+        input.best_ask.0,
+        input.price_tick,
+        input.anchor.0,
+        buy_threshold,
+        buy_required_with_inventory,
+        if input.position > 0 {
+            inventory_surcharge_pico_bps
+        } else {
+            0
+        },
+        buy_fill_probability_bps,
+        input.bid_quantity,
+        input.buy_queue_ahead,
+        quantity,
+        input.confidence_bps,
+        input.fill_aware,
+        true,
+    );
+    let sell_price = optimal_passive_maker_price(
+        input.best_bid.0,
+        input.best_ask.0,
+        input.price_tick,
+        input.anchor.0,
+        sell_threshold,
+        sell_required_with_inventory,
+        if input.position < 0 {
+            inventory_surcharge_pico_bps
+        } else {
+            0
+        },
+        sell_fill_probability_bps,
+        input.ask_quantity,
+        input.sell_queue_ahead,
+        quantity,
+        input.confidence_bps,
+        input.fill_aware,
+        false,
+    );
+    let buy_edge_numerator = buy_price
+        .map(|price| {
+            (i128::from(input.anchor.0) - i128::from(price)).max(0) * 10_000 * PICO_BPS_SCALE
+        })
+        .unwrap_or(0);
+    let sell_edge_numerator = sell_price
+        .map(|price| {
+            (i128::from(price) - i128::from(input.anchor.0)).max(0) * 10_000 * PICO_BPS_SCALE
+        })
+        .unwrap_or(0);
+    let buy_threshold_numerator = buy_required_with_inventory * i128::from(input.anchor.0);
+    let sell_threshold_numerator = sell_required_with_inventory * i128::from(input.anchor.0);
+    let buy_remaining = (i128::from(input.max_position) - i128::from(input.position)).max(0);
+    let sell_remaining = (i128::from(input.max_position) + i128::from(input.position)).max(0);
+    let buy_quantity = i128::from(quantity).min(buy_remaining);
+    let sell_quantity = i128::from(quantity).min(sell_remaining);
+    let buy_fill_probability = buy_price
+        .map(|price| {
+            selected_fill_probability_bps(
+                input.best_bid.0,
+                input.best_ask.0,
+                input.price_tick,
+                price,
+                buy_fill_probability_bps,
+                input.bid_quantity,
+                input.buy_queue_ahead,
+                buy_quantity as i64,
+                true,
+            )
+        })
+        .unwrap_or(0);
+    let sell_fill_probability = sell_price
+        .map(|price| {
+            selected_fill_probability_bps(
+                input.best_bid.0,
+                input.best_ask.0,
+                input.price_tick,
+                price,
+                sell_fill_probability_bps,
+                input.ask_quantity,
+                input.sell_queue_ahead,
+                sell_quantity as i64,
+                false,
+            )
+        })
+        .unwrap_or(0);
+    let buy_admissible = buy_price.is_some()
+        && buy_quantity > 0
+        && buy_edge_numerator > buy_threshold_numerator
         && (!input.fill_aware
             || conditionally_admissible(
                 buy_edge_numerator,
                 input.anchor.0,
                 buy_threshold,
-                buy_fill_probability_bps,
+                if input.position > 0 {
+                    inventory_surcharge_pico_bps
+                } else {
+                    0
+                },
+                buy_fill_probability,
                 input.confidence_bps,
-            ))
-    {
-        let remaining = (i128::from(input.max_position) - i128::from(input.position)).max(0);
-        let capped_quantity = i128::from(quantity).min(remaining);
-        if capped_quantity > 0 {
-            return SignalDecision::BuyMaker {
-                price: input.best_bid,
-                quantity: capped_quantity as i64,
-            };
-        }
-        return SignalDecision::Blocked(SignalBlockReason::PositionLimit);
-    }
-    if sell_edge_numerator >= sell_threshold_numerator
+            ));
+    let sell_admissible = sell_price.is_some()
+        && sell_quantity > 0
+        && sell_edge_numerator > sell_threshold_numerator
         && (!input.fill_aware
             || conditionally_admissible(
                 sell_edge_numerator,
                 input.anchor.0,
                 sell_threshold,
-                sell_fill_probability_bps,
+                if input.position < 0 {
+                    inventory_surcharge_pico_bps
+                } else {
+                    0
+                },
+                sell_fill_probability,
                 input.confidence_bps,
-            ))
-    {
-        let remaining = (i128::from(input.max_position) + i128::from(input.position)).max(0);
-        let capped_quantity = i128::from(quantity).min(remaining);
-        if capped_quantity > 0 {
+            ));
+    let buy_score = if buy_admissible {
+        (buy_edge_numerator - buy_threshold_numerator) * i128::from(buy_fill_probability)
+    } else {
+        i128::MIN
+    };
+    let sell_score = if sell_admissible {
+        (sell_edge_numerator - sell_threshold_numerator) * i128::from(sell_fill_probability)
+    } else {
+        i128::MIN
+    };
+    if buy_admissible || sell_admissible {
+        let choose_buy = if buy_score != sell_score {
+            buy_score > sell_score
+        } else if input.position > 0 {
+            false
+        } else if input.position < 0 {
+            true
+        } else if buy_fill_probability != sell_fill_probability {
+            buy_fill_probability > sell_fill_probability
+        } else {
+            buy_edge_numerator >= sell_edge_numerator
+        };
+        if choose_buy && buy_admissible {
+            return SignalDecision::BuyMaker {
+                price: PriceTicks(buy_price.expect("admissible buy quote")),
+                quantity: buy_quantity as i64,
+            };
+        }
+        if sell_admissible {
             return SignalDecision::SellMaker {
-                price: input.best_ask,
-                quantity: capped_quantity as i64,
+                price: PriceTicks(sell_price.expect("admissible sell quote")),
+                quantity: sell_quantity as i64,
             };
         }
         return SignalDecision::Blocked(SignalBlockReason::PositionLimit);
     }
-    SignalDecision::Blocked(SignalBlockReason::NoEdge)
+    if buy_remaining == 0 && sell_remaining == 0 {
+        SignalDecision::Blocked(SignalBlockReason::PositionLimit)
+    } else {
+        SignalDecision::Blocked(SignalBlockReason::NoEdge)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -511,6 +805,11 @@ pub fn adaptive_intent_from_market(
         anchor,
         best_bid: bid,
         best_ask: ask,
+        price_tick: 0,
+        bid_quantity,
+        ask_quantity,
+        buy_queue_ahead: bid_quantity,
+        sell_queue_ahead: ask_quantity,
         index_price: index,
         mark_price: mark,
         position,
@@ -573,6 +872,7 @@ fn conditionally_admissible(
     edge_numerator: i128,
     anchor: i64,
     threshold: AdaptiveThreshold,
+    inventory_extra_pico_bps: i128,
     fill_probability_bps: u16,
     confidence_bps: u16,
 ) -> bool {
@@ -588,7 +888,9 @@ fn conditionally_admissible(
     let to_ppm = |pico_bps: i64| {
         (i128::from(pico_bps) * 100 / PICO_BPS_SCALE).clamp(0, i128::from(i64::MAX)) as i64
     };
-    let inventory_ppm = to_ppm(components[9]);
+    let inventory_extra_ppm = (inventory_extra_pico_bps.max(0) * 100 / PICO_BPS_SCALE)
+        .clamp(0, i128::from(i64::MAX)) as i64;
+    let inventory_ppm = to_ppm(components[9]).saturating_add(inventory_extra_ppm);
     let deadline_ppm = to_ppm(components[4]);
     let cost_ppm = to_ppm(components[2]);
     let Some(gross_edge) = ConfidenceInterval::new(edge_ppm, edge_ppm, edge_ppm, 1, confidence_bps)
@@ -642,6 +944,11 @@ mod tests {
             anchor: PriceTicks(100_000),
             best_bid: PriceTicks(98_000),
             best_ask: PriceTicks(98_100),
+            price_tick: 0,
+            bid_quantity: 100,
+            ask_quantity: 100,
+            buy_queue_ahead: 100,
+            sell_queue_ahead: 100,
             index_price: PriceTicks(98_050),
             mark_price: PriceTicks(98_050),
             position: 0,
@@ -706,6 +1013,22 @@ mod tests {
     }
 
     #[test]
+    fn optimizes_queue_priority_inside_a_wide_spread() {
+        let mut value = input();
+        value.price_tick = 10;
+        value.buy_fill_probability_bps = 5_000;
+        let decision = decide(value);
+        match decision {
+            SignalDecision::BuyMaker { price, quantity } => {
+                assert!(price.0 > value.best_bid.0);
+                assert!(price.0 < value.best_ask.0);
+                assert_eq!(quantity, 100);
+            }
+            other => panic!("expected optimized maker quote, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn blocks_when_mark_and_index_disagree() {
         let mut value = input();
         value.mark_price = PriceTicks(99_000);
@@ -720,12 +1043,30 @@ mod tests {
         let mut value = input();
         value.best_bid = PriceTicks(98_950);
         value.best_ask = PriceTicks(101_050);
-        value.buy_adverse_selection_bps = 24;
+        value.buy_adverse_selection_bps = 40;
         value.sell_adverse_selection_bps = 0;
         assert_eq!(
             decide(value),
             SignalDecision::SellMaker {
                 price: PriceTicks(101_050),
+                quantity: 100
+            }
+        );
+    }
+
+    #[test]
+    fn compares_both_directions_by_risk_adjusted_ev() {
+        let mut value = input();
+        value.anchor = PriceTicks(98_050);
+        value.threshold = AdaptiveThreshold::from_components(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+            .expect("zero threshold is valid for the direction comparison");
+        value.fill_aware = false;
+        value.buy_fill_probability_bps = 1_000;
+        value.sell_fill_probability_bps = 10_000;
+        assert_eq!(
+            decide(value),
+            SignalDecision::SellMaker {
+                price: PriceTicks(98_100),
                 quantity: 100
             }
         );

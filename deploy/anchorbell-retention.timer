@@ -1,0 +1,10 @@
+[Unit]
+Description=Check AnchorBell raw archive budget every 15 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Unit=anchorbell-retention.service
+
+[Install]
+WantedBy=timers.target

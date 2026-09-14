@@ -39,6 +39,7 @@ pub struct EvidenceSummary {
     pub evidence_id: String,
     pub methodology_id: String,
     pub evidence_state: EvidenceState,
+    pub anchor_authority_passed: bool,
     pub status: String,
     pub anchor_semantics: String,
     pub price_semantics: String,
@@ -87,6 +88,7 @@ struct QuoteState {
 }
 
 pub struct EvidenceAccumulator {
+    anchor_authority_passed: bool,
     config: EvidenceConfig,
     quotes: BTreeMap<String, QuoteState>,
     pending: BTreeMap<String, VecDeque<Point>>,
@@ -106,6 +108,7 @@ impl EvidenceAccumulator {
             normalized.horizons_ms.push(1_000);
         }
         Self {
+            anchor_authority_passed: false,
             config: normalized,
             quotes: BTreeMap::new(),
             pending: BTreeMap::new(),
@@ -115,6 +118,9 @@ impl EvidenceAccumulator {
             anchor_integrity_violations: 0,
             stats: BTreeMap::new(),
         }
+    }
+    pub fn set_anchor_authority(&mut self, passed: bool) {
+        self.anchor_authority_passed = passed;
     }
     pub fn evidence_id(&self) -> String {
         "anchorbell-evidence-v1".to_owned()
@@ -302,6 +308,7 @@ impl EvidenceAccumulator {
         };
         EvidenceSummary {
             evidence_id: self.evidence_id(),
+            anchor_authority_passed: self.anchor_authority_passed,
             methodology_id: "anchorbell-analytics-methods-v1".to_owned(),
             evidence_state,
             anchor_semantics:
@@ -312,7 +319,9 @@ impl EvidenceAccumulator {
             mark_semantics:
                 "Binance MarkPrice.mark_price (used for feed state, not substituted for index)"
                     .to_owned(),
-            status: if self.eligible_observations == 0 {
+            status: if !self.anchor_authority_passed {
+                "invalid_reference".to_owned()
+            } else if self.eligible_observations == 0 {
                 "insufficient_data".to_owned()
             } else {
                 "observational".to_owned()
@@ -354,5 +363,16 @@ mod tests {
             -basis_bps(101, 100).signum() * (0 - basis_bps(101, 100)),
             100
         );
+    }
+    #[test]
+    fn evidence_requires_authoritative_anchor_before_claiming_observational_status() {
+        let mut accumulator = EvidenceAccumulator::new(EvidenceConfig::default());
+        let invalid = accumulator.summary();
+        assert!(!invalid.anchor_authority_passed);
+        assert_eq!(invalid.status, "invalid_reference");
+        accumulator.set_anchor_authority(true);
+        let ready = accumulator.summary();
+        assert!(ready.anchor_authority_passed);
+        assert_eq!(ready.status, "insufficient_data");
     }
 }

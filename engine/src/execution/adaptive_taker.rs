@@ -204,11 +204,13 @@ pub fn decide(
         } else {
             0
         });
-    let maker_not_feasible =
-        maker_slack < 0 || input.maker_confidence_bps < policy.minimum_maker_confidence_bps;
-    if !maker_not_feasible
-        && waiting_cost_bps <= taker_cost_bps.saturating_add(policy.cost_margin_bps)
-    {
+    // Unknown or insufficient calibration is not evidence that a passive exit
+    // cannot complete. In a maker-only strategy, confidence may influence
+    // sizing and diagnostics, but it must not silently turn an ordinary
+    // reduce-only maker order into a taker order. Escalate only when the
+    // remaining hard-deadline slack is actually negative.
+    let maker_not_feasible = maker_slack < 0;
+    if !maker_not_feasible {
         return AdaptiveTakerDecision::Hold(TakerBlockReason::KeepMakerWorking);
     }
 
@@ -289,6 +291,16 @@ mod tests {
     fn keeps_maker_when_it_is_feasible_and_cheaper() {
         assert_eq!(
             decide(policy(), input()),
+            AdaptiveTakerDecision::Hold(TakerBlockReason::KeepMakerWorking)
+        );
+    }
+
+    #[test]
+    fn unknown_maker_confidence_does_not_force_taker() {
+        let mut value = input();
+        value.maker_confidence_bps = 0;
+        assert_eq!(
+            decide(policy(), value),
             AdaptiveTakerDecision::Hold(TakerBlockReason::KeepMakerWorking)
         );
     }

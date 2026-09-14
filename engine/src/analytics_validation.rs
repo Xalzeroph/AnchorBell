@@ -672,6 +672,7 @@ pub struct SimulationPromotionGate {
     pub minimum_fills: u64,
     pub evidence_class: String,
     pub integrity_passed: bool,
+    pub anchor_authority_passed: bool,
     pub evidence_sufficient: bool,
     pub economic_passed: bool,
     pub survival_passed: bool,
@@ -773,6 +774,7 @@ pub fn evaluate_simulation_promotion(input: SimulationPromotionInput) -> Simulat
             methodology_id: "anchorbell-automatic-promotion-v3".to_owned(),
             minimum_fills: MINIMUM_FILLS,
             evidence_class: classify_simulation_evidence(input),
+            anchor_authority_passed: true,
             integrity_passed: input.records_dropped == 0,
             evidence_sufficient: false,
             economic_passed: false,
@@ -808,6 +810,7 @@ pub fn evaluate_simulation_promotion(input: SimulationPromotionInput) -> Simulat
     SimulationPromotionGate {
         methodology_id: "anchorbell-automatic-promotion-v3".to_owned(),
         minimum_fills: MINIMUM_FILLS,
+        anchor_authority_passed: true,
         evidence_class: classify_simulation_evidence(input),
         integrity_passed,
         evidence_sufficient,
@@ -816,6 +819,24 @@ pub fn evaluate_simulation_promotion(input: SimulationPromotionInput) -> Simulat
         verdict,
         reason,
     }
+}
+
+/// Evaluate promotion while making anchor-source authority explicit.
+/// Callers that cannot prove legal-close authority must fail closed.
+pub fn evaluate_simulation_promotion_with_anchor_authority(
+    input: SimulationPromotionInput,
+    anchor_authority_passed: bool,
+) -> SimulationPromotionGate {
+    let mut gate = evaluate_simulation_promotion(input);
+    gate.anchor_authority_passed = anchor_authority_passed;
+    if !anchor_authority_passed {
+        gate.evidence_class = "INVALID_REFERENCE".to_owned();
+        gate.evidence_sufficient = false;
+        gate.economic_passed = false;
+        gate.verdict = ValidationVerdict::Indeterminate;
+        gate.reason = "non_authoritative_anchor_source".to_owned();
+    }
+    gate
 }
 
 #[cfg(test)]

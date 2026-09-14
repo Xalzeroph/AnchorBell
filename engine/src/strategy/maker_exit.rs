@@ -45,6 +45,9 @@ pub struct MakerExitInput {
     pub now_ms: u64,
     pub max_book_age_ms: u64,
     pub plan: DualFlattenPlan,
+    /// Permit passive inventory reduction when the live fair-value signal
+    /// has reversed, even outside the scheduled flatten windows.
+    pub allow_reversion_exit: bool,
     pub book: Option<ExitBook>,
     pub constraints: Option<ExitConstraints>,
     pub working: ExitWorkingOrder,
@@ -90,7 +93,7 @@ pub fn decide_maker_exit(input: MakerExitInput) -> MakerExitDecision {
         None => return MakerExitDecision::Blocked(ExitBlockReason::InvalidInput),
     };
 
-    if phase == FlattenPhase::Trading {
+    if phase == FlattenPhase::Trading && !input.allow_reversion_exit {
         return if input.plan.funding.status == FundingScheduleStatus::Unknown {
             MakerExitDecision::Blocked(ExitBlockReason::InvalidInput)
         } else {
@@ -141,8 +144,12 @@ pub fn decide_maker_exit(input: MakerExitInput) -> MakerExitDecision {
         ExitWorkingOrder::Pending => MakerExitDecision::WaitForReconciliation,
         ExitWorkingOrder::None => match fresh_quantity(position_quantity, quote) {
             Ok(quantity) => MakerExitDecision::Submit(match quote.side {
-                Side::Buy => OrderIntent::maker_buy(input.symbol, quote.price, quantity),
-                Side::Sell => OrderIntent::maker_sell(input.symbol, quote.price, quantity),
+                Side::Buy => {
+                    OrderIntent::reduce_only_maker_buy(input.symbol, quote.price, quantity)
+                }
+                Side::Sell => {
+                    OrderIntent::reduce_only_maker_sell(input.symbol, quote.price, quantity)
+                }
             }),
             Err(reason) => MakerExitDecision::Blocked(reason),
         },
@@ -264,6 +271,7 @@ mod tests {
                 9_000,
             )
             .unwrap(),
+            allow_reversion_exit: false,
             book: Some(ExitBook {
                 bid: 9_880,
                 ask: 9_890,
@@ -290,14 +298,24 @@ mod tests {
         let long_input = input();
         assert_eq!(
             decide_maker_exit(long_input),
-            MakerExitDecision::Submit(OrderIntent::maker_sell(7, 9_890, 10))
+            MakerExitDecision::Submit(OrderIntent::reduce_only_maker_sell(7, 9_890, 10))
         );
 
         let mut short_input = input();
         short_input.position = -10;
         assert_eq!(
             decide_maker_exit(short_input),
-            MakerExitDecision::Submit(OrderIntent::maker_buy(7, 9_880, 10))
+            MakerExitDecision::Submit(OrderIntent::reduce_only_maker_buy(7, 9_880, 10))
+        );
+    }
+
+    #[test]
+    fn reversion_exit_is_allowed_outside_scheduled_window() {
+        let mut value = input();
+        value.allow_reversion_exit = true;
+        assert_eq!(
+            decide_maker_exit(value),
+            MakerExitDecision::Submit(OrderIntent::reduce_only_maker_sell(7, 9_890, 10))
         );
     }
 
@@ -407,7 +425,7 @@ mod tests {
         });
         assert_eq!(
             decide_maker_exit(value),
-            MakerExitDecision::Submit(OrderIntent::maker_sell(7, 9_890, 120))
+            MakerExitDecision::Submit(OrderIntent::reduce_only_maker_sell(7, 9_890, 120))
         );
 
         value.position = 9;

@@ -1135,6 +1135,37 @@ fn latest_fx_quotes(run_dir: &Path) -> Value {
     Value::Object(quotes)
 }
 
+fn dashboard_summary(summary: Option<&Value>, detailed: bool) -> Value {
+    let Some(object) = summary.and_then(Value::as_object) else {
+        return json!({});
+    };
+    let records = object
+        .get("gate_rejection_records")
+        .and_then(Value::as_array);
+    let records = records.map(Vec::as_slice).unwrap_or_default();
+    let keep = if detailed { records.len().min(120) } else { 0 };
+    let mut compact: serde_json::Map<String, Value> = object
+        .iter()
+        .filter(|(key, _)| key.as_str() != "gate_rejection_records")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    compact.insert(
+        "gate_rejection_records".to_owned(),
+        json!(&records[records.len() - keep..]),
+    );
+    compact.insert(
+        "gate_rejection_records_truncated".to_owned(),
+        json!(
+            keep < records.len()
+                || object
+                    .get("gate_rejection_records_truncated")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        ),
+    );
+    Value::Object(compact)
+}
+
 async fn runs_response() -> (u16, &'static str, Vec<u8>) {
     let Some(root) = external_batch_root() else {
         return json_response(
@@ -1254,7 +1285,7 @@ async fn runs_response() -> (u16, &'static str, Vec<u8>) {
                     "available": metrics.is_some(),
                     "symbols": symbols,
                     "history": history,
-                    "summary": metrics.as_ref().and_then(|v| v.get("summary")).cloned().unwrap_or_else(|| json!({})),
+                    "summary": dashboard_summary(metrics.as_ref().and_then(|v| v.get("summary")), detailed),
                     "risk_metrics": metrics.as_ref().and_then(|v| v.get("risk_metrics")).cloned().unwrap_or_else(|| json!({})),
                     "raw_available": metrics.is_some(),
                 }));
@@ -2181,5 +2212,41 @@ fn reason_phrase(status: u16) -> &'static str {
         500 => "Internal Server Error",
         502 => "Bad Gateway",
         _ => "Error",
+    }
+}
+
+#[cfg(test)]
+mod summary_response_tests {
+    use super::*;
+
+    #[test]
+    fn current_summary_limits_details_and_keeps_cumulative_totals() {
+        let summary = json!({"rejected_entries": 10_000, "net_pnl_ticks": -23,
+            "gate_rejection_records": (0..10_000).map(|id| json!({"id": id})).collect::<Vec<_>>()});
+        let compact = dashboard_summary(Some(&summary), true);
+        assert_eq!(compact["rejected_entries"], 10_000);
+        assert_eq!(compact["net_pnl_ticks"], -23);
+        let rows = compact["gate_rejection_records"].as_array().unwrap();
+        assert_eq!(rows.len(), 120);
+        assert_eq!(rows.first().unwrap()["id"], 9880);
+        assert_eq!(rows.last().unwrap()["id"], 9999);
+        assert_eq!(compact["gate_rejection_records_truncated"], true);
+    }
+
+    #[test]
+    fn historical_summary_keeps_results_without_repeating_diagnostics() {
+        let summary = json!({"fill_count": 4, "net_pnl_ticks": -23,
+            "gate_rejection_records": [{"id":1}]});
+        let compact = dashboard_summary(Some(&summary), false);
+        assert_eq!(compact["fill_count"], 4);
+        assert_eq!(compact["net_pnl_ticks"], -23);
+        assert!(compact["gate_rejection_records"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            summary["gate_rejection_records"].as_array().unwrap().len(),
+            1
+        );
     }
 }
