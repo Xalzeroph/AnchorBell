@@ -3,10 +3,17 @@ use crate::{
         CalibrationError, CalibrationObservation, CalibrationSnapshot, CalibrationState,
     },
     evolution::StrategyArtifact,
-    ledger::EvidenceLedger,
+    ledger::{EvidenceLedger, LedgerError},
     model::EvidenceFrame,
     policy::{Decision, DecisionEngine},
 };
+use serde_json::Error as SerializationError;
+
+#[derive(Debug)]
+pub enum RuntimeError {
+    EvidenceSerialization(SerializationError),
+    Ledger(LedgerError),
+}
 
 pub struct TradingEngine {
     pub decision: DecisionEngine,
@@ -50,14 +57,16 @@ impl TradingEngine {
         Ok(())
     }
 
-    pub fn evaluate(&mut self, frame: &EvidenceFrame) -> Decision {
-        let payload = serde_json::to_vec(frame).unwrap_or_default();
-        self.ledger.append(
-            format!("frame-{}", frame.now_ms),
-            "evidence_frame",
-            frame.now_ms,
-            &payload,
-        );
-        self.decision.decide(frame)
+    pub fn evaluate(&mut self, frame: &EvidenceFrame) -> Result<Decision, RuntimeError> {
+        let payload = serde_json::to_vec(frame).map_err(RuntimeError::EvidenceSerialization)?;
+        self.ledger
+            .append(
+                format!("frame-{}", frame.now_ms),
+                "evidence_frame",
+                frame.now_ms,
+                &payload,
+            )
+            .map_err(RuntimeError::Ledger)?;
+        Ok(self.decision.decide(frame))
     }
 }

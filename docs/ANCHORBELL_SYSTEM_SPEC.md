@@ -166,6 +166,19 @@ A rule mismatch produces no validated order. The model records workingType
 explicitly even when an ordinary passive limit has no trigger; this prevents
 conditional-order semantics from being silently invented by adapters.
 
+FundingSchedule is a first-class episode object. It carries the next funding
+settlement, exchange-reported interval, observation time, freshness bound and
+source digest. Entry completeness requires a fresh schedule; the strategy does
+not infer a funding boundary from a weekday or a fixed eight-hour constant.
+For Hedge Mode, the API-level reduceOnly flag is not sent; the position side
+and closing direction are validated as the reduction proof. One-way and Hedge
+Mode therefore have different explicit order semantics.
+
+ValidatedOrder also records the visible queue ahead at validation time and an
+OrderRoute: PassiveMaker, PassiveReduceOnly or EmergencyReduceOnly. The latter
+is IOC and is only emitted at the hard deadline. It has a distinct
+execution-port method and cannot be confused with ordinary maker flow.
+
 ## 8. Outcome semantics and action competition
 
 ExecutionCycle is the typed causal path for an entry action. It records side,
@@ -189,8 +202,10 @@ OutcomeScenario contains either this complete cycle or an explicit Wait value.
 An incomplete cycle is not converted to a zero-profit scenario.
 
 QueueFillEstimate uses only causal throughput observed after the order's
-latency. With queue-ahead quantity q_a, own quantity q_o and traded-through
-quantity q_t:
+latency.
+An exchange-authoritative fill event may not exceed the causal fill quantity;
+a local intent event can never create a fill. With queue-ahead quantity q_a,
+own quantity q_o and traded-through quantity q_t:
 
     q_fill = min(q_o, max(0, q_t - q_a))
     p_fill = floor(10000 * q_fill / q_o).
@@ -218,7 +233,10 @@ uncertainty, timing uncertainty, or model uncertainty.
 The old minimum-over-scenarios rule is not used because it discarded the
 probability information and made any tiny tail scenario dominate all decisions.
 Missing costs, nonterminal paths and invalid weights remain a hard rejection;
-they are never converted to zero.
+they are never converted to zero. Runtime serialization and ledger append
+failures are returned as errors; they are not replaced with empty payloads or
+unrecorded decisions. The evidence ledger hashes payload, event metadata and
+the previous event digest, and verifies the head as well as every link.
 
 Wait is a first-class action with its own terminal outcome distribution. An
 entry is admitted only when its calibrated executable lower value is strictly

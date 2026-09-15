@@ -61,6 +61,9 @@ pub enum Decision {
         order: ValidatedOrder,
         robust_value_pico_bps: i64,
     },
+    EmergencyReduceOnly {
+        order: ValidatedOrder,
+    },
     ResidualExposure {
         position: i64,
     },
@@ -89,7 +92,7 @@ pub struct DecisionEngine {
 
 impl DecisionEngine {
     pub fn decide(&self, frame: &EvidenceFrame) -> Decision {
-        if !frame.complete_for_entry() || !frame.account.reconciled {
+        if frame.account.validate().is_err() || !frame.account.reconciled {
             return Decision::Wait {
                 reason: DecisionReason::IncompleteEvidence,
             };
@@ -106,9 +109,12 @@ impl DecisionEngine {
                     reason: DecisionReason::HardDeadline,
                 }
             } else {
-                Decision::ResidualExposure {
-                    position: frame.account.position,
-                }
+                self.emergency_reduce(frame)
+            };
+        }
+        if !frame.complete_for_entry() {
+            return Decision::Wait {
+                reason: DecisionReason::IncompleteEvidence,
             };
         }
         if frame.account.position != 0 && phase == EpisodePhase::Reducing {
@@ -153,6 +159,25 @@ impl DecisionEngine {
             },
         }
     }
+    fn position_side(
+        mode: crate::model::PositionMode,
+        side: Side,
+        position: i64,
+        reducing: bool,
+    ) -> crate::model::PositionSide {
+        match mode {
+            crate::model::PositionMode::OneWay => crate::model::PositionSide::Both,
+            crate::model::PositionMode::Hedge if reducing && position > 0 => {
+                crate::model::PositionSide::Long
+            }
+            crate::model::PositionMode::Hedge if reducing => crate::model::PositionSide::Short,
+            crate::model::PositionMode::Hedge if side == Side::Buy => {
+                crate::model::PositionSide::Long
+            }
+            crate::model::PositionMode::Hedge => crate::model::PositionSide::Short,
+        }
+    }
+
     fn entry(
         &self,
         frame: &EvidenceFrame,
@@ -182,7 +207,12 @@ impl DecisionEngine {
             price: frame.market.book.passive_price(side),
             quantity: crate::model::Quantity(quantity),
             reduce_only: false,
-            position_side: crate::model::PositionSide::Both,
+            position_side: Self::position_side(
+                frame.contract.position_mode,
+                side,
+                frame.account.position,
+                false,
+            ),
             time_in_force: crate::model::TimeInForce::Gtx,
             working_type: crate::model::WorkingType::ContractPrice,
             price_protect: false,
@@ -194,6 +224,47 @@ impl DecisionEngine {
             .validate(candidate, frame.market.book, frame.account, frame.now_ms)
             .ok()
             .map(|order| (order, value))
+    }
+
+    fn emergency_reduce(&self, frame: &EvidenceFrame) -> Decision {
+        let side = if frame.account.position > 0 {
+            Side::Sell
+        } else {
+            Side::Buy
+        };
+        let quantity = frame.account.position.unsigned_abs().min(i64::MAX as u64) as i64;
+        let candidate = CandidateOrder {
+            symbol: frame.contract.symbol.clone(),
+            side,
+            price: match side {
+                Side::Buy => frame.market.book.ask,
+                Side::Sell => frame.market.book.bid,
+            },
+            quantity: crate::model::Quantity(quantity),
+            reduce_only: true,
+            position_side: Self::position_side(
+                frame.contract.position_mode,
+                side,
+                frame.account.position,
+                true,
+            ),
+            time_in_force: crate::model::TimeInForce::Ioc,
+            working_type: crate::model::WorkingType::ContractPrice,
+            price_protect: false,
+            trigger_price: None,
+            close_position: false,
+        };
+        match frame.contract.validate_emergency_reduce_only(
+            candidate,
+            frame.market.book,
+            frame.account,
+            frame.now_ms,
+        ) {
+            Ok(order) => Decision::EmergencyReduceOnly { order },
+            Err(_) => Decision::ResidualExposure {
+                position: frame.account.position,
+            },
+        }
     }
 
     fn reduce(&self, frame: &EvidenceFrame) -> Decision {
@@ -213,8 +284,13 @@ impl DecisionEngine {
             side,
             price: frame.market.book.passive_price(side),
             quantity: crate::model::Quantity(quantity),
-            reduce_only: true,
-            position_side: crate::model::PositionSide::Both,
+            reduce_only: frame.contract.position_mode == crate::model::PositionMode::OneWay,
+            position_side: Self::position_side(
+                frame.contract.position_mode,
+                side,
+                frame.account.position,
+                true,
+            ),
             time_in_force: crate::model::TimeInForce::Gtx,
             working_type: crate::model::WorkingType::ContractPrice,
             price_protect: false,
@@ -225,10 +301,13 @@ impl DecisionEngine {
             .contract
             .validate(candidate, frame.market.book, frame.account, frame.now_ms)
         {
-            Ok(order) => Decision::ReduceOnly {
-                order,
-                robust_value_pico_bps: 0,
-            },
+            Ok(mut order) => {
+                order.route = crate::model::OrderRoute::PassiveReduceOnly;
+                Decision::ReduceOnly {
+                    order,
+                    robust_value_pico_bps: 0,
+                }
+            }
             Err(_) => Decision::Wait {
                 reason: DecisionReason::ContractRejected,
             },
@@ -284,7 +363,13 @@ mod tests {
     pub(crate) fn frame(now: u64) -> EvidenceFrame {
         let anchor = Anchor::new("a", "equity", PriceTicks(100_000), 0, 10_000, "digest").unwrap();
         let window = ClosedWindow::new(100, 9_000, 9_500, 10_000).unwrap();
-        let episode = AnchorEpisode::new("ep", anchor, window, Some(9_400)).unwrap();
+        let episode = AnchorEpisode::new(
+            "ep",
+            anchor,
+            window,
+            Some(FundingSchedule::new(9_400, 28_800_000, 1, 20_000, "funding").unwrap()),
+        )
+        .unwrap();
         let book = Book {
             bid: PriceTicks(98_000),
             ask: PriceTicks(98_100),
@@ -373,7 +458,6 @@ mod tests {
             },
             external_closed: true,
             calendar_known: true,
-            funding_known: true,
             model_version: "model-v1".into(),
             calibration: calibration_state.snapshot().unwrap(),
             buy_outcome,
@@ -465,5 +549,34 @@ mod wait_competition_tests {
                 reason: DecisionReason::NoRobustEdge
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod emergency_tests {
+    use super::*;
+    use crate::model::{OrderRoute, TimeInForce};
+
+    #[test]
+    fn hard_deadline_uses_a_separately_audited_reduce_route() {
+        let mut evidence = super::tests::frame(10_000);
+        evidence.account.position = 10;
+        evidence.market.book.observed_at_ms = 10_000;
+        evidence.market.server_time_ms = 10_000;
+        evidence.contract.observed_at_ms = 10_000;
+        let engine = DecisionEngine {
+            plan: StrategyPlan::anchor_closed_maker("plan-v1"),
+            limits: PolicyLimits {
+                requested_quantity: 10,
+            },
+        };
+        match engine.decide(&evidence) {
+            Decision::EmergencyReduceOnly { order } => {
+                assert_eq!(order.route, OrderRoute::EmergencyReduceOnly);
+                assert_eq!(order.order.time_in_force, TimeInForce::Ioc);
+                assert!(order.order.reduce_only);
+            }
+            other => panic!("unexpected decision: {other:?}"),
+        }
     }
 }

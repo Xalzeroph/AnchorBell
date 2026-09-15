@@ -69,7 +69,12 @@ The Binance contract model explicitly validates position mode and positionSide,
 post-only GTX time-in-force, reduce-only and closePosition support, conditional
 order support, priceProtect/triggerProtect semantics, current filters, contract
 freshness and remaining rate-limit budget. A CandidateOrder that fails any of
-these checks cannot become a ValidatedOrder.
+these checks cannot become a ValidatedOrder. Passive entries and passive
+reductions carry the visible queue-ahead quantity. Hard-deadline flattening is
+a separate IOC reduce-only route with its own validator and ExecutionPort method;
+it is never silently treated as an ordinary maker order. The funding boundary is
+a typed FundingSchedule with next settlement, interval, observation freshness
+and source digest, not a weekday or fixed-eight-hour strategy constant.
 
 The calibrated executable value is:
 

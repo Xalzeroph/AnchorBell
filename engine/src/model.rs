@@ -70,6 +70,13 @@ impl Book {
             Side::Sell => self.ask,
         }
     }
+
+    pub fn queue_ahead_quantity(self, side: Side) -> Quantity {
+        match side {
+            Side::Buy => self.bid_quantity,
+            Side::Sell => self.ask_quantity,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,11 +184,50 @@ pub enum EpisodePhase {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FundingSchedule {
+    pub next_funding_at_ms: u64,
+    pub interval_ms: u64,
+    pub observed_at_ms: u64,
+    pub max_age_ms: u64,
+    pub source_digest: String,
+}
+
+impl FundingSchedule {
+    pub fn new(
+        next_funding_at_ms: u64,
+        interval_ms: u64,
+        observed_at_ms: u64,
+        max_age_ms: u64,
+        source_digest: impl Into<String>,
+    ) -> Result<Self, ModelError> {
+        let schedule = Self {
+            next_funding_at_ms,
+            interval_ms,
+            observed_at_ms,
+            max_age_ms,
+            source_digest: source_digest.into(),
+        };
+        if schedule.next_funding_at_ms <= schedule.observed_at_ms
+            || schedule.interval_ms == 0
+            || schedule.max_age_ms == 0
+            || schedule.source_digest.is_empty()
+        {
+            return Err(ModelError::InvalidFundingSchedule);
+        }
+        Ok(schedule)
+    }
+
+    pub fn valid_at(&self, now_ms: u64) -> bool {
+        now_ms >= self.observed_at_ms && now_ms - self.observed_at_ms <= self.max_age_ms
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnchorEpisode {
     pub id: String,
     pub anchor: Anchor,
     pub window: ClosedWindow,
-    pub funding_deadline_ms: Option<u64>,
+    pub funding: Option<FundingSchedule>,
     pub phase: EpisodePhase,
 }
 
@@ -190,17 +236,21 @@ impl AnchorEpisode {
         id: impl Into<String>,
         anchor: Anchor,
         window: ClosedWindow,
-        funding_deadline_ms: Option<u64>,
+        funding: Option<FundingSchedule>,
     ) -> Result<Self, ModelError> {
         let id = id.into();
-        if id.is_empty() || funding_deadline_ms.is_some_and(|v| v <= window.closed_at_ms) {
+        if id.is_empty()
+            || funding
+                .as_ref()
+                .is_some_and(|schedule| schedule.next_funding_at_ms <= window.closed_at_ms)
+        {
             return Err(ModelError::InvalidEpisode);
         }
         Ok(Self {
             id,
             anchor,
             window,
-            funding_deadline_ms,
+            funding,
             phase: EpisodePhase::Unborn,
         })
     }
@@ -210,7 +260,10 @@ impl AnchorEpisode {
         }
         if position != 0
             && (self.window.reduce_only(now_ms)
-                || self.funding_deadline_ms.is_some_and(|d| now_ms >= d))
+                || self
+                    .funding
+                    .as_ref()
+                    .is_some_and(|schedule| now_ms >= schedule.next_funding_at_ms))
         {
             return EpisodePhase::Reducing;
         }
@@ -223,10 +276,16 @@ impl AnchorEpisode {
     pub fn entry_allowed(&self, now_ms: u64) -> bool {
         self.anchor.valid_at(now_ms) && self.window.entry_allowed(now_ms)
     }
+    pub fn funding_valid_at(&self, now_ms: u64) -> bool {
+        self.funding
+            .as_ref()
+            .is_some_and(|schedule| schedule.valid_at(now_ms))
+    }
     pub fn earliest_exit_ms(&self) -> u64 {
-        self.funding_deadline_ms
-            .map_or(self.window.external_open_ms, |d| {
-                min(d, self.window.external_open_ms)
+        self.funding
+            .as_ref()
+            .map_or(self.window.external_open_ms, |schedule| {
+                min(schedule.next_funding_at_ms, self.window.external_open_ms)
             })
     }
 }
@@ -308,6 +367,8 @@ impl BinanceContract {
         now_ms: u64,
     ) -> Result<ValidatedOrder, ModelError> {
         book.validate()?;
+        book.validate()?;
+        account.validate()?;
         if self.symbol != order.symbol
             || self.status != ContractStatus::Trading
             || !self.post_only_supported
@@ -325,8 +386,10 @@ impl BinanceContract {
         if !valid_position_side
             || order.time_in_force != TimeInForce::Gtx
             || (order.reduce_only && !self.reduce_only_supported)
+            || (order.reduce_only && self.position_mode == PositionMode::Hedge)
             || (order.close_position && !self.close_position_supported)
             || (order.close_position && !order.reduce_only)
+            || (order.close_position && order.trigger_price.is_none())
         {
             return Err(ModelError::InvalidOrderSemantics);
         }
@@ -378,8 +441,83 @@ impl BinanceContract {
                 return Err(ModelError::PositionLimit);
             }
         }
+        let route = if order.reduce_only {
+            OrderRoute::PassiveReduceOnly
+        } else {
+            OrderRoute::PassiveMaker
+        };
         Ok(ValidatedOrder {
+            queue_ahead_quantity: book.queue_ahead_quantity(order.side).0,
             order,
+            route,
+            contract_digest: self.digest.clone(),
+            validated_at_ms: now_ms,
+        })
+    }
+
+    pub fn validate_emergency_reduce_only(
+        &self,
+        order: CandidateOrder,
+        book: Book,
+        account: AccountSnapshot,
+        now_ms: u64,
+    ) -> Result<ValidatedOrder, ModelError> {
+        book.validate()?;
+        account.validate()?;
+        if self.symbol != order.symbol
+            || self.status != ContractStatus::Trading
+            || self.rate_limit_remaining == 0
+            || self.digest.is_empty()
+            || now_ms < self.observed_at_ms
+            || now_ms - self.observed_at_ms > self.max_age_ms
+            || order.time_in_force != TimeInForce::Ioc
+            || order.close_position
+            || order.trigger_price.is_some()
+            || order.price_protect
+            || (self.position_mode == PositionMode::Hedge && order.reduce_only)
+            || (self.position_mode == PositionMode::Hedge
+                && order.position_side == PositionSide::Both)
+            || (self.position_mode == PositionMode::OneWay
+                && (!order.reduce_only || order.position_side != PositionSide::Both))
+            || (self.position_mode == PositionMode::OneWay && !self.reduce_only_supported)
+        {
+            return Err(ModelError::InvalidOrderSemantics);
+        }
+        if order.price.0 < self.price_filter.min.0
+            || order.price.0 > self.price_filter.max.0
+            || self.price_filter.tick <= 0
+            || order.price.0 % self.price_filter.tick != 0
+        {
+            return Err(ModelError::PriceFilter);
+        }
+        if order.quantity.0 < self.quantity_filter.min.0
+            || order.quantity.0 > self.quantity_filter.max.0
+            || self.quantity_filter.step <= 0
+            || order.quantity.0 % self.quantity_filter.step != 0
+            || order.quantity.0 > account.position.unsigned_abs() as i64
+        {
+            return Err(ModelError::QuantityFilter);
+        }
+        let notional = i128::from(order.price.0)
+            .checked_mul(i128::from(order.quantity.0))
+            .ok_or(ModelError::NotionalFilter)?;
+        if notional < self.min_notional_ticks {
+            return Err(ModelError::NotionalFilter);
+        }
+        let reducing = (order.side == Side::Sell && account.position > 0)
+            || (order.side == Side::Buy && account.position < 0);
+        let hedge_position_matches = match account.position.cmp(&0) {
+            std::cmp::Ordering::Greater => order.position_side == PositionSide::Long,
+            std::cmp::Ordering::Less => order.position_side == PositionSide::Short,
+            std::cmp::Ordering::Equal => false,
+        };
+        if !reducing || (self.position_mode == PositionMode::Hedge && !hedge_position_matches) {
+            return Err(ModelError::InvalidReduceOnly);
+        }
+        Ok(ValidatedOrder {
+            queue_ahead_quantity: book.queue_ahead_quantity(order.side).0,
+            order,
+            route: OrderRoute::EmergencyReduceOnly,
             contract_digest: self.digest.clone(),
             validated_at_ms: now_ms,
         })
@@ -417,6 +555,18 @@ pub struct AccountSnapshot {
     pub margin_available_ppm: i64,
 }
 
+impl AccountSnapshot {
+    pub fn validate(self) -> Result<(), ModelError> {
+        if self.max_position < 0
+            || self.position.unsigned_abs() > self.max_position as u64
+            || !(0..=1_000_000).contains(&self.margin_available_ppm)
+        {
+            return Err(ModelError::InvalidAccount);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CandidateOrder {
     pub symbol: String,
@@ -432,9 +582,18 @@ pub struct CandidateOrder {
     pub close_position: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OrderRoute {
+    PassiveMaker,
+    PassiveReduceOnly,
+    EmergencyReduceOnly,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidatedOrder {
+    pub queue_ahead_quantity: i64,
     pub order: CandidateOrder,
+    pub route: OrderRoute,
     pub contract_digest: String,
     pub validated_at_ms: u64,
 }
@@ -448,17 +607,22 @@ pub struct QueueFillEstimate {
 }
 
 impl QueueFillEstimate {
-    pub fn fill_probability_bps(&self) -> Option<u16> {
+    pub fn causal_fill_quantity(&self) -> Option<i64> {
         if self.queue_ahead_quantity < 0
             || self.order_quantity <= 0
             || self.traded_through_quantity < 0
         {
             return None;
         }
-        let available = self
-            .traded_through_quantity
-            .saturating_sub(self.queue_ahead_quantity)
-            .min(self.order_quantity);
+        Some(
+            self.traded_through_quantity
+                .saturating_sub(self.queue_ahead_quantity)
+                .min(self.order_quantity),
+        )
+    }
+
+    pub fn fill_probability_bps(&self) -> Option<u16> {
+        let available = self.causal_fill_quantity()?;
         let probability = i128::from(available)
             .checked_mul(BPS_SCALE)?
             .checked_div(i128::from(self.order_quantity))?;
@@ -681,7 +845,6 @@ pub struct EvidenceFrame {
     pub account: AccountSnapshot,
     pub external_closed: bool,
     pub calendar_known: bool,
-    pub funding_known: bool,
     pub model_version: String,
     pub calibration: crate::calibration::CalibrationSnapshot,
     pub buy_outcome: OutcomeDistribution,
@@ -693,7 +856,7 @@ impl EvidenceFrame {
     pub fn complete_for_entry(&self) -> bool {
         self.calendar_known
             && self.external_closed
-            && self.funding_known
+            && self.episode.funding_valid_at(self.now_ms)
             && self.account.reconciled
             && !self.model_version.is_empty()
             && self.calibration.validate().is_ok()
@@ -706,6 +869,7 @@ pub enum ModelError {
     InvalidAnchor,
     InvalidWindow,
     InvalidEpisode,
+    InvalidFundingSchedule,
     InvalidMarket,
     StaleMarket,
     ContractUnavailable,
@@ -716,6 +880,7 @@ pub enum ModelError {
     InvalidReduceOnly,
     PositionLimit,
     InvalidOrderSemantics,
+    InvalidAccount,
     RateLimit,
     IncompleteEvidence,
 }
