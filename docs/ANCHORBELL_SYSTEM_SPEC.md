@@ -170,8 +170,9 @@ conditional-order semantics from being silently invented by adapters.
 
 ExecutionCycle is the typed causal path for an entry action. It records side,
 static anchor price, entry and exit prices, requested quantity, entry and exit
-filled quantities, entry/exit fees, exit cost, funding cost, deadline risk and
-event times. Gross convergence value is derived from those observations rather
+filled quantities, queue-ahead quantities, entry/exit latency, entry/exit
+fees, exit cost, funding cost, deadline risk and event times. Gross convergence
+value is derived from those observations rather
 than accepted as a free-standing prediction:
 
     G = floor(side * (exit_price - entry_price)

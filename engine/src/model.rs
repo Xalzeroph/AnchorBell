@@ -448,6 +448,10 @@ pub struct ExecutionCycle {
     pub requested_quantity: Quantity,
     pub entry_filled_quantity: i64,
     pub exit_filled_quantity: i64,
+    pub entry_queue_ahead_quantity: i64,
+    pub exit_queue_ahead_quantity: i64,
+    pub entry_latency_ms: u64,
+    pub exit_latency_ms: u64,
     pub entry_fee_pico_bps: i64,
     pub exit_fee_pico_bps: i64,
     pub exit_cost_pico_bps: i64,
@@ -468,6 +472,8 @@ impl ExecutionCycle {
             || self.exit_filled_quantity < 0
             || self.entry_filled_quantity > self.requested_quantity.0
             || self.exit_filled_quantity > self.entry_filled_quantity
+            || self.entry_queue_ahead_quantity < 0
+            || self.exit_queue_ahead_quantity < 0
             || self.entry_at_ms == 0
             || self.exit_at_ms <= self.entry_at_ms
             || self.deadline_ms <= self.exit_at_ms
@@ -799,6 +805,10 @@ mod outcome_tests {
                 requested_quantity: Quantity(1),
                 entry_filled_quantity,
                 exit_filled_quantity,
+                entry_queue_ahead_quantity: 0,
+                exit_queue_ahead_quantity: 0,
+                entry_latency_ms: 0,
+                exit_latency_ms: 0,
                 entry_fee_pico_bps,
                 exit_fee_pico_bps: 0,
                 exit_cost_pico_bps: 0,
