@@ -439,6 +439,33 @@ pub struct ValidatedOrder {
     pub validated_at_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueFillEstimate {
+    pub queue_ahead_quantity: i64,
+    pub order_quantity: i64,
+    pub traded_through_quantity: i64,
+    pub observed_latency_ms: u64,
+}
+
+impl QueueFillEstimate {
+    pub fn fill_probability_bps(&self) -> Option<u16> {
+        if self.queue_ahead_quantity < 0
+            || self.order_quantity <= 0
+            || self.traded_through_quantity < 0
+        {
+            return None;
+        }
+        let available = self
+            .traded_through_quantity
+            .saturating_sub(self.queue_ahead_quantity)
+            .min(self.order_quantity);
+        let probability = i128::from(available)
+            .checked_mul(BPS_SCALE)?
+            .checked_div(i128::from(self.order_quantity))?;
+        u16::try_from(probability).ok()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionCycle {
     pub side: Side,
@@ -819,6 +846,27 @@ mod outcome_tests {
                 deadline_ms: 3,
             },
         )
+    }
+
+    #[test]
+    fn queue_fill_probability_uses_only_observed_throughput() {
+        let estimate = QueueFillEstimate {
+            queue_ahead_quantity: 100,
+            order_quantity: 10,
+            traded_through_quantity: 105,
+            observed_latency_ms: 50,
+        };
+        assert_eq!(estimate.fill_probability_bps(), Some(5_000));
+        assert_eq!(
+            QueueFillEstimate {
+                queue_ahead_quantity: -1,
+                order_quantity: 10,
+                traded_through_quantity: 10,
+                observed_latency_ms: 0,
+            }
+            .fill_probability_bps(),
+            None
+        );
     }
 
     #[test]

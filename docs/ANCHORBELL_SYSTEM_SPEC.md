@@ -188,6 +188,17 @@ exit event occurs before the hard deadline. Its net value is derived as:
 OutcomeScenario contains either this complete cycle or an explicit Wait value.
 An incomplete cycle is not converted to a zero-profit scenario.
 
+QueueFillEstimate uses only causal throughput observed after the order's
+latency. With queue-ahead quantity q_a, own quantity q_o and traded-through
+quantity q_t:
+
+    q_fill = min(q_o, max(0, q_t - q_a))
+    p_fill = floor(10000 * q_fill / q_o).
+
+This is a structural fill estimate, not a tuned probability constant. The
+latency is part of the observation boundary, so pre-placement or pre-latency
+trades cannot be counted as fill evidence.
+
 OutcomeDistribution requires positive scenario weights summing to 10000 basis
 points and every scenario to be terminal. Each scenario net value is:
 
