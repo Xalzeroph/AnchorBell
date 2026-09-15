@@ -440,14 +440,123 @@ pub struct ValidatedOrder {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OutcomeScenario {
-    pub weight_bps: u16,
-    pub gross_anchor_pnl_pico_bps: i64,
-    pub fee_cost_pico_bps: i64,
-    pub funding_cost_pico_bps: i64,
+pub struct ExecutionCycle {
+    pub side: Side,
+    pub anchor_price: PriceTicks,
+    pub entry_price: PriceTicks,
+    pub exit_price: PriceTicks,
+    pub requested_quantity: Quantity,
+    pub entry_filled_quantity: i64,
+    pub exit_filled_quantity: i64,
+    pub entry_fee_pico_bps: i64,
+    pub exit_fee_pico_bps: i64,
     pub exit_cost_pico_bps: i64,
+    pub funding_cost_pico_bps: i64,
     pub deadline_risk_pico_bps: i64,
-    pub terminal: bool,
+    pub entry_at_ms: u64,
+    pub exit_at_ms: u64,
+    pub deadline_ms: u64,
+}
+
+impl ExecutionCycle {
+    fn validate(&self) -> Option<()> {
+        if self.anchor_price.0 <= 0
+            || self.entry_price.0 <= 0
+            || self.exit_price.0 <= 0
+            || self.requested_quantity.0 <= 0
+            || self.entry_filled_quantity < 0
+            || self.exit_filled_quantity < 0
+            || self.entry_filled_quantity > self.requested_quantity.0
+            || self.exit_filled_quantity > self.entry_filled_quantity
+            || self.entry_at_ms == 0
+            || self.exit_at_ms <= self.entry_at_ms
+            || self.deadline_ms <= self.exit_at_ms
+            || self.entry_fee_pico_bps < 0
+            || self.exit_fee_pico_bps < 0
+            || self.exit_cost_pico_bps < 0
+            || self.funding_cost_pico_bps < 0
+            || self.deadline_risk_pico_bps < 0
+        {
+            return None;
+        }
+        Some(())
+    }
+
+    pub fn terminal(&self) -> bool {
+        self.exit_filled_quantity == self.entry_filled_quantity
+    }
+
+    pub fn gross_anchor_pnl_pico_bps(&self) -> Option<i128> {
+        self.validate()?;
+        let signed_delta =
+            i128::from(self.exit_price.0 - self.entry_price.0) * i128::from(self.side.sign());
+        let numerator = signed_delta
+            .checked_mul(PICO_BPS_SCALE)?
+            .checked_mul(i128::from(self.exit_filled_quantity))?;
+        let denominator =
+            i128::from(self.anchor_price.0).checked_mul(i128::from(self.requested_quantity.0))?;
+        floor_div_positive(numerator, denominator)
+    }
+
+    pub fn net_value(&self) -> Option<i128> {
+        let gross = self.gross_anchor_pnl_pico_bps()?;
+        let fee =
+            i128::from(self.entry_fee_pico_bps).checked_add(i128::from(self.exit_fee_pico_bps))?;
+        Some(
+            gross
+                - fee
+                - i128::from(self.exit_cost_pico_bps)
+                - i128::from(self.funding_cost_pico_bps)
+                - i128::from(self.deadline_risk_pico_bps),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OutcomeScenario {
+    Cycle {
+        weight_bps: u16,
+        cycle: ExecutionCycle,
+    },
+    Wait {
+        weight_bps: u16,
+        value_pico_bps: i64,
+    },
+}
+
+impl OutcomeScenario {
+    pub fn cycle(weight_bps: u16, cycle: ExecutionCycle) -> Self {
+        Self::Cycle { weight_bps, cycle }
+    }
+
+    pub fn wait(weight_bps: u16, value_pico_bps: i64) -> Self {
+        Self::Wait {
+            weight_bps,
+            value_pico_bps,
+        }
+    }
+
+    fn weight_bps(&self) -> u16 {
+        match self {
+            Self::Cycle { weight_bps, .. } | Self::Wait { weight_bps, .. } => *weight_bps,
+        }
+    }
+
+    fn terminal(&self) -> bool {
+        match self {
+            Self::Cycle { cycle, .. } => cycle.terminal(),
+            Self::Wait { .. } => true,
+        }
+    }
+
+    pub fn net_value(&self) -> Option<i128> {
+        match self {
+            Self::Cycle { cycle, .. } => cycle.net_value(),
+            Self::Wait { value_pico_bps, .. } => {
+                (*value_pico_bps != i64::MIN).then_some(i128::from(*value_pico_bps))
+            }
+        }
+    }
 }
 
 pub fn floor_div_positive(numerator: i128, denominator: i128) -> Option<i128> {
@@ -514,39 +623,19 @@ impl OutcomeDistribution {
             return None;
         }
         let total = self.scenarios.iter().try_fold(0_u32, |sum, scenario| {
-            sum.checked_add(u32::from(scenario.weight_bps))
+            sum.checked_add(u32::from(scenario.weight_bps()))
         })?;
         if total != 10_000
             || self.scenarios.iter().any(|scenario| {
-                scenario.weight_bps == 0 || (require_terminal && !scenario.terminal)
+                scenario.weight_bps() == 0 || (require_terminal && !scenario.terminal())
             })
         {
             return None;
         }
         self.scenarios.iter().try_fold(0_i128, |sum, scenario| {
             let value = scenario.net_value()?;
-            sum.checked_add(i128::from(scenario.weight_bps) * value)
+            sum.checked_add(i128::from(scenario.weight_bps()) * value)
         })
-    }
-}
-
-impl OutcomeScenario {
-    pub fn net_value(&self) -> Option<i128> {
-        if self.gross_anchor_pnl_pico_bps == i64::MIN
-            || self.fee_cost_pico_bps < 0
-            || self.funding_cost_pico_bps < 0
-            || self.exit_cost_pico_bps < 0
-            || self.deadline_risk_pico_bps < 0
-        {
-            return None;
-        }
-        Some(
-            i128::from(self.gross_anchor_pnl_pico_bps)
-                - i128::from(self.fee_cost_pico_bps)
-                - i128::from(self.funding_cost_pico_bps)
-                - i128::from(self.exit_cost_pico_bps)
-                - i128::from(self.deadline_risk_pico_bps),
-        )
     }
 }
 
@@ -692,6 +781,36 @@ mod tests {
 mod outcome_tests {
     use super::*;
 
+    fn cycle(
+        weight_bps: u16,
+        entry_price: i64,
+        exit_price: i64,
+        entry_fee_pico_bps: i64,
+        entry_filled_quantity: i64,
+        exit_filled_quantity: i64,
+    ) -> OutcomeScenario {
+        OutcomeScenario::cycle(
+            weight_bps,
+            ExecutionCycle {
+                side: Side::Buy,
+                anchor_price: PriceTicks(1_000_000_000_000),
+                entry_price: PriceTicks(entry_price),
+                exit_price: PriceTicks(exit_price),
+                requested_quantity: Quantity(1),
+                entry_filled_quantity,
+                exit_filled_quantity,
+                entry_fee_pico_bps,
+                exit_fee_pico_bps: 0,
+                exit_cost_pico_bps: 0,
+                funding_cost_pico_bps: 0,
+                deadline_risk_pico_bps: 0,
+                entry_at_ms: 1,
+                exit_at_ms: 2,
+                deadline_ms: 3,
+            },
+        )
+    }
+
     #[test]
     fn floor_division_is_a_true_lower_bound_for_negative_values() {
         assert_eq!(floor_div_positive(-1, 10_000), Some(-1));
@@ -725,24 +844,8 @@ mod outcome_tests {
     fn lower_value_uses_all_probabilities_and_costs() {
         let distribution = OutcomeDistribution {
             scenarios: vec![
-                OutcomeScenario {
-                    weight_bps: 5_000,
-                    gross_anchor_pnl_pico_bps: 100,
-                    fee_cost_pico_bps: 10,
-                    funding_cost_pico_bps: 0,
-                    exit_cost_pico_bps: 0,
-                    deadline_risk_pico_bps: 0,
-                    terminal: true,
-                },
-                OutcomeScenario {
-                    weight_bps: 5_000,
-                    gross_anchor_pnl_pico_bps: 0,
-                    fee_cost_pico_bps: 0,
-                    funding_cost_pico_bps: 0,
-                    exit_cost_pico_bps: 0,
-                    deadline_risk_pico_bps: 0,
-                    terminal: true,
-                },
+                cycle(5_000, 1_000_000_000_000, 1_000_000_000_100, 10, 1, 1),
+                cycle(5_000, 1_000_000_000_000, 1_000_000_000_000, 0, 1, 1),
             ],
             uncertainty: UncertaintyBudget {
                 anchor_pico_bps: 2,
@@ -758,15 +861,7 @@ mod outcome_tests {
     #[test]
     fn incomplete_path_is_not_silently_zero() {
         let distribution = OutcomeDistribution {
-            scenarios: vec![OutcomeScenario {
-                weight_bps: 10_000,
-                gross_anchor_pnl_pico_bps: 100,
-                fee_cost_pico_bps: 0,
-                funding_cost_pico_bps: 0,
-                exit_cost_pico_bps: 0,
-                deadline_risk_pico_bps: 0,
-                terminal: false,
-            }],
+            scenarios: vec![cycle(10_000, 1_000_000_000_000, 1_000_000_000_100, 0, 1, 0)],
             uncertainty: UncertaintyBudget {
                 anchor_pico_bps: 0,
                 execution_pico_bps: 0,

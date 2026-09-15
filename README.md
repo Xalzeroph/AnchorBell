@@ -58,10 +58,12 @@ exchange and does not submit an order.
 ## Calibration and Binance legality
 
 Calibration is not a bootstrap constant. CalibrationState is an ordered bounded
-log of observed attempts, fills and signed conditional markouts. It has a schema
-and model version, JSON persistence, replay validation and a SHA-256 evidence
-digest. Before 30 effective observations with markouts, no CalibrationSnapshot
-exists and the entry policy cannot admit new risk.
+log of observed attempts, fills, side and signed conditional markouts. It has a
+schema and model version, JSON persistence, replay validation and a SHA-256
+evidence digest. Admission requires 30 effective markouts plus at least 15
+complete observations for each side, and uses a chronological train/holdout
+split. Before admission, a ColdStart snapshot has zero historical influence and
+the entry policy cannot use historical execution evidence.
 
 The Binance contract model explicitly validates position mode and positionSide,
 post-only GTX time-in-force, reduce-only and closePosition support, conditional
@@ -71,10 +73,10 @@ these checks cannot become a ValidatedOrder.
 
 The calibrated executable value is:
 
-    V_path = weighted(gross_anchor_pnl - fee - funding - exit - deadline_risk)
+    V_path = weighted(derived_cycle_net_value)
     U = U_anchor + U_execution + U_timing + U_model
     L = floor(V_path) - U
-    V_exec = floor(L * fill_probability / 10000) + robust_markout_lower
+    V_exec(s) = floor(L * fill_probability_s / 10000) + robust_markout_lower_s
 
 with all terms represented as integer pico-basis-points. This is conditional on
 causal evidence and is only compared against wait after the closed-window,

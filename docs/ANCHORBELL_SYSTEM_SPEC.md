@@ -131,19 +131,30 @@ never creates risk. The model cannot guarantee profit, but makes every profit
 ## 6. Calibration contract
 
 CalibrationState is the only source for learned execution quantities. It stores
-ordered observations of attempted quantity, confirmed fill quantity and signed
-conditional markout. The state is bounded, versioned and serializable. Loading a
-state requires identity validation and replay equality; malformed, reordered or
-An admitted historical snapshot is unavailable until 30 effective observations, including 30 markouts, exist. Before that point only a ColdStart snapshot with zero historical influence exists. Therefore no prior, bootstrap value or hand-written fallback can create new risk.
+ordered observations of attempted quantity, confirmed fill quantity, side and
+signed conditional markout. The state is bounded, versioned and serializable.
+Loading a state requires identity validation and replay equality; malformed,
+reordered or future-edited state is rejected.
 
-For a path lower value L, fill probability p and robust conditional markout m,
-the executable lower value is
+Admission requires at least 30 effective markouts, at least 15 complete Buy
+observations and at least 15 complete Sell observations. The train/validation
+split is chronological: the first two thirds are used for training statistics
+and the final third is a holdout. Markout values are sorted only inside each
+statistical calculation; they are never sorted before the temporal split. A
+future regime deterioration therefore revokes admission instead of contaminating
+the training set. Before admission, only a ColdStart snapshot with zero
+historical influence is available. No bootstrap constant or hand-written fallback
+can create new risk.
 
-    V_exec = floor(L * p / 10000) + m.
+After admission, Buy and Sell retain separate attempt, fill-probability and
+robust-markout estimates. For side s, path lower value L, side-specific fill
+probability p_s and side-specific robust markout m_s:
 
-The policy uses V_exec for both long and short candidates, so direction is a
-property of the signed anchor residual and the validated outcome path, not a
-separate long-only or short-only rule.
+    V_exec(s) = floor(L * p_s / 10000) + m_s.
+
+Direction is therefore represented by the anchor residual, the causal outcome
+path and the side-specific execution evidence; it is not assumed that long and
+short execution are symmetric.
 
 ## 7. Binance legality contract
 
@@ -157,19 +168,30 @@ conditional-order semantics from being silently invented by adapters.
 
 ## 8. Outcome semantics and action competition
 
-OutcomeScenario is a complete terminal path, not a single price difference. Its
-net value is
+ExecutionCycle is the typed causal path for an entry action. It records side,
+static anchor price, entry and exit prices, requested quantity, entry and exit
+filled quantities, entry/exit fees, exit cost, funding cost, deadline risk and
+event times. Gross convergence value is derived from those observations rather
+than accepted as a free-standing prediction:
 
-    N = gross_anchor_convergence
-        - fee_cost
-        - funding_cost
-        - exit_cost
-        - deadline_risk_cost.
+    G = floor(side * (exit_price - entry_price)
+              * filled_exit * PICO_BPS
+              / (anchor_price * requested_quantity)).
+
+The cycle is terminal only when exit quantity equals entry quantity and the
+exit event occurs before the hard deadline. Its net value is derived as:
+
+    N = G - entry_fee - exit_fee - exit_cost
+        - funding_cost - deadline_risk_cost.
+
+OutcomeScenario contains either this complete cycle or an explicit Wait value.
+An incomplete cycle is not converted to a zero-profit scenario.
 
 OutcomeDistribution requires positive scenario weights summing to 10000 basis
 points and every scenario to be terminal. Each scenario net value is:
 
-    N_i = gross_anchor_pnl_i - fee_i - funding_i - exit_i - deadline_risk_i.
+    N_i = derived_cycle_net_value_i
+          or explicit_wait_value_i.
 
 The uncertainty is a typed budget, not a black-box threshold:
 

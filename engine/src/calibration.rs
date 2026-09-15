@@ -6,7 +6,29 @@ use std::collections::VecDeque;
 pub const CALIBRATION_SCHEMA_VERSION: u16 = 2;
 pub const CALIBRATION_MODEL_VERSION: &str = "anchorbell-conditional-outcome-v2";
 pub const MIN_EFFECTIVE_SAMPLES: usize = 30;
+const MIN_DIRECTIONAL_SAMPLES: usize = MIN_EFFECTIVE_SAMPLES / 2;
 const WINDOW_CAPACITY: usize = 4096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectionalCalibration {
+    pub attempts: u64,
+    pub fills: u64,
+    pub fill_probability_bps: u16,
+    pub adverse_markout_pico_bps: i64,
+    pub robust_lower_pico_bps: i64,
+}
+
+impl DirectionalCalibration {
+    fn cold_start() -> Self {
+        Self {
+            attempts: 0,
+            fills: 0,
+            fill_probability_bps: 0,
+            adverse_markout_pico_bps: 0,
+            robust_lower_pico_bps: 0,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CalibrationPhase {
@@ -38,6 +60,8 @@ pub struct HistoryAdmission {
 pub struct HistoryQualityReport {
     pub total_observations: u64,
     pub complete_observations: u64,
+    pub buy_complete_observations: u64,
+    pub sell_complete_observations: u64,
     pub validation_observations: u64,
     pub chronology_valid: bool,
     pub replay_valid: bool,
@@ -65,11 +89,8 @@ pub struct CalibrationSnapshot {
     pub instrument: String,
     pub phase: CalibrationPhase,
     pub effective_sample_size: u64,
-    pub attempts: u64,
-    pub fills: u64,
-    pub fill_probability_bps: u16,
-    pub adverse_markout_pico_bps: i64,
-    pub robust_lower_pico_bps: i64,
+    pub buy: DirectionalCalibration,
+    pub sell: DirectionalCalibration,
     pub window_start_ms: u64,
     pub window_end_ms: u64,
     pub evidence_digest: String,
@@ -106,7 +127,8 @@ impl CalibrationState {
 
     pub fn observe(&mut self, observation: CalibrationObservation) -> Result<(), CalibrationError> {
         self.validate_identity()?;
-        if observation.attempted_quantity <= 0
+        if observation.event_at_ms == 0
+            || observation.attempted_quantity <= 0
             || observation.filled_quantity < 0
             || observation.filled_quantity > observation.attempted_quantity
             || observation.markout_pico_bps.is_some_and(|v| v == i64::MIN)
@@ -145,16 +167,35 @@ impl CalibrationState {
             .iter()
             .zip(self.observations.iter().skip(1))
             .all(|(previous, current)| previous.event_at_ms <= current.event_at_ms);
-        let mut completed: Vec<i64> = self
+        let completed: Vec<(Side, i64)> = self
             .observations
             .iter()
-            .filter_map(|observation| observation.markout_pico_bps)
+            .filter_map(|observation| {
+                observation
+                    .markout_pico_bps
+                    .map(|markout| (observation.side, markout))
+            })
             .collect();
-        completed.sort_unstable();
 
         let split = completed.len().saturating_mul(2) / 3;
-        let train = robust_stats(&completed[..split]);
-        let validation = robust_stats(&completed[split..]);
+        let train_values: Vec<i64> = completed[..split]
+            .iter()
+            .map(|(_, markout)| *markout)
+            .collect();
+        let validation_values: Vec<i64> = completed[split..]
+            .iter()
+            .map(|(_, markout)| *markout)
+            .collect();
+        let train = robust_stats(&train_values);
+        let validation = robust_stats(&validation_values);
+        let buy_complete_observations = completed
+            .iter()
+            .filter(|(side, _)| *side == Side::Buy)
+            .count() as u64;
+        let sell_complete_observations = completed
+            .iter()
+            .filter(|(side, _)| *side == Side::Sell)
+            .count() as u64;
         let replay_valid = chronology_valid
             && self.first_event_at_ms
                 == self
@@ -169,6 +210,8 @@ impl CalibrationState {
 
         let admissible =
             completed.len() >= MIN_EFFECTIVE_SAMPLES
+                && buy_complete_observations >= MIN_DIRECTIONAL_SAMPLES as u64
+                && sell_complete_observations >= MIN_DIRECTIONAL_SAMPLES as u64
                 && split > 0
                 && validation.is_some()
                 && chronology_valid
@@ -180,6 +223,8 @@ impl CalibrationState {
         Ok(HistoryQualityReport {
             total_observations: self.observations.len() as u64,
             complete_observations: completed.len() as u64,
+            buy_complete_observations,
+            sell_complete_observations,
             validation_observations: completed.len().saturating_sub(split) as u64,
             chronology_valid,
             replay_valid,
@@ -262,17 +307,13 @@ impl CalibrationState {
         &self,
         admission: &HistoryAdmission,
     ) -> Result<CalibrationSnapshot, CalibrationError> {
-        let attempts: u64 = self
-            .observations
-            .iter()
-            .map(|value| value.attempted_quantity as u64)
-            .sum();
-        let fills: u64 = self
-            .observations
-            .iter()
-            .map(|value| value.filled_quantity as u64)
-            .sum();
-        if attempts == 0 || admission.effective_sample_size < MIN_EFFECTIVE_SAMPLES as u64 {
+        let buy = self
+            .directional_calibration(Side::Buy)
+            .ok_or(CalibrationError::InsufficientHistory)?;
+        let sell = self
+            .directional_calibration(Side::Sell)
+            .ok_or(CalibrationError::InsufficientHistory)?;
+        if admission.effective_sample_size < MIN_EFFECTIVE_SAMPLES as u64 {
             return Err(CalibrationError::InsufficientHistory);
         }
         let snapshot = CalibrationSnapshot {
@@ -281,17 +322,40 @@ impl CalibrationState {
             instrument: self.instrument.clone(),
             phase: CalibrationPhase::Admitted,
             effective_sample_size: admission.effective_sample_size,
-            attempts,
-            fills,
-            fill_probability_bps: (fills.saturating_mul(10_000) / attempts).min(10_000) as u16,
-            adverse_markout_pico_bps: admission.validation_median_pico_bps,
-            robust_lower_pico_bps: admission.validation_robust_lower_pico_bps,
+            buy,
+            sell,
             window_start_ms: self.first_event_at_ms,
             window_end_ms: self.last_event_at_ms,
             evidence_digest: admission.evidence_digest.clone(),
         };
         snapshot.validate()?;
         Ok(snapshot)
+    }
+
+    fn directional_calibration(&self, side: Side) -> Option<DirectionalCalibration> {
+        let observations: Vec<&CalibrationObservation> = self
+            .observations
+            .iter()
+            .filter(|observation| observation.side == side)
+            .collect();
+        let attempts = observations.iter().try_fold(0_u64, |sum, observation| {
+            sum.checked_add(observation.attempted_quantity as u64)
+        })?;
+        let fills = observations.iter().try_fold(0_u64, |sum, observation| {
+            sum.checked_add(observation.filled_quantity as u64)
+        })?;
+        let markouts: Vec<i64> = observations
+            .iter()
+            .filter_map(|observation| observation.markout_pico_bps)
+            .collect();
+        let (median, robust_lower) = robust_stats(&markouts)?;
+        Some(DirectionalCalibration {
+            attempts,
+            fills,
+            fill_probability_bps: (fills.saturating_mul(10_000) / attempts).min(10_000) as u16,
+            adverse_markout_pico_bps: median,
+            robust_lower_pico_bps: robust_lower,
+        })
     }
 
     fn cold_start_snapshot(&self) -> CalibrationSnapshot {
@@ -301,11 +365,8 @@ impl CalibrationState {
             instrument: self.instrument.clone(),
             phase: CalibrationPhase::ColdStart,
             effective_sample_size: 0,
-            attempts: 0,
-            fills: 0,
-            fill_probability_bps: 0,
-            adverse_markout_pico_bps: 0,
-            robust_lower_pico_bps: 0,
+            buy: DirectionalCalibration::cold_start(),
+            sell: DirectionalCalibration::cold_start(),
             window_start_ms: 0,
             window_end_ms: 0,
             evidence_digest: digest_bytes(
@@ -329,12 +390,16 @@ impl CalibrationState {
 }
 
 impl CalibrationSnapshot {
-    pub fn robust_executable_value(&self, path_value_pico_bps: i64) -> i64 {
+    pub fn robust_executable_value(&self, side: Side, path_value_pico_bps: i64) -> i64 {
         if self.phase != CalibrationPhase::Admitted {
             return path_value_pico_bps;
         }
+        let directional = match side {
+            Side::Buy => self.buy,
+            Side::Sell => self.sell,
+        };
         let fill_adjusted = crate::model::floor_div_positive(
-            i128::from(path_value_pico_bps) * i128::from(self.fill_probability_bps),
+            i128::from(path_value_pico_bps) * i128::from(directional.fill_probability_bps),
             10_000,
         )
         .and_then(|value| i64::try_from(value).ok())
@@ -345,7 +410,7 @@ impl CalibrationSnapshot {
                 i64::MAX
             }
         });
-        fill_adjusted.saturating_add(self.robust_lower_pico_bps)
+        fill_adjusted.saturating_add(directional.robust_lower_pico_bps)
     }
 
     pub fn validate(&self) -> Result<(), CalibrationError> {
@@ -360,19 +425,21 @@ impl CalibrationSnapshot {
         match self.phase {
             CalibrationPhase::ColdStart => {
                 if self.effective_sample_size != 0
-                    || self.attempts != 0
-                    || self.fills != 0
-                    || self.fill_probability_bps != 0
+                    || self.buy != DirectionalCalibration::cold_start()
+                    || self.sell != DirectionalCalibration::cold_start()
                 {
                     return Err(CalibrationError::InvalidSnapshot);
                 }
             }
             CalibrationPhase::Validating => return Err(CalibrationError::InvalidSnapshot),
             CalibrationPhase::Admitted => {
+                let directional_valid = [self.buy, self.sell].iter().all(|value| {
+                    value.attempts > 0
+                        && value.fills <= value.attempts
+                        && value.fill_probability_bps <= 10_000
+                });
                 if self.effective_sample_size < MIN_EFFECTIVE_SAMPLES as u64
-                    || self.attempts == 0
-                    || self.fills > self.attempts
-                    || self.fill_probability_bps > 10_000
+                    || !directional_valid
                     || self.window_end_ms < self.window_start_ms
                 {
                     return Err(CalibrationError::InvalidSnapshot);
@@ -387,8 +454,10 @@ fn robust_stats(values: &[i64]) -> Option<(i64, i64)> {
     if values.is_empty() {
         return None;
     }
-    let median = values[(values.len() - 1) / 2];
-    let mut deviations: Vec<i64> = values
+    let mut ordered = values.to_vec();
+    ordered.sort_unstable();
+    let median = ordered[(ordered.len() - 1) / 2];
+    let mut deviations: Vec<i64> = ordered
         .iter()
         .map(|value| value.saturating_sub(median).abs())
         .collect();
@@ -427,7 +496,7 @@ mod tests {
         let state = CalibrationState::new("BTCUSDT").unwrap();
         let snapshot = state.decision_snapshot().unwrap();
         assert_eq!(snapshot.phase, CalibrationPhase::ColdStart);
-        assert_eq!(snapshot.robust_executable_value(123), 123);
+        assert_eq!(snapshot.robust_executable_value(Side::Buy, 123), 123);
         assert!(snapshot.validate().is_ok());
     }
 
@@ -436,7 +505,11 @@ mod tests {
         let mut state = CalibrationState::new("BTCUSDT").unwrap();
         for i in 0..(MIN_EFFECTIVE_SAMPLES - 1) {
             state
-                .observe(observation(i as u64 + 1, Side::Buy, Some(20_000_000_000)))
+                .observe(observation(
+                    i as u64 + 1,
+                    if i % 2 == 0 { Side::Buy } else { Side::Sell },
+                    Some(20_000_000_000),
+                ))
                 .unwrap();
         }
         assert_eq!(state.snapshot(), Err(CalibrationError::HistoryNotAdmitted));
@@ -448,13 +521,51 @@ mod tests {
         let mut state = CalibrationState::new("BTCUSDT").unwrap();
         for i in 0..MIN_EFFECTIVE_SAMPLES {
             state
-                .observe(observation(i as u64 + 1, Side::Buy, Some(20_000_000_000)))
+                .observe(observation(
+                    i as u64 + 1,
+                    if i % 2 == 0 { Side::Buy } else { Side::Sell },
+                    Some(if i % 2 == 0 {
+                        20_000_000_000
+                    } else {
+                        -10_000_000_000
+                    }),
+                ))
                 .unwrap();
         }
         let report = state.history_quality().unwrap();
         assert!(report.admissible);
         assert_eq!(state.phase(), CalibrationPhase::Admitted);
-        assert!(state.snapshot().unwrap().validate().is_ok());
+        let snapshot = state.snapshot().unwrap();
+        assert!(snapshot.validate().is_ok());
+        assert_eq!(snapshot.buy.robust_lower_pico_bps, 20_000_000_000);
+        assert_eq!(snapshot.sell.robust_lower_pico_bps, -10_000_000_000);
+    }
+
+    #[test]
+    fn chronological_holdout_rejects_future_regime_break() {
+        let mut state = CalibrationState::new("BTCUSDT").unwrap();
+        for i in 0..MIN_EFFECTIVE_SAMPLES {
+            let markout = if i < 20 {
+                20_000_000_000
+            } else {
+                -20_000_000_000
+            };
+            state
+                .observe(observation(
+                    i as u64 + 1,
+                    if i % 2 == 0 { Side::Buy } else { Side::Sell },
+                    Some(markout),
+                ))
+                .unwrap();
+        }
+        let report = state.history_quality().unwrap();
+        assert!(!report.admissible);
+        assert!(
+            report.train_robust_lower_pico_bps.expect("train statistic")
+                > report
+                    .validation_robust_lower_pico_bps
+                    .expect("validation statistic")
+        );
     }
 
     #[test]

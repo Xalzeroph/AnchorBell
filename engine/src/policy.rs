@@ -161,7 +161,7 @@ impl DecisionEngine {
     ) -> Option<(ValidatedOrder, i64)> {
         let value = frame
             .calibration
-            .robust_executable_value(outcome.lower_value()?);
+            .robust_executable_value(side, outcome.lower_value()?);
         let remaining = match side {
             Side::Buy => frame
                 .account
@@ -254,6 +254,29 @@ mod tests {
     use super::*;
     use crate::model::*;
 
+    fn cycle(side: Side, entry_price: i64, exit_price: i64) -> OutcomeScenario {
+        OutcomeScenario::cycle(
+            5_000,
+            ExecutionCycle {
+                side,
+                anchor_price: PriceTicks(100_000),
+                entry_price: PriceTicks(entry_price),
+                exit_price: PriceTicks(exit_price),
+                requested_quantity: Quantity(10),
+                entry_filled_quantity: 10,
+                exit_filled_quantity: 10,
+                entry_fee_pico_bps: 0,
+                exit_fee_pico_bps: 0,
+                exit_cost_pico_bps: 0,
+                funding_cost_pico_bps: 0,
+                deadline_risk_pico_bps: 0,
+                entry_at_ms: 1,
+                exit_at_ms: 2,
+                deadline_ms: 3,
+            },
+        )
+    }
+
     pub(crate) fn frame(now: u64) -> EvidenceFrame {
         let anchor = Anchor::new("a", "equity", PriceTicks(100_000), 0, 10_000, "digest").unwrap();
         let window = ClosedWindow::new(100, 9_000, 9_500, 10_000).unwrap();
@@ -292,33 +315,25 @@ mod tests {
             max_age_ms: 100,
             digest: "rules".into(),
         };
-        let outcome = OutcomeDistribution {
+        let uncertainty = UncertaintyBudget {
+            anchor_pico_bps: 0,
+            execution_pico_bps: 500_000_000,
+            timing_pico_bps: 0,
+            model_pico_bps: 500_000_000,
+        };
+        let buy_outcome = OutcomeDistribution {
             scenarios: vec![
-                OutcomeScenario {
-                    weight_bps: 5_000,
-                    gross_anchor_pnl_pico_bps: 20_000_000_000,
-                    fee_cost_pico_bps: 0,
-                    funding_cost_pico_bps: 0,
-                    exit_cost_pico_bps: 0,
-                    deadline_risk_pico_bps: 0,
-                    terminal: true,
-                },
-                OutcomeScenario {
-                    weight_bps: 5_000,
-                    gross_anchor_pnl_pico_bps: 10_000_000_000,
-                    fee_cost_pico_bps: 0,
-                    funding_cost_pico_bps: 0,
-                    exit_cost_pico_bps: 0,
-                    deadline_risk_pico_bps: 0,
-                    terminal: true,
-                },
+                cycle(Side::Buy, 98_000, 100_000),
+                cycle(Side::Buy, 98_000, 99_000),
             ],
-            uncertainty: UncertaintyBudget {
-                anchor_pico_bps: 0,
-                execution_pico_bps: 500_000_000,
-                timing_pico_bps: 0,
-                model_pico_bps: 500_000_000,
-            },
+            uncertainty,
+        };
+        let sell_outcome = OutcomeDistribution {
+            scenarios: vec![
+                cycle(Side::Sell, 102_000, 100_000),
+                cycle(Side::Sell, 102_000, 101_000),
+            ],
+            uncertainty,
         };
         let mut calibration_state = crate::calibration::CalibrationState::new(
             String::from_utf8(vec![66, 84, 67, 85, 83, 68, 84]).unwrap(),
@@ -328,7 +343,7 @@ mod tests {
             calibration_state
                 .observe(crate::calibration::CalibrationObservation {
                     event_at_ms: i as u64 + 1,
-                    side: Side::Buy,
+                    side: if i % 2 == 0 { Side::Buy } else { Side::Sell },
                     attempted_quantity: 10,
                     filled_quantity: 5,
                     markout_pico_bps: Some(20_000_000_000),
@@ -357,18 +372,10 @@ mod tests {
             funding_known: true,
             model_version: "model-v1".into(),
             calibration: calibration_state.snapshot().unwrap(),
-            buy_outcome: outcome.clone(),
-            sell_outcome: outcome,
+            buy_outcome,
+            sell_outcome,
             wait_outcome: OutcomeDistribution {
-                scenarios: vec![OutcomeScenario {
-                    weight_bps: 10_000,
-                    gross_anchor_pnl_pico_bps: 0,
-                    fee_cost_pico_bps: 0,
-                    funding_cost_pico_bps: 0,
-                    exit_cost_pico_bps: 0,
-                    deadline_risk_pico_bps: 0,
-                    terminal: true,
-                }],
+                scenarios: vec![OutcomeScenario::wait(10_000, 0)],
                 uncertainty: UncertaintyBudget {
                     anchor_pico_bps: 0,
                     execution_pico_bps: 0,
@@ -423,22 +430,18 @@ mod wait_competition_tests {
             .unwrap()
             .decision_snapshot()
             .unwrap();
-        for scenario in &mut evidence.buy_outcome.scenarios {
-            scenario.gross_anchor_pnl_pico_bps = -1;
-        }
-        for scenario in &mut evidence.sell_outcome.scenarios {
-            scenario.gross_anchor_pnl_pico_bps = -1;
-        }
+        evidence.buy_outcome = OutcomeDistribution {
+            scenarios: vec![OutcomeScenario::wait(10_000, -1)],
+            uncertainty: UncertaintyBudget {
+                anchor_pico_bps: 0,
+                execution_pico_bps: 0,
+                timing_pico_bps: 0,
+                model_pico_bps: 0,
+            },
+        };
+        evidence.sell_outcome = evidence.buy_outcome.clone();
         evidence.wait_outcome = OutcomeDistribution {
-            scenarios: vec![OutcomeScenario {
-                weight_bps: 10_000,
-                gross_anchor_pnl_pico_bps: 0,
-                fee_cost_pico_bps: 0,
-                funding_cost_pico_bps: 0,
-                exit_cost_pico_bps: 0,
-                deadline_risk_pico_bps: 0,
-                terminal: true,
-            }],
+            scenarios: vec![OutcomeScenario::wait(10_000, 0)],
             uncertainty: UncertaintyBudget {
                 anchor_pico_bps: 0,
                 execution_pico_bps: 0,
