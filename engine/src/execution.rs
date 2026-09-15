@@ -1,4 +1,4 @@
-use crate::model::{CandidateOrder, ModelError, Side, ValidatedOrder};
+use crate::model::{CandidateOrder, ModelError, Side, TimeInForce, ValidatedOrder};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,9 +101,11 @@ pub trait ExecutionPort {
 pub struct NoUnscopedAggressor;
 
 pub fn assert_maker(order: &CandidateOrder) -> Result<(), NoUnscopedAggressor> {
-    if order.reduce_only {
+    if order.reduce_only
+        || (order.time_in_force == TimeInForce::Gtx && order.trigger_price.is_none())
+    {
         Ok(())
     } else {
-        Ok(())
+        Err(NoUnscopedAggressor)
     }
 }

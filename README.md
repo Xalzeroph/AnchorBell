@@ -54,3 +54,28 @@ Run from the repository root:
 
 The last command prints the build and plan identity; it does not connect to an
 exchange and does not submit an order.
+
+## Calibration and Binance legality
+
+Calibration is not a bootstrap constant. CalibrationState is an ordered bounded
+log of observed attempts, fills and signed conditional markouts. It has a schema
+and model version, JSON persistence, replay validation and a SHA-256 evidence
+digest. Before 30 effective observations with markouts, no CalibrationSnapshot
+exists and the entry policy cannot admit new risk.
+
+The Binance contract model explicitly validates position mode and positionSide,
+post-only GTX time-in-force, reduce-only and closePosition support, conditional
+order support, priceProtect/triggerProtect semantics, current filters, contract
+freshness and remaining rate-limit budget. A CandidateOrder that fails any of
+these checks cannot become a ValidatedOrder.
+
+The calibrated executable value is:
+
+    V_path = weighted(gross_anchor_pnl - fee - funding - exit - deadline_risk)
+    U = U_anchor + U_execution + U_timing + U_model
+    L = floor(V_path) - U
+    V_exec = floor(L * fill_probability / 10000) + robust_markout_lower
+
+with all terms represented as integer pico-basis-points. This is conditional on
+causal evidence and is only compared against wait after the closed-window,
+contract and account gates pass.

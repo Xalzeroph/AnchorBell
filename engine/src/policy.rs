@@ -80,7 +80,6 @@ pub enum DecisionReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PolicyLimits {
     pub requested_quantity: i64,
-    pub minimum_robust_value_pico_bps: i64,
 }
 
 pub struct DecisionEngine {
@@ -122,48 +121,47 @@ impl DecisionEngine {
         }
         let buy = self.entry(frame, Side::Buy, &frame.buy_outcome);
         let sell = self.entry(frame, Side::Sell, &frame.sell_outcome);
+        let wait_value = match frame.wait_outcome.lower_value() {
+            Some(value) => value,
+            None => {
+                return Decision::Wait {
+                    reason: DecisionReason::IncompleteEvidence,
+                };
+            }
+        };
         match (buy, sell) {
-            (Some((b, bv)), Some((_s, sv)))
-                if bv >= sv && bv > self.limits.minimum_robust_value_pico_bps =>
-            {
+            (Some((b, bv)), Some((_s, sv))) if bv >= sv && bv > wait_value => {
                 Decision::PlaceMaker {
                     order: b,
                     robust_value_pico_bps: bv,
                 }
             }
-            (Some((b, bv)), Some((_s, sv)))
-                if bv > self.limits.minimum_robust_value_pico_bps && bv > sv =>
-            {
-                Decision::PlaceMaker {
-                    order: b,
-                    robust_value_pico_bps: bv,
-                }
-            }
-            (Some((b, bv)), None) if bv > self.limits.minimum_robust_value_pico_bps => {
-                Decision::PlaceMaker {
-                    order: b,
-                    robust_value_pico_bps: bv,
-                }
-            }
-            (None, Some((s, sv))) if sv > self.limits.minimum_robust_value_pico_bps => {
-                Decision::PlaceMaker {
-                    order: s,
-                    robust_value_pico_bps: sv,
-                }
-            }
+            (Some((_b, bv)), Some((s, sv))) if sv > bv && sv > wait_value => Decision::PlaceMaker {
+                order: s,
+                robust_value_pico_bps: sv,
+            },
+            (Some((b, bv)), None) if bv > wait_value => Decision::PlaceMaker {
+                order: b,
+                robust_value_pico_bps: bv,
+            },
+            (None, Some((s, sv))) if sv > wait_value => Decision::PlaceMaker {
+                order: s,
+                robust_value_pico_bps: sv,
+            },
             _ => Decision::Wait {
                 reason: DecisionReason::NoRobustEdge,
             },
         }
     }
-
     fn entry(
         &self,
         frame: &EvidenceFrame,
         side: Side,
         outcome: &OutcomeDistribution,
     ) -> Option<(ValidatedOrder, i64)> {
-        let value = outcome.lower_value()?;
+        let value = frame
+            .calibration
+            .robust_executable_value(outcome.lower_value()?);
         let remaining = match side {
             Side::Buy => frame
                 .account
@@ -184,6 +182,12 @@ impl DecisionEngine {
             price: frame.market.book.passive_price(side),
             quantity: crate::model::Quantity(quantity),
             reduce_only: false,
+            position_side: crate::model::PositionSide::Both,
+            time_in_force: crate::model::TimeInForce::Gtx,
+            working_type: crate::model::WorkingType::ContractPrice,
+            price_protect: false,
+            trigger_price: None,
+            close_position: false,
         };
         frame
             .contract
@@ -210,6 +214,12 @@ impl DecisionEngine {
             price: frame.market.book.passive_price(side),
             quantity: crate::model::Quantity(quantity),
             reduce_only: true,
+            position_side: crate::model::PositionSide::Both,
+            time_in_force: crate::model::TimeInForce::Gtx,
+            working_type: crate::model::WorkingType::ContractPrice,
+            price_protect: false,
+            trigger_price: None,
+            close_position: false,
         };
         match frame
             .contract
@@ -244,7 +254,7 @@ mod tests {
     use super::*;
     use crate::model::*;
 
-    fn frame(now: u64) -> EvidenceFrame {
+    pub(crate) fn frame(now: u64) -> EvidenceFrame {
         let anchor = Anchor::new("a", "equity", PriceTicks(100_000), 0, 10_000, "digest").unwrap();
         let window = ClosedWindow::new(100, 9_000, 9_500, 10_000).unwrap();
         let episode = AnchorEpisode::new("ep", anchor, window, Some(9_400)).unwrap();
@@ -273,6 +283,11 @@ mod tests {
             min_notional_ticks: 1,
             position_mode: PositionMode::OneWay,
             post_only_supported: true,
+            reduce_only_supported: true,
+            close_position_supported: true,
+            conditional_orders_supported: false,
+            trigger_protect_bps: 0,
+            rate_limit_remaining: 100,
             observed_at_ms: now,
             max_age_ms: 100,
             digest: "rules".into(),
@@ -281,17 +296,45 @@ mod tests {
             scenarios: vec![
                 OutcomeScenario {
                     weight_bps: 5_000,
-                    pnl_pico_bps: 20_000_000_000,
+                    gross_anchor_pnl_pico_bps: 20_000_000_000,
+                    fee_cost_pico_bps: 0,
+                    funding_cost_pico_bps: 0,
+                    exit_cost_pico_bps: 0,
+                    deadline_risk_pico_bps: 0,
                     terminal: true,
                 },
                 OutcomeScenario {
                     weight_bps: 5_000,
-                    pnl_pico_bps: 10_000_000_000,
+                    gross_anchor_pnl_pico_bps: 10_000_000_000,
+                    fee_cost_pico_bps: 0,
+                    funding_cost_pico_bps: 0,
+                    exit_cost_pico_bps: 0,
+                    deadline_risk_pico_bps: 0,
                     terminal: true,
                 },
             ],
-            uncertainty_pico_bps: 1_000_000_000,
+            uncertainty: UncertaintyBudget {
+                anchor_pico_bps: 0,
+                execution_pico_bps: 500_000_000,
+                timing_pico_bps: 0,
+                model_pico_bps: 500_000_000,
+            },
         };
+        let mut calibration_state = crate::calibration::CalibrationState::new(
+            String::from_utf8(vec![66, 84, 67, 85, 83, 68, 84]).unwrap(),
+        )
+        .unwrap();
+        for i in 0..crate::calibration::MIN_EFFECTIVE_SAMPLES {
+            calibration_state
+                .observe(crate::calibration::CalibrationObservation {
+                    event_at_ms: i as u64 + 1,
+                    side: Side::Buy,
+                    attempted_quantity: 10,
+                    filled_quantity: 5,
+                    markout_pico_bps: Some(20_000_000_000),
+                })
+                .unwrap();
+        }
         EvidenceFrame {
             now_ms: now,
             episode,
@@ -313,8 +356,26 @@ mod tests {
             calendar_known: true,
             funding_known: true,
             model_version: "model-v1".into(),
+            calibration: calibration_state.snapshot().unwrap(),
             buy_outcome: outcome.clone(),
             sell_outcome: outcome,
+            wait_outcome: OutcomeDistribution {
+                scenarios: vec![OutcomeScenario {
+                    weight_bps: 10_000,
+                    gross_anchor_pnl_pico_bps: 0,
+                    fee_cost_pico_bps: 0,
+                    funding_cost_pico_bps: 0,
+                    exit_cost_pico_bps: 0,
+                    deadline_risk_pico_bps: 0,
+                    terminal: true,
+                }],
+                uncertainty: UncertaintyBudget {
+                    anchor_pico_bps: 0,
+                    execution_pico_bps: 0,
+                    timing_pico_bps: 0,
+                    model_pico_bps: 0,
+                },
+            },
         }
     }
 
@@ -324,7 +385,6 @@ mod tests {
             plan: StrategyPlan::anchor_closed_maker("plan-v1"),
             limits: PolicyLimits {
                 requested_quantity: 10,
-                minimum_robust_value_pico_bps: 1,
             },
         };
         assert!(matches!(
@@ -339,13 +399,63 @@ mod tests {
             plan: StrategyPlan::anchor_closed_maker("plan-v1"),
             limits: PolicyLimits {
                 requested_quantity: 10,
-                minimum_robust_value_pico_bps: 1,
             },
         };
         assert_eq!(
             engine.decide(&frame(9_600)),
             Decision::Wait {
                 reason: DecisionReason::OutsideEntryWindow
+            }
+        );
+    }
+}
+
+#[cfg(test)]
+mod wait_competition_tests {
+    use super::*;
+    use crate::calibration::CalibrationState;
+    use crate::model::{OutcomeScenario, UncertaintyBudget};
+
+    #[test]
+    fn wait_is_an_explicit_competing_action() {
+        let mut evidence = super::tests::frame(200);
+        evidence.calibration = CalibrationState::new("BTCUSDT")
+            .unwrap()
+            .decision_snapshot()
+            .unwrap();
+        for scenario in &mut evidence.buy_outcome.scenarios {
+            scenario.gross_anchor_pnl_pico_bps = -1;
+        }
+        for scenario in &mut evidence.sell_outcome.scenarios {
+            scenario.gross_anchor_pnl_pico_bps = -1;
+        }
+        evidence.wait_outcome = OutcomeDistribution {
+            scenarios: vec![OutcomeScenario {
+                weight_bps: 10_000,
+                gross_anchor_pnl_pico_bps: 0,
+                fee_cost_pico_bps: 0,
+                funding_cost_pico_bps: 0,
+                exit_cost_pico_bps: 0,
+                deadline_risk_pico_bps: 0,
+                terminal: true,
+            }],
+            uncertainty: UncertaintyBudget {
+                anchor_pico_bps: 0,
+                execution_pico_bps: 0,
+                timing_pico_bps: 0,
+                model_pico_bps: 0,
+            },
+        };
+        let engine = DecisionEngine {
+            plan: StrategyPlan::anchor_closed_maker("plan-v1"),
+            limits: PolicyLimits {
+                requested_quantity: 10,
+            },
+        };
+        assert_eq!(
+            engine.decide(&evidence),
+            Decision::Wait {
+                reason: DecisionReason::NoRobustEdge
             }
         );
     }

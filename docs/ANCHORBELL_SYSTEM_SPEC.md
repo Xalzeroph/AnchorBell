@@ -127,3 +127,66 @@ Release proof: every entry traces to AnchorId, ClosedWindow and contract digest;
 every field has freshness, source and event id; live and replay agree; partial
 fills, cancel races, unknown orders and position mismatches are tested; Unknown
 never creates risk. The model cannot guarantee profit, but makes every profit
+
+## 6. Calibration contract
+
+CalibrationState is the only source for learned execution quantities. It stores
+ordered observations of attempted quantity, confirmed fill quantity and signed
+conditional markout. The state is bounded, versioned and serializable. Loading a
+state requires identity validation and replay equality; malformed, reordered or
+An admitted historical snapshot is unavailable until 30 effective observations, including 30 markouts, exist. Before that point only a ColdStart snapshot with zero historical influence exists. Therefore no prior, bootstrap value or hand-written fallback can create new risk.
+
+For a path lower value L, fill probability p and robust conditional markout m,
+the executable lower value is
+
+    V_exec = floor(L * p / 10000) + m.
+
+The policy uses V_exec for both long and short candidates, so direction is a
+property of the signed anchor residual and the validated outcome path, not a
+separate long-only or short-only rule.
+
+## 7. Binance legality contract
+
+BinanceContract and CandidateOrder jointly represent the exchange rule surface.
+The validator checks status and freshness, PRICE_FILTER, LOT_SIZE, notional,
+post-only GTX, position mode/positionSide, reduce-only, closePosition,
+conditional-order support, priceProtect/triggerProtect and rate limit budget.
+A rule mismatch produces no validated order. The model records workingType
+explicitly even when an ordinary passive limit has no trigger; this prevents
+conditional-order semantics from being silently invented by adapters.
+
+## 8. Outcome semantics and action competition
+
+OutcomeScenario is a complete terminal path, not a single price difference. Its
+net value is
+
+    N = gross_anchor_convergence
+        - fee_cost
+        - funding_cost
+        - exit_cost
+        - deadline_risk_cost.
+
+OutcomeDistribution requires positive scenario weights summing to 10000 basis
+points and every scenario to be terminal. Each scenario net value is:
+
+    N_i = gross_anchor_pnl_i - fee_i - funding_i - exit_i - deadline_risk_i.
+
+The uncertainty is a typed budget, not a black-box threshold:
+
+    U = U_anchor + U_execution + U_timing + U_model
+    L = floor(sum(weight_i * N_i) / 10000) - U.
+
+Each component must be non-negative and represent a distinct information
+failure or execution risk. The lower value is therefore auditable: a decision
+can identify whether its edge is consumed by anchor uncertainty, fill/queue
+uncertainty, timing uncertainty, or model uncertainty.
+
+The old minimum-over-scenarios rule is not used because it discarded the
+probability information and made any tiny tail scenario dominate all decisions.
+Missing costs, nonterminal paths and invalid weights remain a hard rejection;
+they are never converted to zero.
+
+Wait is a first-class action with its own terminal outcome distribution. An
+entry is admitted only when its calibrated executable lower value is strictly
+greater than Wait and greater than the opposite direction. There is no
+independent minimum-profit hyperparameter in the decision gate.

@@ -109,6 +109,16 @@ impl Anchor {
         }
         Ok(value)
     }
+    pub fn residual_pico_bps(&self, fair_price: PriceTicks) -> Option<i64> {
+        if fair_price.0 <= 0 {
+            return None;
+        }
+        let residual =
+            (i128::from(self.price.0) - i128::from(fair_price.0)).checked_mul(PICO_BPS_SCALE)?;
+        let residual = floor_div_positive(residual, i128::from(self.price.0))?;
+        i64::try_from(residual).ok()
+    }
+
     pub fn valid_at(&self, now_ms: u64) -> bool {
         now_ms >= self.observed_at_ms && now_ms < self.valid_until_ms
     }
@@ -235,6 +245,27 @@ pub enum PositionMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PositionSide {
+    Both,
+    Long,
+    Short,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TimeInForce {
+    Gtc,
+    Ioc,
+    Fok,
+    Gtx,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkingType {
+    MarkPrice,
+    ContractPrice,
+    IndexPrice,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PriceFilter {
     pub min: PriceTicks,
     pub max: PriceTicks,
@@ -258,6 +289,11 @@ pub struct BinanceContract {
     pub min_notional_ticks: i128,
     pub position_mode: PositionMode,
     pub post_only_supported: bool,
+    pub reduce_only_supported: bool,
+    pub close_position_supported: bool,
+    pub conditional_orders_supported: bool,
+    pub trigger_protect_bps: u16,
+    pub rate_limit_remaining: u32,
     pub observed_at_ms: u64,
     pub max_age_ms: u64,
     pub digest: String,
@@ -275,11 +311,34 @@ impl BinanceContract {
         if self.symbol != order.symbol
             || self.status != ContractStatus::Trading
             || !self.post_only_supported
+            || self.rate_limit_remaining == 0
             || self.digest.is_empty()
             || now_ms < self.observed_at_ms
             || now_ms - self.observed_at_ms > self.max_age_ms
         {
             return Err(ModelError::ContractUnavailable);
+        }
+        let valid_position_side = match self.position_mode {
+            PositionMode::OneWay => order.position_side == PositionSide::Both,
+            PositionMode::Hedge => order.position_side != PositionSide::Both,
+        };
+        if !valid_position_side
+            || order.time_in_force != TimeInForce::Gtx
+            || (order.reduce_only && !self.reduce_only_supported)
+            || (order.close_position && !self.close_position_supported)
+            || (order.close_position && !order.reduce_only)
+        {
+            return Err(ModelError::InvalidOrderSemantics);
+        }
+        if let Some(trigger_price) = order.trigger_price {
+            if !self.conditional_orders_supported
+                || trigger_price.0 <= 0
+                || (order.price_protect && self.trigger_protect_bps == 0)
+            {
+                return Err(ModelError::InvalidOrderSemantics);
+            }
+        } else if order.price_protect {
+            return Err(ModelError::InvalidOrderSemantics);
         }
         if order.price.0 < self.price_filter.min.0
             || order.price.0 > self.price_filter.max.0
@@ -365,6 +424,12 @@ pub struct CandidateOrder {
     pub price: PriceTicks,
     pub quantity: Quantity,
     pub reduce_only: bool,
+    pub position_side: PositionSide,
+    pub time_in_force: TimeInForce,
+    pub working_type: WorkingType,
+    pub price_protect: bool,
+    pub trigger_price: Option<PriceTicks>,
+    pub close_position: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -377,36 +442,111 @@ pub struct ValidatedOrder {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutcomeScenario {
     pub weight_bps: u16,
-    pub pnl_pico_bps: i64,
+    pub gross_anchor_pnl_pico_bps: i64,
+    pub fee_cost_pico_bps: i64,
+    pub funding_cost_pico_bps: i64,
+    pub exit_cost_pico_bps: i64,
+    pub deadline_risk_pico_bps: i64,
     pub terminal: bool,
+}
+
+pub fn floor_div_positive(numerator: i128, denominator: i128) -> Option<i128> {
+    if denominator <= 0 {
+        return None;
+    }
+    let quotient = numerator / denominator;
+    let remainder = numerator % denominator;
+    if remainder != 0 && numerator < 0 {
+        quotient.checked_sub(1)
+    } else {
+        Some(quotient)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UncertaintyBudget {
+    pub anchor_pico_bps: i64,
+    pub execution_pico_bps: i64,
+    pub timing_pico_bps: i64,
+    pub model_pico_bps: i64,
+}
+
+impl UncertaintyBudget {
+    pub fn total(self) -> Option<i64> {
+        let mut total = 0_i128;
+        for component in [
+            self.anchor_pico_bps,
+            self.execution_pico_bps,
+            self.timing_pico_bps,
+            self.model_pico_bps,
+        ] {
+            if component < 0 {
+                return None;
+            }
+            total = total.checked_add(i128::from(component))?;
+        }
+        i64::try_from(total).ok()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutcomeDistribution {
     pub scenarios: Vec<OutcomeScenario>,
-    pub uncertainty_pico_bps: i64,
+    pub uncertainty: UncertaintyBudget,
 }
 
 impl OutcomeDistribution {
     pub fn lower_value(&self) -> Option<i64> {
-        if self.scenarios.is_empty()
-            || self.uncertainty_pico_bps < 0
-            || self
-                .scenarios
-                .iter()
-                .any(|s| s.weight_bps == 0 || s.pnl_pico_bps == i64::MIN)
+        let uncertainty = self.uncertainty.total()?;
+        let weighted_sum = self.weighted_net_sum(true)?;
+        let weighted_value = floor_div_positive(weighted_sum, 10_000)?;
+        let lower = weighted_value.checked_sub(i128::from(uncertainty))?;
+        i64::try_from(lower).ok()
+    }
+
+    pub fn expected_net_value(&self) -> Option<i64> {
+        let weighted_sum = self.weighted_net_sum(true)?;
+        i64::try_from(floor_div_positive(weighted_sum, 10_000)?).ok()
+    }
+
+    fn weighted_net_sum(&self, require_terminal: bool) -> Option<i128> {
+        if self.scenarios.is_empty() {
+            return None;
+        }
+        let total = self.scenarios.iter().try_fold(0_u32, |sum, scenario| {
+            sum.checked_add(u32::from(scenario.weight_bps))
+        })?;
+        if total != 10_000
+            || self.scenarios.iter().any(|scenario| {
+                scenario.weight_bps == 0 || (require_terminal && !scenario.terminal)
+            })
         {
             return None;
         }
-        let total: u32 = self.scenarios.iter().map(|s| u32::from(s.weight_bps)).sum();
-        if total != 10_000 {
+        self.scenarios.iter().try_fold(0_i128, |sum, scenario| {
+            let value = scenario.net_value()?;
+            sum.checked_add(i128::from(scenario.weight_bps) * value)
+        })
+    }
+}
+
+impl OutcomeScenario {
+    pub fn net_value(&self) -> Option<i128> {
+        if self.gross_anchor_pnl_pico_bps == i64::MIN
+            || self.fee_cost_pico_bps < 0
+            || self.funding_cost_pico_bps < 0
+            || self.exit_cost_pico_bps < 0
+            || self.deadline_risk_pico_bps < 0
+        {
             return None;
         }
-        self.scenarios
-            .iter()
-            .map(|s| s.pnl_pico_bps)
-            .min()
-            .map(|v| v.saturating_sub(self.uncertainty_pico_bps))
+        Some(
+            i128::from(self.gross_anchor_pnl_pico_bps)
+                - i128::from(self.fee_cost_pico_bps)
+                - i128::from(self.funding_cost_pico_bps)
+                - i128::from(self.exit_cost_pico_bps)
+                - i128::from(self.deadline_risk_pico_bps),
+        )
     }
 }
 
@@ -421,8 +561,10 @@ pub struct EvidenceFrame {
     pub calendar_known: bool,
     pub funding_known: bool,
     pub model_version: String,
+    pub calibration: crate::calibration::CalibrationSnapshot,
     pub buy_outcome: OutcomeDistribution,
     pub sell_outcome: OutcomeDistribution,
+    pub wait_outcome: OutcomeDistribution,
 }
 
 impl EvidenceFrame {
@@ -432,6 +574,8 @@ impl EvidenceFrame {
             && self.funding_known
             && self.account.reconciled
             && !self.model_version.is_empty()
+            && self.calibration.validate().is_ok()
+            && self.wait_outcome.lower_value().is_some()
     }
 }
 
@@ -449,5 +593,201 @@ pub enum ModelError {
     WouldTakeLiquidity,
     InvalidReduceOnly,
     PositionLimit,
+    InvalidOrderSemantics,
+    RateLimit,
     IncompleteEvidence,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixtures() -> (BinanceContract, Book, AccountSnapshot, CandidateOrder) {
+        (
+            BinanceContract {
+                symbol: "BTCUSDT".into(),
+                status: ContractStatus::Trading,
+                contract_type: "PERPETUAL".into(),
+                price_filter: PriceFilter {
+                    min: PriceTicks(1),
+                    max: PriceTicks(1_000_000),
+                    tick: 1,
+                },
+                quantity_filter: QuantityFilter {
+                    min: Quantity(1),
+                    max: Quantity(1_000),
+                    step: 1,
+                },
+                min_notional_ticks: 1,
+                position_mode: PositionMode::OneWay,
+                post_only_supported: true,
+                reduce_only_supported: true,
+                close_position_supported: true,
+                conditional_orders_supported: false,
+                trigger_protect_bps: 0,
+                rate_limit_remaining: 10,
+                observed_at_ms: 1,
+                max_age_ms: 100,
+                digest: "contract-digest".into(),
+            },
+            Book {
+                bid: PriceTicks(99),
+                ask: PriceTicks(101),
+                bid_quantity: Quantity(100),
+                ask_quantity: Quantity(100),
+                observed_at_ms: 1,
+                sequence: 1,
+            },
+            AccountSnapshot {
+                position: 0,
+                max_position: 100,
+                reconciled: true,
+                margin_available_ppm: 1_000_000,
+            },
+            CandidateOrder {
+                symbol: "BTCUSDT".into(),
+                side: Side::Buy,
+                price: PriceTicks(99),
+                quantity: Quantity(1),
+                reduce_only: false,
+                position_side: PositionSide::Both,
+                time_in_force: TimeInForce::Gtx,
+                working_type: WorkingType::ContractPrice,
+                price_protect: false,
+                trigger_price: None,
+                close_position: false,
+            },
+        )
+    }
+
+    #[test]
+    fn binance_order_semantics_are_hard_gates() {
+        let (contract, book, account, order) = fixtures();
+        assert!(contract.validate(order.clone(), book, account, 1).is_ok());
+
+        let mut non_post_only = order.clone();
+        non_post_only.time_in_force = TimeInForce::Gtc;
+        assert_eq!(
+            contract.validate(non_post_only, book, account, 1),
+            Err(ModelError::InvalidOrderSemantics)
+        );
+
+        let mut wrong_position_side = order.clone();
+        wrong_position_side.position_side = PositionSide::Long;
+        assert_eq!(
+            contract.validate(wrong_position_side, book, account, 1),
+            Err(ModelError::InvalidOrderSemantics)
+        );
+
+        let mut unsupported_trigger = order;
+        unsupported_trigger.trigger_price = Some(PriceTicks(100));
+        assert_eq!(
+            contract.validate(unsupported_trigger, book, account, 1),
+            Err(ModelError::InvalidOrderSemantics)
+        );
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+
+    #[test]
+    fn floor_division_is_a_true_lower_bound_for_negative_values() {
+        assert_eq!(floor_div_positive(-1, 10_000), Some(-1));
+        assert_eq!(floor_div_positive(-10_000, 10_000), Some(-1));
+        assert_eq!(floor_div_positive(10_001, 10_000), Some(1));
+        assert_eq!(floor_div_positive(1, 0), None);
+    }
+
+    #[test]
+    fn uncertainty_budget_is_decomposable_and_rejects_negative() {
+        let budget = UncertaintyBudget {
+            anchor_pico_bps: 2,
+            execution_pico_bps: 3,
+            timing_pico_bps: 5,
+            model_pico_bps: 7,
+        };
+        assert_eq!(budget.total(), Some(17));
+        assert_eq!(
+            UncertaintyBudget {
+                anchor_pico_bps: -1,
+                execution_pico_bps: 0,
+                timing_pico_bps: 0,
+                model_pico_bps: 0,
+            }
+            .total(),
+            None
+        );
+    }
+
+    #[test]
+    fn lower_value_uses_all_probabilities_and_costs() {
+        let distribution = OutcomeDistribution {
+            scenarios: vec![
+                OutcomeScenario {
+                    weight_bps: 5_000,
+                    gross_anchor_pnl_pico_bps: 100,
+                    fee_cost_pico_bps: 10,
+                    funding_cost_pico_bps: 0,
+                    exit_cost_pico_bps: 0,
+                    deadline_risk_pico_bps: 0,
+                    terminal: true,
+                },
+                OutcomeScenario {
+                    weight_bps: 5_000,
+                    gross_anchor_pnl_pico_bps: 0,
+                    fee_cost_pico_bps: 0,
+                    funding_cost_pico_bps: 0,
+                    exit_cost_pico_bps: 0,
+                    deadline_risk_pico_bps: 0,
+                    terminal: true,
+                },
+            ],
+            uncertainty: UncertaintyBudget {
+                anchor_pico_bps: 2,
+                execution_pico_bps: 3,
+                timing_pico_bps: 1,
+                model_pico_bps: 4,
+            },
+        };
+        assert_eq!(distribution.expected_net_value(), Some(45));
+        assert_eq!(distribution.lower_value(), Some(35));
+    }
+
+    #[test]
+    fn incomplete_path_is_not_silently_zero() {
+        let distribution = OutcomeDistribution {
+            scenarios: vec![OutcomeScenario {
+                weight_bps: 10_000,
+                gross_anchor_pnl_pico_bps: 100,
+                fee_cost_pico_bps: 0,
+                funding_cost_pico_bps: 0,
+                exit_cost_pico_bps: 0,
+                deadline_risk_pico_bps: 0,
+                terminal: false,
+            }],
+            uncertainty: UncertaintyBudget {
+                anchor_pico_bps: 0,
+                execution_pico_bps: 0,
+                timing_pico_bps: 0,
+                model_pico_bps: 0,
+            },
+        };
+        assert_eq!(distribution.lower_value(), None);
+        assert_eq!(distribution.expected_net_value(), None);
+    }
+
+    #[test]
+    fn anchor_residual_is_signed_against_fair_price() {
+        let anchor = Anchor::new("a", "equity", PriceTicks(110), 1, 10, "digest").unwrap();
+        assert_eq!(
+            anchor.residual_pico_bps(PriceTicks(100)),
+            Some(90_909_090_909)
+        );
+        assert_eq!(
+            anchor.residual_pico_bps(PriceTicks(120)),
+            Some(-90_909_090_910)
+        );
+    }
 }
