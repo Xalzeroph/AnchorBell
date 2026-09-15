@@ -11,6 +11,8 @@ use serde_json::Error as SerializationError;
 
 #[derive(Debug)]
 pub enum RuntimeError {
+    Calibration(CalibrationError),
+    CalibrationMismatch,
     EvidenceSerialization(SerializationError),
     Ledger(LedgerError),
 }
@@ -58,6 +60,13 @@ impl TradingEngine {
     }
 
     pub fn evaluate(&mut self, frame: &EvidenceFrame) -> Result<Decision, RuntimeError> {
+        let expected_calibration = self
+            .calibration
+            .decision_snapshot()
+            .map_err(RuntimeError::Calibration)?;
+        if expected_calibration != frame.calibration {
+            return Err(RuntimeError::CalibrationMismatch);
+        }
         let payload = serde_json::to_vec(frame).map_err(RuntimeError::EvidenceSerialization)?;
         self.ledger
             .append(

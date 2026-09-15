@@ -17,6 +17,7 @@ pub enum LedgerError {
     EmptyEventType,
     InvalidEventTime,
     NonMonotonicTime,
+    DuplicateEventId,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +44,9 @@ impl EvidenceLedger {
         }
         if at_ms == 0 {
             return Err(LedgerError::InvalidEventTime);
+        }
+        if self.events.iter().any(|event| event.event_id == event_id) {
+            return Err(LedgerError::DuplicateEventId);
         }
         if self
             .events
@@ -131,5 +135,17 @@ mod tests {
             ledger.append("two", "frame", 1, b"b"),
             Err(LedgerError::NonMonotonicTime)
         );
+    }
+
+    #[test]
+    fn ledger_rejects_duplicate_event_ids() {
+        let mut ledger = EvidenceLedger::default();
+        ledger.append("one", "frame", 1, b"a").unwrap();
+        assert_eq!(
+            ledger.append("one", "frame", 2, b"b"),
+            Err(LedgerError::DuplicateEventId)
+        );
+        assert!(ledger.verify());
+        assert_eq!(ledger.events.len(), 1);
     }
 }

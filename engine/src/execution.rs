@@ -75,7 +75,11 @@ impl OrderRecord {
         {
             return Err(ModelError::IncompleteEvidence);
         }
+        let recovering_unknown = self.state == OrderState::Unknown
+            && event.state != OrderState::Unknown
+            && matches!(event.authority, Authority::Exchange | Authority::Replay);
         if event.state != OrderState::Unknown
+            && !recovering_unknown
             && terminal_rank(event.state) < terminal_rank(self.state)
         {
             return Err(ModelError::IncompleteEvidence);
@@ -227,5 +231,38 @@ mod tests {
             }),
             Err(ModelError::IncompleteEvidence)
         );
+    }
+
+    #[test]
+    fn unknown_state_can_be_recovered_by_authoritative_update() {
+        let mut order = record();
+        order
+            .apply(OrderEvent {
+                event_id: "unknown".into(),
+                order_id: "order-1".into(),
+                symbol: "BTCUSDT".into(),
+                state: OrderState::Unknown,
+                authority: Authority::Local,
+                event_at_ms: 2,
+                cumulative_quantity: 0,
+                traded_through_quantity: None,
+                observed_latency_ms: None,
+            })
+            .unwrap();
+        order
+            .apply(OrderEvent {
+                event_id: "accepted".into(),
+                order_id: "order-1".into(),
+                symbol: "BTCUSDT".into(),
+                state: OrderState::Accepted,
+                authority: Authority::Exchange,
+                event_at_ms: 3,
+                cumulative_quantity: 0,
+                traded_through_quantity: None,
+                observed_latency_ms: None,
+            })
+            .unwrap();
+        assert_eq!(order.state, OrderState::Accepted);
+        assert_eq!(order.last_event_at_ms, 3);
     }
 }

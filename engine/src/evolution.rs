@@ -89,8 +89,9 @@ impl PromotionGate {
         if !required_semantics(&challenger.plan) {
             return Err(PromotionRejection::MissingRequiredSemantics);
         }
-        if challenger.robust_value_pico_bps <= champion.robust_value_pico_bps
-            && challenger.simplicity_score >= champion.simplicity_score
+        if challenger.robust_value_pico_bps < champion.robust_value_pico_bps
+            || (challenger.robust_value_pico_bps == champion.robust_value_pico_bps
+                && challenger.simplicity_score >= champion.simplicity_score)
         {
             return Err(PromotionRejection::NotBetterThanChampion);
         }
@@ -150,6 +151,23 @@ mod tests {
         assert_eq!(
             blocked.approve(&artifact("champion", 10), &artifact("challenger", 20)),
             Err(PromotionRejection::InvalidInvariants)
+        );
+    }
+
+    #[test]
+    fn evolution_cannot_trade_robust_value_for_simplicity() {
+        let gate = PromotionGate {
+            invariants: CoreInvariants::immutable(),
+            thresholds: PromotionThresholds {
+                minimum_effective_sample_size: 30,
+                maximum_drawdown_pico_bps: 100,
+            },
+        };
+        let mut simpler_but_worse = artifact("challenger", 9);
+        simpler_but_worse.simplicity_score = 0;
+        assert_eq!(
+            gate.approve(&artifact("champion", 10), &simpler_but_worse),
+            Err(PromotionRejection::NotBetterThanChampion)
         );
     }
 }
