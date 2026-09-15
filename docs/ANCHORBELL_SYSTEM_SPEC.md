@@ -30,11 +30,11 @@ conditional value, and accept only when it beats the robust value of wait:
 
 ## 2. Reality to canonical object
 
-completed external close -> Anchor
-one closed period -> AnchorEpisode
+completed external close plus ClosureEvidence -> Anchor
+one closed period plus bound closure evidence -> AnchorEpisode
 Binance rules at time t -> BinanceContract
 book, index, mark, freshness -> MarketSnapshot
-account and remote orders -> AccountSnapshot
+account, reconciliation time and remote orders -> AccountSnapshot
 proposal -> CandidateOrder
 rule-checked proposal -> ValidatedOrder
 full fill/markout/exit path -> OutcomeDistribution
@@ -45,8 +45,9 @@ evolvable semantic policy -> StrategyPlan
 
 Axiom A0, time and causality: every event has exchange time, sequence when
 available, and unique id; decisions use only F_t; duplicate channels are
-deduplicated; local clocks are timeout guards; drift, gaps or conflicts halt
-new risk.
+deduplicated; an order lifecycle also rejects a repeated event id after later
+progress; local clocks are timeout guards; drift, gaps or conflicts halt new
+risk.
 
 Axiom A1, anchor: the anchor is a completed final close of a specified
 instrument, venue, timezone and date. Calendar and source completion are both
@@ -62,15 +63,21 @@ exit boundary. Unknown calendar facts block entry.
 
 Axiom A3, Binance contract: exchangeInfo, status, contract type, filters,
 precision, position mode and account permission are inputs. Price satisfies
-PRICE_FILTER; quantity satisfies LOT_SIZE; notional satisfies MIN_NOTIONAL or
-NOTIONAL when supplied. Maker proves non-crossing before send. positionSide,
-reduceOnly, closePosition and hedge mode are validated together. mark, index,
+PRICE_FILTER with price modulo tickSize equal to zero and independent min/max
+bounds; quantity satisfies LOT_SIZE with quantity modulo stepSize equal to zero
+and independent min/max bounds; notional satisfies MIN_NOTIONAL and, when supplied by NOTIONAL,
+also stays below the exchange maximum. Maker
+proves non-crossing before send. positionSide, reduceOnly, closePosition and
+hedge mode are validated together. Current open-order capacity and an enabled
+self-trade-prevention mode are required for additional maker risk. mark, index,
 workingType, priceProtect, triggerProtect, rate limits and connection state
 are recorded. A stale or inconsistent contract digest blocks new orders.
 
-Axiom A4, information: bid, ask, depth, trade, index, mark, funding and server
-time are distinct facts. Book snapshot and deltas prove continuity. Core prices
-and quantities use integer minimum units. Freshness belongs to each stream.
+Axiom A4, information: bid, ask, depth, trade, index, mark, funding, account
+state and server time are distinct facts. Book snapshot and deltas prove
+continuity. Core prices and quantities use integer minimum units. Freshness and
+source identity belong to each stream; a previously reconciled account is not
+valid forever.
 Missing is not zero and unknown risk is not no risk.
 
 Axiom A5, execution: exchange events and REST reconciliation are authoritative
@@ -90,10 +97,12 @@ AnchorEpisode contains Anchor, ClosedWindow, BinanceContract, FundingSchedule
 and EpisodeLedger. Its states are Unborn, Eligible, Building, Harvesting,
 Reducing, Flat and Closed. Unknown can only transition to Reconcile or Halt.
 
-EvidenceFrame contains episode, anchor, calendar, funding, contract snapshot,
-continuous book, index/mark/server time, account, remote orders, fees,
-lifecycle, calibration and model version. Facts are stored once; inferences
-cite fact ids. Live, simulation and replay share validation.
+EvidenceFrame contains episode, the explicit ClosureEvidence event, anchor,
+calendar, funding, contract snapshot, continuous book, index/mark/server time,
+account, remote orders, fees, lifecycle, calibration and model version. Closure
+evidence binds the expected close time to an observed event, source digest and
+known calendar state; a bare boolean cannot establish closure. Facts are stored
+once; inferences cite fact ids. Live, simulation and replay share validation.
 
 StrategyPlan means BindAnchor, RequireClosedWindow, MeasureResidual,
 EstimateJointOutcome, AdmitIfRobustValueBeatsWait, QuotePassive,
@@ -142,9 +151,12 @@ split is chronological: the first two thirds are used for training statistics
 and the final third is a holdout. Markout values are sorted only inside each
 statistical calculation; they are never sorted before the temporal split. A
 future regime deterioration therefore revokes admission instead of contaminating
-the training set. Before admission, only a ColdStart snapshot with zero
-historical influence is available. No bootstrap constant or hand-written fallback
-can create new risk.
+the training set. Before admission, an empty state is represented as ColdStart and the policy
+emits calibration_unavailable; a nonempty state that has not passed admission
+is represented as Validating and emits insufficient_history. Both states block
+new risk while preserving reduction and hard-deadline exit paths. No bootstrap
+constant or hand-written fallback can create new risk. When configured, every
+observation is atomically persisted and replay-validated.
 
 After admission, Buy and Sell retain separate attempt, fill-probability and
 robust-markout estimates. For side s, path lower value L, side-specific fill
@@ -159,10 +171,11 @@ short execution are symmetric.
 ## 7. Binance legality contract
 
 BinanceContract and CandidateOrder jointly represent the exchange rule surface.
-The validator checks status and freshness, PRICE_FILTER, LOT_SIZE, notional,
-post-only GTX, position mode/positionSide, reduce-only, closePosition,
-conditional-order support, priceProtect/triggerProtect and rate limit budget.
-A rule mismatch produces no validated order. The model records workingType
+The validator checks status and freshness, PRICE_FILTER modulo tickSize plus min/max bounds,
+LOT_SIZE modulo stepSize plus min/max bounds, notional, post-only GTX, position
+mode/positionSide, reduce-only, closePosition, conditional-order support,
+priceProtect/triggerProtect, open-order capacity, self-trade prevention and
+rate-limit budget. A rule mismatch produces no validated order. The model records workingType
 explicitly even when an ordinary passive limit has no trigger; this prevents
 conditional-order semantics from being silently invented by adapters.
 
@@ -171,8 +184,12 @@ settlement, exchange-reported interval, observation time, freshness bound and
 source digest. Entry completeness requires a fresh schedule; the strategy does
 not infer a funding boundary from a weekday or a fixed eight-hour constant.
 For Hedge Mode, the API-level reduceOnly flag is not sent; the position side
-and closing direction are validated as the reduction proof. One-way and Hedge
-Mode therefore have different explicit order semantics.
+and closing direction are validated as the reduction proof. The account snapshot
+therefore carries a signed One-way position and separate non-negative long and
+short Hedge legs. If both Hedge legs are open, a single-order policy step refuses
+to claim that the net position is flat and emits residual exposure for a
+two-order reconciliation path. One-way and Hedge Mode therefore have different
+explicit order semantics.
 
 ValidatedOrder also records the visible queue ahead at validation time and an
 OrderRoute: PassiveMaker, PassiveReduceOnly or EmergencyReduceOnly. The latter
@@ -183,7 +200,8 @@ execution-port method and cannot be confused with ordinary maker flow.
 
 ExecutionCycle is the typed causal path for an entry action. It records side,
 static anchor price, entry and exit prices, requested quantity, entry and exit
-filled quantities, queue-ahead quantities, entry/exit latency, entry/exit
+filled quantities, queue-ahead quantities, traded-through quantities observed
+after activation, entry/exit latency, entry/exit
 fees, exit cost, funding cost, deadline risk and event times. Gross convergence
 value is derived from those observations rather
 than accepted as a free-standing prediction:
@@ -209,6 +227,10 @@ own quantity q_o and traded-through quantity q_t:
 
     q_fill = min(q_o, max(0, q_t - q_a))
     p_fill = floor(10000 * q_fill / q_o).
+
+ExecutionCycle applies this same bound independently to entry and exit; a
+positive claimed fill without positive causal throughput is invalid. A path
+with no entry fill is not a Cycle and cannot be used as a profitable outcome.
 
 This is a structural fill estimate, not a tuned probability constant. The
 latency is part of the observation boundary, so pre-placement or pre-latency

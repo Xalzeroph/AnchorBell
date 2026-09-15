@@ -1,16 +1,20 @@
 """Conservative retention for sealed simulation market/evidence archives."""
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shutil
 import stat
+import subprocess
 import time
 
-ARCHIVE = re.compile(r"(?:shared-market|evidence-opportunities)\.jsonl\.segment-\d{6,}\.zst")
+ARCHIVE = re.compile(r"(?:shared-market|evidence-opportunities|shared-fx)\.jsonl(?:\.segment-\d{6,})?\.zst")
+RAW_JSONL = re.compile(r"(?:shared-market|evidence-opportunities|shared-fx)\.jsonl")
 RUN = re.compile(r"simulation-.+-run-\d+")
+TERMINAL_STATUSES = frozenset({"completed", "failed"})
 
 
 def regular(path):
@@ -36,6 +40,131 @@ def write_json(path, value):
     sync_directory(path.parent)
 
 
+def sha256_file(path):
+    digest = hashlib.sha256()
+    line_count = 0
+    with path.open("rb") as stream:
+        for line in stream:
+            digest.update(line)
+            line_count += 1
+    return digest.hexdigest(), line_count
+
+
+def sha256_bytes_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def run_status(run):
+    try:
+        value = json.loads((run / "run-status.json").read_text(encoding="utf-8"))
+        return value.get("status", "unknown")
+    except (OSError, ValueError, TypeError, AttributeError):
+        return "unknown"
+
+
+def simulation_writer_active(root):
+    marker = str(root).encode()
+    try:
+        for process in Path("/proc").iterdir():
+            if not process.name.isdigit():
+                continue
+            try:
+                command = (process / "cmdline").read_bytes()
+            except OSError:
+                continue
+            if b"anchorbell_simulation_batch" in command and marker in command:
+                return True
+    except OSError:
+        return True
+    return False
+
+
+def compact_finalized_run(run, root, *, apply, now, min_age_hours,
+                          writer_active):
+    status = run_status(run)
+    if status not in TERMINAL_STATUSES and (status != "running" or writer_active):
+        return []
+    entries = []
+    for path in sorted(run.iterdir()):
+        if not RAW_JSONL.fullmatch(path.name) or not regular(path):
+            continue
+        info = path.stat()
+        if now - info.st_mtime < min_age_hours * 3600:
+            continue
+        archive = path.with_name(path.name + ".final.zst")
+        metadata = Path(str(archive) + ".meta.json")
+        original_sha256, line_count = sha256_file(path)
+        expected = {
+            "schema_version": 2,
+            "compression": "zstd",
+            "compression_stage": "finalized",
+            "original_file": path.name,
+            "original_bytes": info.st_size,
+            "original_sha256": original_sha256,
+            "line_count": line_count,
+        }
+        valid_existing = False
+        try:
+            saved = json.loads(metadata.read_text(encoding="utf-8"))
+            valid_existing = (
+                regular(archive)
+                and saved == {
+                    **expected,
+                    "compressed_bytes": archive.stat().st_size,
+                    "compressed_sha256": sha256_bytes_file(archive),
+                }
+            )
+        except (OSError, ValueError, TypeError):
+            valid_existing = False
+        entry = {
+            "path": str(path.relative_to(root)),
+            "archive": str(archive.relative_to(root)),
+            "bytes": info.st_size,
+            "status": status,
+            "action": "compact_planned",
+        }
+        if not apply:
+            entries.append(entry)
+            continue
+        try:
+            if not valid_existing:
+                temporary = archive.with_name(archive.name + f".tmp.{os.getpid()}")
+                subprocess.run(
+                    ["zstd", "-q", "-T0", "-3", "-f", "-o", str(temporary), str(path)],
+                    check=True,
+                )
+                subprocess.run(["zstd", "-q", "-t", str(temporary)], check=True)
+                os.replace(temporary, archive)
+                compressed = {
+                    **expected,
+                    "compressed_bytes": archive.stat().st_size,
+                    "compressed_sha256": sha256_bytes_file(archive),
+                }
+                write_json(metadata, compressed)
+            saved = json.loads(metadata.read_text(encoding="utf-8"))
+            if saved.get("original_sha256") != original_sha256:
+                raise ValueError("final archive provenance mismatch")
+            subprocess.run(["zstd", "-q", "-t", str(archive)], check=True)
+            path.unlink()
+            sync_directory(path.parent)
+            entry["action"] = "compacted"
+            entries.append(entry)
+        except (OSError, ValueError, subprocess.CalledProcessError) as error:
+            temporary = archive.with_name(archive.name + f".tmp.{os.getpid()}")
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+            entry["action"] = "compact_error"
+            entry["error"] = str(error)
+            entries.append(entry)
+    return entries
+
+
 def maintain(root, *, apply=False, max_bytes=8 * 1024**3,
              min_age_hours=24, max_age_days=7, free_floor=8 * 1024**3,
              now=None):
@@ -43,6 +172,17 @@ def maintain(root, *, apply=False, max_bytes=8 * 1024**3,
     if min(max_bytes, min_age_hours, max_age_days, free_floor) < 0:
         raise ValueError("retention limits must be nonnegative")
     now = time.time() if now is None else now
+    compacted = []
+    writer_active = simulation_writer_active(root)
+    for run in root.iterdir():
+        if not RUN.fullmatch(run.name) or run.is_symlink() or not run.is_dir():
+            continue
+        manifest = run / "run-manifest.json"
+        if manifest.exists() and regular(manifest):
+            compacted.extend(compact_finalized_run(
+                run, root, apply=apply, now=now,
+                min_age_hours=min_age_hours, writer_active=writer_active,
+            ))
     archives = []
     total = 0
     for run in root.iterdir():
@@ -70,7 +210,7 @@ def maintain(root, *, apply=False, max_bytes=8 * 1024**3,
             archives.append((info.st_mtime, str(path), info.st_size, info.st_ino))
     available = shutil.disk_usage(root).free
     result = {"observed_at_ms": int(now * 1000), "apply": apply,
-              "removed": [], "planned": [], "errors": [],
+              "compacted": compacted, "removed": [], "planned": [], "errors": [],
               "archive_bytes_before": total, "available_bytes_before": available}
     for modified, name, size, inode in sorted(archives):
         age = now - modified

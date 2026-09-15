@@ -2,6 +2,7 @@ use crate::model::{
     CandidateOrder, ModelError, QueueFillEstimate, Side, TimeInForce, ValidatedOrder,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderState {
@@ -47,6 +48,7 @@ pub struct OrderRecord {
     pub state: OrderState,
     pub last_event_at_ms: u64,
     pub contract_digest: String,
+    pub applied_event_ids: BTreeSet<String>,
 }
 
 impl OrderRecord {
@@ -61,10 +63,12 @@ impl OrderRecord {
             state: OrderState::Intent,
             last_event_at_ms: order.validated_at_ms,
             contract_digest: order.contract_digest.clone(),
+            applied_event_ids: BTreeSet::new(),
         }
     }
     pub fn apply(&mut self, event: OrderEvent) -> Result<(), ModelError> {
         if event.event_id.is_empty()
+            || self.applied_event_ids.contains(&event.event_id)
             || event.order_id != self.order_id
             || event.symbol != self.symbol
             || event.event_at_ms == 0
@@ -80,7 +84,7 @@ impl OrderRecord {
             && matches!(event.authority, Authority::Exchange | Authority::Replay);
         if event.state != OrderState::Unknown
             && !recovering_unknown
-            && terminal_rank(event.state) < terminal_rank(self.state)
+            && !valid_transition(self.state, event.state)
         {
             return Err(ModelError::IncompleteEvidence);
         }
@@ -89,6 +93,19 @@ impl OrderRecord {
             OrderState::Filled | OrderState::PartiallyFilled
         ) && event.authority == Authority::Local
         {
+            return Err(ModelError::IncompleteEvidence);
+        }
+        if matches!(event.state, OrderState::Canceled | OrderState::Rejected)
+            && !matches!(event.authority, Authority::Exchange | Authority::Replay)
+        {
+            return Err(ModelError::IncompleteEvidence);
+        }
+        if event.state == OrderState::PartiallyFilled
+            && (event.cumulative_quantity == 0 || event.cumulative_quantity == self.quantity)
+        {
+            return Err(ModelError::IncompleteEvidence);
+        }
+        if event.state == OrderState::Rejected && event.cumulative_quantity != 0 {
             return Err(ModelError::IncompleteEvidence);
         }
         if event.state == OrderState::Filled && event.cumulative_quantity != self.quantity {
@@ -111,20 +128,58 @@ impl OrderRecord {
         self.state = event.state;
         self.filled_quantity = event.cumulative_quantity;
         self.last_event_at_ms = event.event_at_ms;
+        self.applied_event_ids.insert(event.event_id);
         Ok(())
     }
 }
 
-fn terminal_rank(state: OrderState) -> u8 {
-    match state {
-        OrderState::Intent => 0,
-        OrderState::Submitted => 1,
-        OrderState::Accepted => 2,
-        OrderState::PartiallyFilled => 3,
-        OrderState::CancelPending => 4,
-        OrderState::Filled | OrderState::Canceled | OrderState::Rejected => 5,
-        OrderState::Unknown => 6,
-    }
+fn valid_transition(from: OrderState, to: OrderState) -> bool {
+    matches!(
+        (from, to),
+        (
+            OrderState::Intent,
+            OrderState::Intent
+                | OrderState::Submitted
+                | OrderState::Accepted
+                | OrderState::PartiallyFilled
+                | OrderState::Filled
+                | OrderState::Rejected
+                | OrderState::Unknown,
+        ) | (
+            OrderState::Submitted,
+            OrderState::Submitted
+                | OrderState::Accepted
+                | OrderState::PartiallyFilled
+                | OrderState::Filled
+                | OrderState::CancelPending
+                | OrderState::Rejected
+                | OrderState::Unknown,
+        ) | (
+            OrderState::Accepted,
+            OrderState::Accepted
+                | OrderState::PartiallyFilled
+                | OrderState::Filled
+                | OrderState::CancelPending
+                | OrderState::Rejected
+                | OrderState::Unknown,
+        ) | (
+            OrderState::PartiallyFilled,
+            OrderState::PartiallyFilled
+                | OrderState::Filled
+                | OrderState::CancelPending
+                | OrderState::Unknown,
+        ) | (
+            OrderState::CancelPending,
+            OrderState::CancelPending
+                | OrderState::PartiallyFilled
+                | OrderState::Filled
+                | OrderState::Canceled
+                | OrderState::Unknown,
+        ) | (OrderState::Filled, OrderState::Filled)
+            | (OrderState::Canceled, OrderState::Canceled)
+            | (OrderState::Rejected, OrderState::Rejected)
+            | (OrderState::Unknown, OrderState::Unknown)
+    )
 }
 
 pub trait ExecutionPort {
@@ -231,6 +286,131 @@ mod tests {
             }),
             Err(ModelError::IncompleteEvidence)
         );
+    }
+
+    #[test]
+    fn duplicate_event_id_is_rejected_even_after_progress() {
+        let mut order = record();
+        let event = OrderEvent {
+            event_id: "accepted".into(),
+            order_id: "order-1".into(),
+            symbol: "BTCUSDT".into(),
+            state: OrderState::Accepted,
+            authority: Authority::Exchange,
+            event_at_ms: 2,
+            cumulative_quantity: 0,
+            traded_through_quantity: None,
+            observed_latency_ms: None,
+        };
+        order.apply(event.clone()).unwrap();
+        let mut progressed = event;
+        progressed.event_at_ms = 3;
+        progressed.state = OrderState::Canceled;
+        assert_eq!(order.apply(progressed), Err(ModelError::IncompleteEvidence));
+    }
+
+    #[test]
+    fn terminal_states_cannot_cross_after_cancellation_or_rejection() {
+        let mut canceled = record();
+        canceled
+            .apply(OrderEvent {
+                event_id: "accepted".into(),
+                order_id: "order-1".into(),
+                symbol: "BTCUSDT".into(),
+                state: OrderState::Accepted,
+                authority: Authority::Exchange,
+                event_at_ms: 2,
+                cumulative_quantity: 0,
+                traded_through_quantity: None,
+                observed_latency_ms: None,
+            })
+            .unwrap();
+        canceled
+            .apply(OrderEvent {
+                event_id: "cancel-pending".into(),
+                order_id: "order-1".into(),
+                symbol: "BTCUSDT".into(),
+                state: OrderState::CancelPending,
+                authority: Authority::Local,
+                event_at_ms: 3,
+                cumulative_quantity: 0,
+                traded_through_quantity: None,
+                observed_latency_ms: None,
+            })
+            .unwrap();
+        canceled
+            .apply(OrderEvent {
+                event_id: "canceled".into(),
+                order_id: "order-1".into(),
+                symbol: "BTCUSDT".into(),
+                state: OrderState::Canceled,
+                authority: Authority::Exchange,
+                event_at_ms: 4,
+                cumulative_quantity: 0,
+                traded_through_quantity: None,
+                observed_latency_ms: None,
+            })
+            .unwrap();
+        assert_eq!(
+            canceled.apply(OrderEvent {
+                event_id: "late-fill".into(),
+                order_id: "order-1".into(),
+                symbol: "BTCUSDT".into(),
+                state: OrderState::Filled,
+                authority: Authority::Exchange,
+                event_at_ms: 5,
+                cumulative_quantity: 3,
+                traded_through_quantity: Some(8),
+                observed_latency_ms: Some(50),
+            }),
+            Err(ModelError::IncompleteEvidence)
+        );
+    }
+
+    #[test]
+    fn cancel_race_allows_authoritative_fill_before_cancel_confirmation() {
+        let mut order = record();
+        order
+            .apply(OrderEvent {
+                event_id: "accepted".into(),
+                order_id: "order-1".into(),
+                symbol: "BTCUSDT".into(),
+                state: OrderState::Accepted,
+                authority: Authority::Exchange,
+                event_at_ms: 2,
+                cumulative_quantity: 0,
+                traded_through_quantity: None,
+                observed_latency_ms: None,
+            })
+            .unwrap();
+        order
+            .apply(OrderEvent {
+                event_id: "cancel-pending".into(),
+                order_id: "order-1".into(),
+                symbol: "BTCUSDT".into(),
+                state: OrderState::CancelPending,
+                authority: Authority::Local,
+                event_at_ms: 3,
+                cumulative_quantity: 0,
+                traded_through_quantity: None,
+                observed_latency_ms: None,
+            })
+            .unwrap();
+        order
+            .apply(OrderEvent {
+                event_id: "partial-race".into(),
+                order_id: "order-1".into(),
+                symbol: "BTCUSDT".into(),
+                state: OrderState::PartiallyFilled,
+                authority: Authority::Exchange,
+                event_at_ms: 4,
+                cumulative_quantity: 1,
+                traded_through_quantity: Some(6),
+                observed_latency_ms: Some(50),
+            })
+            .unwrap();
+        assert_eq!(order.state, OrderState::PartiallyFilled);
+        assert_eq!(order.filled_quantity, 1);
     }
 
     #[test]

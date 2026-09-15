@@ -1,4 +1,4 @@
-use crate::policy::{StrategyNode, StrategyPlan};
+use crate::policy::StrategyPlan;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoreInvariants {
@@ -58,6 +58,8 @@ pub enum PromotionRejection {
     DrawdownLimit,
     NotBetterThanChampion,
     MissingRequiredSemantics,
+    InvalidArtifactIdentity,
+    InvalidEvidenceDigest,
 }
 
 pub struct PromotionGate {
@@ -74,11 +76,30 @@ impl PromotionGate {
         if !self.invariants.holds() {
             return Err(PromotionRejection::InvalidInvariants);
         }
-        if challenger.evidence_digest.is_empty() {
-            return Err(PromotionRejection::MissingEvidence);
+        if champion.version.trim().is_empty()
+            || champion.version != champion.plan.version
+            || !champion.plan.is_legal()
+            || challenger.version.trim().is_empty()
+            || challenger.plan.version != challenger.version
+        {
+            return Err(PromotionRejection::InvalidArtifactIdentity);
         }
-        if challenger.sealed_set_digest.is_empty() {
-            return Err(PromotionRejection::MissingSealedSet);
+        if !is_sha256_digest(&challenger.evidence_digest) {
+            return Err(if challenger.evidence_digest.is_empty() {
+                PromotionRejection::MissingEvidence
+            } else {
+                PromotionRejection::InvalidEvidenceDigest
+            });
+        }
+        if !is_sha256_digest(&challenger.sealed_set_digest) {
+            return Err(if challenger.sealed_set_digest.is_empty() {
+                PromotionRejection::MissingSealedSet
+            } else {
+                PromotionRejection::InvalidEvidenceDigest
+            });
+        }
+        if challenger.max_drawdown_pico_bps < 0 {
+            return Err(PromotionRejection::DrawdownLimit);
         }
         if challenger.effective_sample_size < self.thresholds.minimum_effective_sample_size {
             return Err(PromotionRejection::InsufficientHistory);
@@ -100,16 +121,11 @@ impl PromotionGate {
 }
 
 fn required_semantics(plan: &StrategyPlan) -> bool {
-    [
-        StrategyNode::BindAnchor,
-        StrategyNode::RequireClosedWindow,
-        StrategyNode::EstimateJointOutcome,
-        StrategyNode::AdmitIfRobustValueBeatsWait,
-        StrategyNode::QuotePassive,
-        StrategyNode::ReconcileBeforeResume,
-    ]
-    .iter()
-    .all(|required| plan.nodes.contains(required))
+    plan.is_legal()
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -120,8 +136,8 @@ mod tests {
         StrategyArtifact {
             version: version.into(),
             plan: StrategyPlan::anchor_closed_maker(version),
-            evidence_digest: "evidence".into(),
-            sealed_set_digest: "sealed".into(),
+            evidence_digest: "a".repeat(64),
+            sealed_set_digest: "b".repeat(64),
             effective_sample_size: 100,
             robust_value_pico_bps: value,
             max_drawdown_pico_bps: 10,
@@ -151,6 +167,30 @@ mod tests {
         assert_eq!(
             blocked.approve(&artifact("champion", 10), &artifact("challenger", 20)),
             Err(PromotionRejection::InvalidInvariants)
+        );
+    }
+
+    #[test]
+    fn evolution_rejects_identity_and_digest_mismatches() {
+        let gate = PromotionGate {
+            invariants: CoreInvariants::immutable(),
+            thresholds: PromotionThresholds {
+                minimum_effective_sample_size: 30,
+                maximum_drawdown_pico_bps: 100,
+            },
+        };
+        let champion = artifact("champion", 10);
+        let mut challenger = artifact("challenger", 20);
+        challenger.plan.version = "wrong".into();
+        assert_eq!(
+            gate.approve(&champion, &challenger),
+            Err(PromotionRejection::InvalidArtifactIdentity)
+        );
+        challenger.plan.version = "challenger".into();
+        challenger.evidence_digest = "bad".into();
+        assert_eq!(
+            gate.approve(&champion, &challenger),
+            Err(PromotionRejection::InvalidEvidenceDigest)
         );
     }
 

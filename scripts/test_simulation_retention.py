@@ -91,6 +91,35 @@ class RetentionTests(unittest.TestCase):
         self.assertTrue(records.exists())
         self.assertEqual(result["status"], "pressure")
 
+    def test_finalizes_terminal_raw_streams_but_preserves_strategy_records(self):
+        (self.run / "run-status.json").write_text('{"status":"completed"}')
+        raw = self.run / "shared-market.jsonl"
+        raw.write_text('{"event":1}\n{"event":2}\n')
+        os.utime(raw, (self.now - 172800, self.now - 172800))
+        records_dir = self.run / "CORE_V1"
+        records_dir.mkdir()
+        records = records_dir / "records.jsonl"
+        records.write_text('{"decision":"wait"}\n')
+        result = maintain(self.root, apply=True, max_bytes=10**9,
+                          free_floor=0, now=self.now)
+        final = Path(str(raw) + ".final.zst")
+        self.assertFalse(raw.exists())
+        self.assertTrue(final.exists())
+        self.assertTrue(Path(str(final) + ".meta.json").exists())
+        self.assertTrue(records.exists())
+        self.assertEqual([item["action"] for item in result["compacted"]],
+                         ["compacted"])
+
+    def test_running_writer_protection_does_not_block_stale_orphan_cleanup(self):
+        (self.run / "run-status.json").write_text('{"status":"running"}')
+        raw = self.run / "shared-market.jsonl"
+        raw.write_text('{"event":1}\n')
+        os.utime(raw, (self.now - 172800, self.now - 172800))
+        result = maintain(self.root, apply=True, max_bytes=10**9,
+                          free_floor=0, now=self.now)
+        self.assertFalse(raw.exists())
+        self.assertEqual(result["compacted"][0]["status"], "running")
+
     def test_symlinked_run_is_never_followed(self):
         with tempfile.TemporaryDirectory() as outside:
             external = Path(outside)

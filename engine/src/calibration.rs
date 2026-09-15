@@ -146,6 +146,10 @@ impl CalibrationState {
         while self.observations.len() > WINDOW_CAPACITY {
             self.observations.pop_front();
         }
+        self.first_event_at_ms = self
+            .observations
+            .front()
+            .map_or(0, |observation| observation.event_at_ms);
         self.refresh_admission();
         Ok(())
     }
@@ -240,7 +244,11 @@ impl CalibrationState {
         if let Some(admission) = &self.admission {
             return self.admitted_snapshot(admission);
         }
-        Ok(self.cold_start_snapshot())
+        if self.observations.is_empty() {
+            Ok(self.cold_start_snapshot())
+        } else {
+            Ok(self.validating_snapshot())
+        }
     }
 
     pub fn snapshot(&self) -> Result<CalibrationSnapshot, CalibrationError> {
@@ -352,10 +360,33 @@ impl CalibrationState {
         Some(DirectionalCalibration {
             attempts,
             fills,
-            fill_probability_bps: (fills.saturating_mul(10_000) / attempts).min(10_000) as u16,
+            fill_probability_bps: (i128::from(fills)
+                .checked_mul(10_000)?
+                .checked_div(i128::from(attempts))?
+                .min(10_000)) as u16,
             adverse_markout_pico_bps: median,
             robust_lower_pico_bps: robust_lower,
         })
+    }
+
+    fn validating_snapshot(&self) -> CalibrationSnapshot {
+        let complete_observations = self
+            .observations
+            .iter()
+            .filter(|observation| observation.markout_pico_bps.is_some())
+            .count() as u64;
+        CalibrationSnapshot {
+            schema_version: self.schema_version,
+            model_version: self.model_version.clone(),
+            instrument: self.instrument.clone(),
+            phase: CalibrationPhase::Validating,
+            effective_sample_size: complete_observations,
+            buy: DirectionalCalibration::cold_start(),
+            sell: DirectionalCalibration::cold_start(),
+            window_start_ms: self.first_event_at_ms,
+            window_end_ms: self.last_event_at_ms,
+            evidence_digest: digest_observations(&self.observations),
+        }
     }
 
     fn cold_start_snapshot(&self) -> CalibrationSnapshot {
@@ -390,9 +421,9 @@ impl CalibrationState {
 }
 
 impl CalibrationSnapshot {
-    pub fn robust_executable_value(&self, side: Side, path_value_pico_bps: i64) -> i64 {
+    pub fn robust_executable_value(&self, side: Side, path_value_pico_bps: i64) -> Option<i64> {
         if self.phase != CalibrationPhase::Admitted {
-            return path_value_pico_bps;
+            return Some(path_value_pico_bps);
         }
         let directional = match side {
             Side::Buy => self.buy,
@@ -402,15 +433,8 @@ impl CalibrationSnapshot {
             i128::from(path_value_pico_bps) * i128::from(directional.fill_probability_bps),
             10_000,
         )
-        .and_then(|value| i64::try_from(value).ok())
-        .unwrap_or_else(|| {
-            if path_value_pico_bps.is_negative() {
-                i64::MIN
-            } else {
-                i64::MAX
-            }
-        });
-        fill_adjusted.saturating_add(directional.robust_lower_pico_bps)
+        .and_then(|value| i64::try_from(value).ok())?;
+        fill_adjusted.checked_add(directional.robust_lower_pico_bps)
     }
 
     pub fn validate(&self) -> Result<(), CalibrationError> {
@@ -419,7 +443,7 @@ impl CalibrationSnapshot {
         {
             return Err(CalibrationError::SchemaMismatch);
         }
-        if self.instrument.trim().is_empty() || self.evidence_digest.is_empty() {
+        if self.instrument.trim().is_empty() || !is_sha256_digest(&self.evidence_digest) {
             return Err(CalibrationError::InvalidSnapshot);
         }
         match self.phase {
@@ -431,7 +455,16 @@ impl CalibrationSnapshot {
                     return Err(CalibrationError::InvalidSnapshot);
                 }
             }
-            CalibrationPhase::Validating => return Err(CalibrationError::InvalidSnapshot),
+            CalibrationPhase::Validating => {
+                if self.effective_sample_size >= MIN_EFFECTIVE_SAMPLES as u64
+                    || self.window_start_ms == 0
+                    || self.window_end_ms < self.window_start_ms
+                    || self.buy != DirectionalCalibration::cold_start()
+                    || self.sell != DirectionalCalibration::cold_start()
+                {
+                    return Err(CalibrationError::InvalidSnapshot);
+                }
+            }
             CalibrationPhase::Admitted => {
                 let directional_valid = [self.buy, self.sell].iter().all(|value| {
                     value.attempts > 0
@@ -440,6 +473,7 @@ impl CalibrationSnapshot {
                 });
                 if self.effective_sample_size < MIN_EFFECTIVE_SAMPLES as u64
                     || !directional_valid
+                    || self.window_start_ms == 0
                     || self.window_end_ms < self.window_start_ms
                 {
                     return Err(CalibrationError::InvalidSnapshot);
@@ -457,18 +491,39 @@ fn robust_stats(values: &[i64]) -> Option<(i64, i64)> {
     let mut ordered = values.to_vec();
     ordered.sort_unstable();
     let median = ordered[(ordered.len() - 1) / 2];
-    let mut deviations: Vec<i64> = ordered
+    let mut deviations: Vec<i128> = ordered
         .iter()
-        .map(|value| value.saturating_sub(median).abs())
+        .map(|value| (i128::from(*value) - i128::from(median)).abs())
         .collect();
     deviations.sort_unstable();
     let mad = deviations[(deviations.len() - 1) / 2];
-    Some((median, median.saturating_sub(mad.saturating_mul(3))))
+    let robust_lower = i128::from(median).checked_sub(mad.checked_mul(3)?)?;
+    Some((median, i64::try_from(robust_lower).ok()?))
 }
 
 fn digest_observations(observations: &VecDeque<CalibrationObservation>) -> String {
-    let bytes = serde_json::to_vec(observations).unwrap_or_default();
-    digest_bytes(&bytes)
+    let mut hasher = Sha256::new();
+    for observation in observations {
+        hasher.update(observation.event_at_ms.to_le_bytes());
+        hasher.update([match observation.side {
+            Side::Buy => 0_u8,
+            Side::Sell => 1_u8,
+        }]);
+        hasher.update(observation.attempted_quantity.to_le_bytes());
+        hasher.update(observation.filled_quantity.to_le_bytes());
+        match observation.markout_pico_bps {
+            Some(markout) => {
+                hasher.update([1_u8]);
+                hasher.update(markout.to_le_bytes());
+            }
+            None => hasher.update([0_u8]),
+        }
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn digest_bytes(bytes: &[u8]) -> String {
@@ -496,7 +551,17 @@ mod tests {
         let state = CalibrationState::new("BTCUSDT").unwrap();
         let snapshot = state.decision_snapshot().unwrap();
         assert_eq!(snapshot.phase, CalibrationPhase::ColdStart);
-        assert_eq!(snapshot.robust_executable_value(Side::Buy, 123), 123);
+        assert_eq!(snapshot.robust_executable_value(Side::Buy, 123), Some(123));
+        assert!(snapshot.validate().is_ok());
+    }
+
+    #[test]
+    fn validating_snapshot_is_explicitly_unavailable() {
+        let mut state = CalibrationState::new("BTCUSDT").unwrap();
+        state.observe(observation(1, Side::Buy, None)).unwrap();
+        let snapshot = state.decision_snapshot().unwrap();
+        assert_eq!(snapshot.phase, CalibrationPhase::Validating);
+        assert_eq!(snapshot.effective_sample_size, 0);
         assert!(snapshot.validate().is_ok());
     }
 
@@ -591,6 +656,43 @@ mod tests {
         }
         let encoded = state.encode_json().unwrap();
         assert_eq!(CalibrationState::decode_json(&encoded).unwrap(), state);
+    }
+
+    #[test]
+    fn snapshot_rejects_non_digest_evidence() {
+        let mut state = CalibrationState::new("BTCUSDT").unwrap();
+        for i in 0..MIN_EFFECTIVE_SAMPLES {
+            state
+                .observe(observation(
+                    i as u64 + 1,
+                    if i % 2 == 0 { Side::Buy } else { Side::Sell },
+                    Some(20_000_000_000),
+                ))
+                .unwrap();
+        }
+        let mut snapshot = state.snapshot().unwrap();
+        snapshot.evidence_digest = "not-a-digest".into();
+        assert_eq!(snapshot.validate(), Err(CalibrationError::InvalidSnapshot));
+    }
+
+    #[test]
+    fn robust_statistics_do_not_saturate_extreme_values() {
+        let values = [i64::MIN + 1, 0, i64::MAX];
+        assert_eq!(robust_stats(&values), None);
+    }
+
+    #[test]
+    fn replay_remains_valid_after_sliding_window_eviction() {
+        let mut state = CalibrationState::new("BTCUSDT").unwrap();
+        for event_at_ms in 1..=(WINDOW_CAPACITY as u64 + 1) {
+            state
+                .observe(observation(event_at_ms, Side::Buy, None))
+                .unwrap();
+        }
+        assert_eq!(state.observations.len(), WINDOW_CAPACITY);
+        assert_eq!(state.first_event_at_ms, 2);
+        assert_eq!(state.last_event_at_ms, WINDOW_CAPACITY as u64 + 1);
+        assert!(state.history_quality().unwrap().replay_valid);
     }
 
     #[test]

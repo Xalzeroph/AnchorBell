@@ -1,3 +1,5 @@
+use serde::Serialize;
+
 use crate::model::{
     AccountSnapshot, AnchorEpisode, CandidateOrder, EpisodePhase, EvidenceFrame,
     OutcomeDistribution, Side, ValidatedOrder,
@@ -46,9 +48,42 @@ impl StrategyPlan {
             ],
         }
     }
+
+    pub fn is_legal(&self) -> bool {
+        if self.version.trim().is_empty() {
+            return false;
+        }
+        let required = [
+            StrategyNode::BindAnchor,
+            StrategyNode::RequireClosedWindow,
+            StrategyNode::MeasureResidual,
+            StrategyNode::EstimateJointOutcome,
+            StrategyNode::AdmitIfRobustValueBeatsWait,
+            StrategyNode::QuotePassive,
+            StrategyNode::ReduceAtEarliestDeadline,
+            StrategyNode::ReconcileBeforeResume,
+        ];
+        let positions: Vec<usize> = required
+            .iter()
+            .filter_map(|required_node| self.nodes.iter().position(|node| node == required_node))
+            .collect();
+        positions.len() == required.len()
+            && positions.windows(2).all(|pair| pair[0] < pair[1])
+            && [
+                "anchor",
+                "external_closed",
+                "binance_contract",
+                "causal",
+                "maker_entry",
+                "reconciled_account",
+            ]
+            .iter()
+            .all(|invariant| self.invariants.iter().any(|item| item == invariant))
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Decision {
     Wait {
         reason: DecisionReason,
@@ -66,18 +101,43 @@ pub enum Decision {
     },
     ResidualExposure {
         position: i64,
+        long_position: i64,
+        short_position: i64,
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DecisionReason {
     IncompleteEvidence,
+    CalibrationUnavailable,
+    InsufficientHistory,
     OutsideEntryWindow,
     StaleMarket,
     NoRobustEdge,
+    AmbiguousDirection,
     ContractRejected,
+    PortfolioRejected,
     PositionLimit,
     HardDeadline,
+}
+
+impl DecisionReason {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::IncompleteEvidence => "incomplete_evidence",
+            Self::CalibrationUnavailable => "calibration_unavailable",
+            Self::InsufficientHistory => "insufficient_history",
+            Self::OutsideEntryWindow => "outside_entry_window",
+            Self::StaleMarket => "stale_market",
+            Self::NoRobustEdge => "no_robust_edge",
+            Self::AmbiguousDirection => "ambiguous_direction",
+            Self::ContractRejected => "contract_rejected",
+            Self::PortfolioRejected => "portfolio_rejected",
+            Self::PositionLimit => "position_limit",
+            Self::HardDeadline => "hard_deadline",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,9 +150,20 @@ pub struct DecisionEngine {
     pub limits: PolicyLimits,
 }
 
+struct EntryEvaluation {
+    opportunity: Option<(ValidatedOrder, i64)>,
+    rejection: Option<DecisionReason>,
+}
+
 impl DecisionEngine {
     pub fn decide(&self, frame: &EvidenceFrame) -> Decision {
-        if frame.account.validate().is_err() || !frame.account.reconciled {
+        if !frame.structurally_valid()
+            || frame
+                .account
+                .validate_for(frame.contract.position_mode, frame.now_ms)
+                .is_err()
+            || !frame.account.reconciled
+        {
             return Decision::Wait {
                 reason: DecisionReason::IncompleteEvidence,
             };
@@ -102,9 +173,10 @@ impl DecisionEngine {
                 reason: DecisionReason::StaleMarket,
             };
         }
-        let phase = frame.episode.phase_at(frame.now_ms, frame.account.position);
+        let has_position = frame.account.has_position(frame.contract.position_mode);
+        let phase = frame.episode.phase_at(frame.now_ms, has_position);
         if phase == EpisodePhase::Closed {
-            return if frame.account.position == 0 {
+            return if !has_position {
                 Decision::Wait {
                     reason: DecisionReason::HardDeadline,
                 }
@@ -112,13 +184,28 @@ impl DecisionEngine {
                 self.emergency_reduce(frame)
             };
         }
+        if has_position && phase == EpisodePhase::Reducing {
+            return self.reduce(frame);
+        }
+        if frame.calibration.phase != crate::calibration::CalibrationPhase::Admitted {
+            return Decision::Wait {
+                reason: match frame.calibration.phase {
+                    crate::calibration::CalibrationPhase::ColdStart => {
+                        DecisionReason::CalibrationUnavailable
+                    }
+                    crate::calibration::CalibrationPhase::Validating => {
+                        DecisionReason::InsufficientHistory
+                    }
+                    crate::calibration::CalibrationPhase::Admitted => {
+                        DecisionReason::IncompleteEvidence
+                    }
+                },
+            };
+        }
         if !frame.complete_for_entry() {
             return Decision::Wait {
                 reason: DecisionReason::IncompleteEvidence,
             };
-        }
-        if frame.account.position != 0 && phase == EpisodePhase::Reducing {
-            return self.reduce(frame);
         }
         if !frame.episode.entry_allowed(frame.now_ms) {
             return Decision::Wait {
@@ -127,6 +214,8 @@ impl DecisionEngine {
         }
         let buy = self.entry(frame, Side::Buy, &frame.buy_outcome);
         let sell = self.entry(frame, Side::Sell, &frame.sell_outcome);
+        let buy_rejection = buy.rejection;
+        let sell_rejection = sell.rejection;
         let wait_value = match frame.wait_outcome.lower_value() {
             Some(value) => value,
             None => {
@@ -135,17 +224,32 @@ impl DecisionEngine {
                 };
             }
         };
-        match (buy, sell) {
-            (Some((b, bv)), Some((_s, sv))) if bv >= sv && bv > wait_value => {
-                Decision::PlaceMaker {
-                    order: b,
-                    robust_value_pico_bps: bv,
-                }
-            }
+        match (buy.opportunity, sell.opportunity) {
+            (Some((b, bv)), Some((_s, sv))) if bv > sv && bv > wait_value => Decision::PlaceMaker {
+                order: b,
+                robust_value_pico_bps: bv,
+            },
             (Some((_b, bv)), Some((s, sv))) if sv > bv && sv > wait_value => Decision::PlaceMaker {
                 order: s,
                 robust_value_pico_bps: sv,
             },
+            (Some((b, bv)), Some((s, sv))) if bv == sv && bv > wait_value => {
+                if b.queue_ahead_quantity < s.queue_ahead_quantity {
+                    Decision::PlaceMaker {
+                        order: b,
+                        robust_value_pico_bps: bv,
+                    }
+                } else if s.queue_ahead_quantity < b.queue_ahead_quantity {
+                    Decision::PlaceMaker {
+                        order: s,
+                        robust_value_pico_bps: sv,
+                    }
+                } else {
+                    Decision::Wait {
+                        reason: DecisionReason::AmbiguousDirection,
+                    }
+                }
+            }
             (Some((b, bv)), None) if bv > wait_value => Decision::PlaceMaker {
                 order: b,
                 robust_value_pico_bps: bv,
@@ -155,51 +259,61 @@ impl DecisionEngine {
                 robust_value_pico_bps: sv,
             },
             _ => Decision::Wait {
-                reason: DecisionReason::NoRobustEdge,
+                reason: buy_rejection
+                    .or(sell_rejection)
+                    .unwrap_or(DecisionReason::NoRobustEdge),
             },
         }
     }
-    fn position_side(
-        mode: crate::model::PositionMode,
-        side: Side,
-        position: i64,
-        reducing: bool,
-    ) -> crate::model::PositionSide {
-        match mode {
-            crate::model::PositionMode::OneWay => crate::model::PositionSide::Both,
-            crate::model::PositionMode::Hedge if reducing && position > 0 => {
-                crate::model::PositionSide::Long
-            }
-            crate::model::PositionMode::Hedge if reducing => crate::model::PositionSide::Short,
-            crate::model::PositionMode::Hedge if side == Side::Buy => {
-                crate::model::PositionSide::Long
-            }
-            crate::model::PositionMode::Hedge => crate::model::PositionSide::Short,
-        }
-    }
-
     fn entry(
         &self,
         frame: &EvidenceFrame,
         side: Side,
         outcome: &OutcomeDistribution,
-    ) -> Option<(ValidatedOrder, i64)> {
-        let value = frame
-            .calibration
-            .robust_executable_value(side, outcome.lower_value()?);
-        let remaining = match side {
-            Side::Buy => frame
-                .account
-                .max_position
-                .saturating_sub(frame.account.position),
-            Side::Sell => frame
-                .account
-                .max_position
-                .saturating_add(frame.account.position),
+    ) -> EntryEvaluation {
+        let Some(path_value) = outcome.lower_value() else {
+            return EntryEvaluation {
+                opportunity: None,
+                rejection: Some(DecisionReason::IncompleteEvidence),
+            };
         };
+        let Some(value) = frame.calibration.robust_executable_value(side, path_value) else {
+            return EntryEvaluation {
+                opportunity: None,
+                rejection: Some(DecisionReason::IncompleteEvidence),
+            };
+        };
+        if frame
+            .portfolio
+            .permits_additional_risk(
+                frame.now_ms,
+                frame.entry_margin_quote_ticks,
+                frame.entry_stress_quote_ticks,
+            )
+            .is_err()
+        {
+            return EntryEvaluation {
+                opportunity: None,
+                rejection: Some(DecisionReason::PortfolioRejected),
+            };
+        }
+        let position_side = match frame.contract.position_mode {
+            crate::model::PositionMode::OneWay => crate::model::PositionSide::Both,
+            crate::model::PositionMode::Hedge if side == Side::Buy => {
+                crate::model::PositionSide::Long
+            }
+            crate::model::PositionMode::Hedge => crate::model::PositionSide::Short,
+        };
+        let remaining = frame
+            .account
+            .leg_quantity(frame.contract.position_mode, side, position_side)
+            .unwrap_or(0);
         let quantity = self.limits.requested_quantity.min(remaining);
         if quantity <= 0 {
-            return None;
+            return EntryEvaluation {
+                opportunity: None,
+                rejection: Some(DecisionReason::PositionLimit),
+            };
         }
         let candidate = CandidateOrder {
             symbol: frame.contract.symbol.clone(),
@@ -207,32 +321,38 @@ impl DecisionEngine {
             price: frame.market.book.passive_price(side),
             quantity: crate::model::Quantity(quantity),
             reduce_only: false,
-            position_side: Self::position_side(
-                frame.contract.position_mode,
-                side,
-                frame.account.position,
-                false,
-            ),
+            position_side,
             time_in_force: crate::model::TimeInForce::Gtx,
             working_type: crate::model::WorkingType::ContractPrice,
             price_protect: false,
             trigger_price: None,
             close_position: false,
         };
-        frame
+        match frame
             .contract
-            .validate(candidate, frame.market.book, frame.account, frame.now_ms)
-            .ok()
-            .map(|order| (order, value))
+            .validate(candidate, frame.market.book, &frame.account, frame.now_ms)
+        {
+            Ok(order) => EntryEvaluation {
+                opportunity: Some((order, value)),
+                rejection: None,
+            },
+            Err(_) => EntryEvaluation {
+                opportunity: None,
+                rejection: Some(DecisionReason::ContractRejected),
+            },
+        }
     }
 
     fn emergency_reduce(&self, frame: &EvidenceFrame) -> Decision {
-        let side = if frame.account.position > 0 {
-            Side::Sell
-        } else {
-            Side::Buy
+        let Some((side, position_side, quantity)) =
+            frame.account.reduction(frame.contract.position_mode)
+        else {
+            return Decision::ResidualExposure {
+                position: frame.account.position,
+                long_position: frame.account.long_position,
+                short_position: frame.account.short_position,
+            };
         };
-        let quantity = frame.account.position.unsigned_abs().min(i64::MAX as u64) as i64;
         let candidate = CandidateOrder {
             symbol: frame.contract.symbol.clone(),
             side,
@@ -241,13 +361,8 @@ impl DecisionEngine {
                 Side::Sell => frame.market.book.bid,
             },
             quantity: crate::model::Quantity(quantity),
-            reduce_only: true,
-            position_side: Self::position_side(
-                frame.contract.position_mode,
-                side,
-                frame.account.position,
-                true,
-            ),
+            reduce_only: frame.contract.position_mode == crate::model::PositionMode::OneWay,
+            position_side,
             time_in_force: crate::model::TimeInForce::Ioc,
             working_type: crate::model::WorkingType::ContractPrice,
             price_protect: false,
@@ -257,23 +372,28 @@ impl DecisionEngine {
         match frame.contract.validate_emergency_reduce_only(
             candidate,
             frame.market.book,
-            frame.account,
+            &frame.account,
             frame.now_ms,
         ) {
             Ok(order) => Decision::EmergencyReduceOnly { order },
             Err(_) => Decision::ResidualExposure {
                 position: frame.account.position,
+                long_position: frame.account.long_position,
+                short_position: frame.account.short_position,
             },
         }
     }
 
     fn reduce(&self, frame: &EvidenceFrame) -> Decision {
-        let side = if frame.account.position > 0 {
-            Side::Sell
-        } else {
-            Side::Buy
+        let Some((side, position_side, quantity)) =
+            frame.account.reduction(frame.contract.position_mode)
+        else {
+            return Decision::ResidualExposure {
+                position: frame.account.position,
+                long_position: frame.account.long_position,
+                short_position: frame.account.short_position,
+            };
         };
-        let quantity = frame.account.position.unsigned_abs().min(i64::MAX as u64) as i64;
         if quantity <= 0 {
             return Decision::Wait {
                 reason: DecisionReason::NoRobustEdge,
@@ -285,12 +405,7 @@ impl DecisionEngine {
             price: frame.market.book.passive_price(side),
             quantity: crate::model::Quantity(quantity),
             reduce_only: frame.contract.position_mode == crate::model::PositionMode::OneWay,
-            position_side: Self::position_side(
-                frame.contract.position_mode,
-                side,
-                frame.account.position,
-                true,
-            ),
+            position_side,
             time_in_force: crate::model::TimeInForce::Gtx,
             working_type: crate::model::WorkingType::ContractPrice,
             price_protect: false,
@@ -299,7 +414,7 @@ impl DecisionEngine {
         };
         match frame
             .contract
-            .validate(candidate, frame.market.book, frame.account, frame.now_ms)
+            .validate(candidate, frame.market.book, &frame.account, frame.now_ms)
         {
             Ok(mut order) => {
                 order.route = crate::model::OrderRoute::PassiveReduceOnly;
@@ -318,14 +433,19 @@ impl DecisionEngine {
 pub fn wait_account() -> AccountSnapshot {
     AccountSnapshot {
         position: 0,
+        long_position: 0,
+        short_position: 0,
         max_position: 0,
         reconciled: false,
         margin_available_ppm: 0,
+        observed_at_ms: 0,
+        max_age_ms: 0,
+        source_digest: String::new(),
     }
 }
 
-pub fn episode_state(episode: &AnchorEpisode, now_ms: u64, position: i64) -> EpisodePhase {
-    episode.phase_at(now_ms, position)
+pub fn episode_state(episode: &AnchorEpisode, now_ms: u64, has_position: bool) -> EpisodePhase {
+    episode.phase_at(now_ms, has_position)
 }
 
 #[cfg(test)]
@@ -346,6 +466,8 @@ mod tests {
                 exit_filled_quantity: 10,
                 entry_queue_ahead_quantity: 100,
                 exit_queue_ahead_quantity: 100,
+                entry_traded_through_quantity: 110,
+                exit_traded_through_quantity: 110,
                 entry_latency_ms: 50,
                 exit_latency_ms: 50,
                 entry_fee_pico_bps: 0,
@@ -361,7 +483,7 @@ mod tests {
     }
 
     pub(crate) fn frame(now: u64) -> EvidenceFrame {
-        let anchor = Anchor::new("a", "equity", PriceTicks(100_000), 0, 10_000, "digest").unwrap();
+        let anchor = Anchor::new("a", "BTCUSDT", PriceTicks(100_000), 0, 10_000, "digest").unwrap();
         let window = ClosedWindow::new(100, 9_000, 9_500, 10_000).unwrap();
         let episode = AnchorEpisode::new(
             "ep",
@@ -393,6 +515,7 @@ mod tests {
                 step: 1,
             },
             min_notional_ticks: 1,
+            max_notional_ticks: None,
             position_mode: PositionMode::OneWay,
             post_only_supported: true,
             reduce_only_supported: true,
@@ -400,6 +523,9 @@ mod tests {
             conditional_orders_supported: false,
             trigger_protect_bps: 0,
             rate_limit_remaining: 100,
+            max_open_orders: 100,
+            open_orders: 0,
+            self_trade_prevention_enabled: true,
             observed_at_ms: now,
             max_age_ms: 100,
             digest: "rules".into(),
@@ -419,8 +545,8 @@ mod tests {
         };
         let sell_outcome = OutcomeDistribution {
             scenarios: vec![
+                cycle(Side::Sell, 102_000, 99_000),
                 cycle(Side::Sell, 102_000, 100_000),
-                cycle(Side::Sell, 102_000, 101_000),
             ],
             uncertainty,
         };
@@ -446,18 +572,47 @@ mod tests {
             market: MarketSnapshot {
                 book,
                 index: PriceTicks(98_050),
+                index_observed_at_ms: now,
+                index_max_age_ms: 100,
                 mark: PriceTicks(98_050),
+                mark_observed_at_ms: now,
+                mark_max_age_ms: 100,
                 server_time_ms: now,
                 max_age_ms: 100,
+                source_digest: "market-digest".into(),
             },
             account: AccountSnapshot {
                 position: 0,
+                long_position: 0,
+                short_position: 0,
                 max_position: 500,
                 reconciled: true,
                 margin_available_ppm: 1_000_000,
+                observed_at_ms: now,
+                max_age_ms: 100,
+                source_digest: "account-digest".into(),
             },
-            external_closed: true,
-            calendar_known: true,
+            portfolio: crate::portfolio::PortfolioSnapshot {
+                quote_asset: "USDT".into(),
+                equity_quote_ticks: 1_000_000,
+                available_margin_quote_ticks: 1_000_000,
+                maintenance_margin_quote_ticks: 0,
+                reserved_margin_quote_ticks: 0,
+                stress_budget_quote_ticks: 1_000_000,
+                used_stress_quote_ticks: 0,
+                observed_at_ms: now,
+                max_age_ms: 100,
+                source_digest: "portfolio-digest".into(),
+            },
+            entry_margin_quote_ticks: 100,
+            entry_stress_quote_ticks: 100,
+            closure: ClosureEvidence {
+                event_id: "session-close-1".into(),
+                closed_at_ms: 100,
+                observed_at_ms: 100,
+                calendar_known: true,
+                source_digest: "calendar-digest".into(),
+            },
             model_version: "model-v1".into(),
             calibration: calibration_state.snapshot().unwrap(),
             buy_outcome,
@@ -486,6 +641,83 @@ mod tests {
             engine.decide(&frame(200)),
             Decision::PlaceMaker { .. }
         ));
+    }
+
+    #[test]
+    fn portfolio_budget_rejects_new_risk_without_rewriting_the_market_edge() {
+        let engine = DecisionEngine {
+            plan: StrategyPlan::anchor_closed_maker("plan-v1"),
+            limits: PolicyLimits {
+                requested_quantity: 10,
+            },
+        };
+        let mut evidence = frame(200);
+        evidence.portfolio.available_margin_quote_ticks = 99;
+        assert_eq!(
+            engine.decide(&evidence),
+            Decision::Wait {
+                reason: DecisionReason::PortfolioRejected
+            }
+        );
+    }
+
+    #[test]
+    fn calibration_gate_uses_stable_machine_codes() {
+        assert_eq!(
+            DecisionReason::CalibrationUnavailable.code(),
+            "calibration_unavailable"
+        );
+        assert_eq!(
+            serde_json::to_string(&Decision::Wait {
+                reason: DecisionReason::InsufficientHistory,
+            })
+            .unwrap(),
+            r#"{"kind":"wait","data":{"reason":"insufficient_history"}}"#
+        );
+    }
+
+    #[test]
+    fn a_plan_is_illegal_when_any_required_semantic_node_is_missing() {
+        let mut plan = StrategyPlan::anchor_closed_maker("plan-v1");
+        plan.nodes
+            .retain(|node| *node != StrategyNode::MeasureResidual);
+        assert!(!plan.is_legal());
+    }
+
+    #[test]
+    fn anchor_contract_and_calibration_must_share_instrument_identity() {
+        let mut evidence = frame(200);
+        evidence.contract.symbol = "ETHUSDT".into();
+        let engine = DecisionEngine {
+            plan: StrategyPlan::anchor_closed_maker("plan-v1"),
+            limits: PolicyLimits {
+                requested_quantity: 10,
+            },
+        };
+        assert_eq!(
+            engine.decide(&evidence),
+            Decision::Wait {
+                reason: DecisionReason::IncompleteEvidence
+            }
+        );
+    }
+
+    #[test]
+    fn exact_value_and_queue_ties_do_not_create_directional_bias() {
+        let mut evidence = frame(200);
+        evidence.sell_outcome = evidence.buy_outcome.clone();
+        let engine = DecisionEngine {
+            plan: StrategyPlan::anchor_closed_maker("plan-v1"),
+            limits: PolicyLimits {
+                requested_quantity: 10,
+            },
+        };
+        assert_eq!(
+            engine.decide(&evidence),
+            Decision::Wait {
+                reason: DecisionReason::AmbiguousDirection
+            }
+        );
     }
 
     #[test]
@@ -546,7 +778,7 @@ mod wait_competition_tests {
         assert_eq!(
             engine.decide(&evidence),
             Decision::Wait {
-                reason: DecisionReason::NoRobustEdge
+                reason: DecisionReason::CalibrationUnavailable
             }
         );
     }

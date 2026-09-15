@@ -54,11 +54,12 @@ pub struct Book {
 }
 
 impl Book {
-    pub fn validate(self) -> Result<(), ModelError> {
+    pub fn validate(&self) -> Result<(), ModelError> {
         if self.bid.0 <= 0
-            || self.ask.0 < self.bid.0
+            || self.ask.0 <= self.bid.0
             || self.bid_quantity.0 <= 0
             || self.ask_quantity.0 <= 0
+            || self.sequence == 0
         {
             return Err(ModelError::InvalidMarket);
         }
@@ -254,11 +255,11 @@ impl AnchorEpisode {
             phase: EpisodePhase::Unborn,
         })
     }
-    pub fn phase_at(&self, now_ms: u64, position: i64) -> EpisodePhase {
+    pub fn phase_at(&self, now_ms: u64, has_position: bool) -> EpisodePhase {
         if self.window.hard_deadline(now_ms) {
             return EpisodePhase::Closed;
         }
-        if position != 0
+        if has_position
             && (self.window.reduce_only(now_ms)
                 || self
                     .funding
@@ -346,6 +347,7 @@ pub struct BinanceContract {
     pub price_filter: PriceFilter,
     pub quantity_filter: QuantityFilter,
     pub min_notional_ticks: i128,
+    pub max_notional_ticks: Option<i128>,
     pub position_mode: PositionMode,
     pub post_only_supported: bool,
     pub reduce_only_supported: bool,
@@ -353,6 +355,9 @@ pub struct BinanceContract {
     pub conditional_orders_supported: bool,
     pub trigger_protect_bps: u16,
     pub rate_limit_remaining: u32,
+    pub max_open_orders: u32,
+    pub open_orders: u32,
+    pub self_trade_prevention_enabled: bool,
     pub observed_at_ms: u64,
     pub max_age_ms: u64,
     pub digest: String,
@@ -363,17 +368,31 @@ impl BinanceContract {
         &self,
         order: CandidateOrder,
         book: Book,
-        account: AccountSnapshot,
+        account: &AccountSnapshot,
         now_ms: u64,
     ) -> Result<ValidatedOrder, ModelError> {
         book.validate()?;
-        book.validate()?;
-        account.validate()?;
+        account.validate_for(self.position_mode, now_ms)?;
+        if !account.reconciled {
+            return Err(ModelError::IncompleteEvidence);
+        }
+        if !order.reduce_only && account.margin_available_ppm == 0 {
+            return Err(ModelError::InsufficientMargin);
+        }
         if self.symbol != order.symbol
             || self.status != ContractStatus::Trading
             || !self.post_only_supported
             || self.rate_limit_remaining == 0
+            || self.max_open_orders == 0
+            || self.open_orders >= self.max_open_orders
+            || !self.self_trade_prevention_enabled
+            || self.contract_type.trim().is_empty()
             || self.digest.is_empty()
+            || self.min_notional_ticks <= 0
+            || self
+                .max_notional_ticks
+                .is_some_and(|value| value <= 0 || value < self.min_notional_ticks)
+            || self.max_age_ms == 0
             || now_ms < self.observed_at_ms
             || now_ms - self.observed_at_ms > self.max_age_ms
         {
@@ -403,24 +422,20 @@ impl BinanceContract {
         } else if order.price_protect {
             return Err(ModelError::InvalidOrderSemantics);
         }
-        if order.price.0 < self.price_filter.min.0
-            || order.price.0 > self.price_filter.max.0
-            || self.price_filter.tick <= 0
-            || order.price.0 % self.price_filter.tick != 0
-        {
+        if !price_filter_contains(self.price_filter, order.price) {
             return Err(ModelError::PriceFilter);
         }
-        if order.quantity.0 < self.quantity_filter.min.0
-            || order.quantity.0 > self.quantity_filter.max.0
-            || self.quantity_filter.step <= 0
-            || order.quantity.0 % self.quantity_filter.step != 0
-        {
+        if !quantity_filter_contains(self.quantity_filter, order.quantity) {
             return Err(ModelError::QuantityFilter);
         }
         let notional = i128::from(order.price.0)
             .checked_mul(i128::from(order.quantity.0))
             .ok_or(ModelError::NotionalFilter)?;
-        if notional < self.min_notional_ticks {
+        if notional < self.min_notional_ticks
+            || self
+                .max_notional_ticks
+                .is_some_and(|maximum| notional > maximum)
+        {
             return Err(ModelError::NotionalFilter);
         }
         if (order.side == Side::Buy && order.price.0 >= book.ask.0)
@@ -428,20 +443,56 @@ impl BinanceContract {
         {
             return Err(ModelError::WouldTakeLiquidity);
         }
-        if order.reduce_only {
-            let reducing = (order.side == Side::Sell && account.position > 0)
-                || (order.side == Side::Buy && account.position < 0);
-            if !reducing {
-                return Err(ModelError::InvalidReduceOnly);
+        let is_reducing = match self.position_mode {
+            PositionMode::OneWay => {
+                (order.side == Side::Sell && account.position > 0)
+                    || (order.side == Side::Buy && account.position < 0)
+            }
+            PositionMode::Hedge => {
+                (order.side == Side::Sell && order.position_side == PositionSide::Long)
+                    || (order.side == Side::Buy && order.position_side == PositionSide::Short)
+            }
+        };
+        if order.reduce_only && !is_reducing {
+            return Err(ModelError::InvalidReduceOnly);
+        }
+        if self.position_mode == PositionMode::OneWay && is_reducing && !order.reduce_only {
+            return Err(ModelError::InvalidReduceOnly);
+        }
+        if is_reducing {
+            let current = match self.position_mode {
+                PositionMode::OneWay => account.position.checked_abs(),
+                PositionMode::Hedge => match order.position_side {
+                    PositionSide::Long => Some(account.long_position),
+                    PositionSide::Short => Some(account.short_position),
+                    PositionSide::Both => None,
+                },
+            }
+            .ok_or(ModelError::InvalidReduceOnly)?;
+            if order.quantity.0 > current {
+                return Err(ModelError::PositionLimit);
             }
         } else {
-            let next = i128::from(account.position)
-                + i128::from(order.side.sign()) * i128::from(order.quantity.0);
-            if next.abs() > i128::from(account.max_position) {
+            let current = match self.position_mode {
+                PositionMode::OneWay => i128::from(account.position)
+                    .checked_add(i128::from(order.side.sign()) * i128::from(order.quantity.0))
+                    .ok_or(ModelError::PositionLimit)?
+                    .abs(),
+                PositionMode::Hedge => match order.position_side {
+                    PositionSide::Long => i128::from(account.long_position)
+                        .checked_add(i128::from(order.quantity.0))
+                        .ok_or(ModelError::PositionLimit)?,
+                    PositionSide::Short => i128::from(account.short_position)
+                        .checked_add(i128::from(order.quantity.0))
+                        .ok_or(ModelError::PositionLimit)?,
+                    PositionSide::Both => return Err(ModelError::InvalidOrderSemantics),
+                },
+            };
+            if current > i128::from(account.max_position) {
                 return Err(ModelError::PositionLimit);
             }
         }
-        let route = if order.reduce_only {
+        let route = if is_reducing {
             OrderRoute::PassiveReduceOnly
         } else {
             OrderRoute::PassiveMaker
@@ -459,59 +510,78 @@ impl BinanceContract {
         &self,
         order: CandidateOrder,
         book: Book,
-        account: AccountSnapshot,
+        account: &AccountSnapshot,
         now_ms: u64,
     ) -> Result<ValidatedOrder, ModelError> {
         book.validate()?;
-        account.validate()?;
+        account.validate_for(self.position_mode, now_ms)?;
+        if !account.reconciled {
+            return Err(ModelError::IncompleteEvidence);
+        }
         if self.symbol != order.symbol
             || self.status != ContractStatus::Trading
             || self.rate_limit_remaining == 0
+            || self.max_open_orders == 0
+            || self.open_orders >= self.max_open_orders
+            || self.contract_type.trim().is_empty()
             || self.digest.is_empty()
+            || self.min_notional_ticks <= 0
+            || self
+                .max_notional_ticks
+                .is_some_and(|value| value <= 0 || value < self.min_notional_ticks)
+            || self.max_age_ms == 0
             || now_ms < self.observed_at_ms
             || now_ms - self.observed_at_ms > self.max_age_ms
             || order.time_in_force != TimeInForce::Ioc
             || order.close_position
             || order.trigger_price.is_some()
             || order.price_protect
-            || (self.position_mode == PositionMode::Hedge && order.reduce_only)
-            || (self.position_mode == PositionMode::Hedge
-                && order.position_side == PositionSide::Both)
             || (self.position_mode == PositionMode::OneWay
                 && (!order.reduce_only || order.position_side != PositionSide::Both))
+            || (self.position_mode == PositionMode::Hedge
+                && (order.reduce_only || order.position_side == PositionSide::Both))
             || (self.position_mode == PositionMode::OneWay && !self.reduce_only_supported)
         {
             return Err(ModelError::InvalidOrderSemantics);
         }
-        if order.price.0 < self.price_filter.min.0
-            || order.price.0 > self.price_filter.max.0
-            || self.price_filter.tick <= 0
-            || order.price.0 % self.price_filter.tick != 0
-        {
+        if !price_filter_contains(self.price_filter, order.price) {
             return Err(ModelError::PriceFilter);
         }
-        if order.quantity.0 < self.quantity_filter.min.0
-            || order.quantity.0 > self.quantity_filter.max.0
-            || self.quantity_filter.step <= 0
-            || order.quantity.0 % self.quantity_filter.step != 0
-            || order.quantity.0 > account.position.unsigned_abs() as i64
+        let Some((expected_side, expected_position_side, available)) =
+            account.reduction(self.position_mode)
+        else {
+            return Err(ModelError::InvalidReduceOnly);
+        };
+        if !quantity_filter_contains(self.quantity_filter, order.quantity)
+            || order.side != expected_side
+            || order.position_side != expected_position_side
+            || order.quantity.0 > available
         {
             return Err(ModelError::QuantityFilter);
         }
         let notional = i128::from(order.price.0)
             .checked_mul(i128::from(order.quantity.0))
             .ok_or(ModelError::NotionalFilter)?;
-        if notional < self.min_notional_ticks {
+        if notional < self.min_notional_ticks
+            || self
+                .max_notional_ticks
+                .is_some_and(|maximum| notional > maximum)
+        {
             return Err(ModelError::NotionalFilter);
         }
-        let reducing = (order.side == Side::Sell && account.position > 0)
-            || (order.side == Side::Buy && account.position < 0);
-        let hedge_position_matches = match account.position.cmp(&0) {
-            std::cmp::Ordering::Greater => order.position_side == PositionSide::Long,
-            std::cmp::Ordering::Less => order.position_side == PositionSide::Short,
-            std::cmp::Ordering::Equal => false,
+        let reducing = match self.position_mode {
+            PositionMode::OneWay => {
+                order.reduce_only
+                    && ((order.side == Side::Sell && account.position > 0)
+                        || (order.side == Side::Buy && account.position < 0))
+            }
+            PositionMode::Hedge => {
+                !order.reduce_only
+                    && ((order.side == Side::Sell && order.position_side == PositionSide::Long)
+                        || (order.side == Side::Buy && order.position_side == PositionSide::Short))
+            }
         };
-        if !reducing || (self.position_mode == PositionMode::Hedge && !hedge_position_matches) {
+        if !reducing {
             return Err(ModelError::InvalidReduceOnly);
         }
         Ok(ValidatedOrder {
@@ -524,22 +594,55 @@ impl BinanceContract {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+fn price_filter_contains(filter: PriceFilter, price: PriceTicks) -> bool {
+    filter.min.0 > 0
+        && filter.max.0 >= filter.min.0
+        && filter.tick > 0
+        && price.0 >= filter.min.0
+        && price.0 <= filter.max.0
+        && price.0 % filter.tick == 0
+}
+
+fn quantity_filter_contains(filter: QuantityFilter, quantity: Quantity) -> bool {
+    filter.min.0 > 0
+        && filter.max.0 >= filter.min.0
+        && filter.step > 0
+        && quantity.0 >= filter.min.0
+        && quantity.0 <= filter.max.0
+        && quantity.0 % filter.step == 0
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarketSnapshot {
     pub book: Book,
     pub index: PriceTicks,
+    pub index_observed_at_ms: u64,
+    pub index_max_age_ms: u64,
     pub mark: PriceTicks,
+    pub mark_observed_at_ms: u64,
+    pub mark_max_age_ms: u64,
     pub server_time_ms: u64,
     pub max_age_ms: u64,
+    pub source_digest: String,
 }
 
 impl MarketSnapshot {
     pub fn validate(&self, now_ms: u64) -> Result<(), ModelError> {
         self.book.validate()?;
-        if self.index.0 <= 0
+        if self.max_age_ms == 0
+            || self.index_max_age_ms == 0
+            || self.mark_max_age_ms == 0
+            || self.index.0 <= 0
             || self.mark.0 <= 0
+            || self.source_digest.is_empty()
             || now_ms < self.server_time_ms
             || now_ms - self.server_time_ms > self.max_age_ms
+            || now_ms < self.book.observed_at_ms
+            || now_ms - self.book.observed_at_ms > self.max_age_ms
+            || now_ms < self.index_observed_at_ms
+            || now_ms - self.index_observed_at_ms > self.index_max_age_ms
+            || now_ms < self.mark_observed_at_ms
+            || now_ms - self.mark_observed_at_ms > self.mark_max_age_ms
         {
             return Err(ModelError::StaleMarket);
         }
@@ -547,23 +650,115 @@ impl MarketSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountSnapshot {
+    /// Signed net position used by Binance One-way mode.
     pub position: i64,
+    /// Long and short legs used by Binance Hedge mode. Both may be non-zero.
+    pub long_position: i64,
+    pub short_position: i64,
     pub max_position: i64,
     pub reconciled: bool,
     pub margin_available_ppm: i64,
+    pub observed_at_ms: u64,
+    pub max_age_ms: u64,
+    pub source_digest: String,
 }
 
 impl AccountSnapshot {
-    pub fn validate(self) -> Result<(), ModelError> {
+    pub fn validate(&self) -> Result<(), ModelError> {
         if self.max_position < 0
             || self.position.unsigned_abs() > self.max_position as u64
+            || self.long_position < 0
+            || self.short_position < 0
+            || self.long_position > self.max_position
+            || self.short_position > self.max_position
             || !(0..=1_000_000).contains(&self.margin_available_ppm)
         {
             return Err(ModelError::InvalidAccount);
         }
         Ok(())
+    }
+
+    pub fn has_position(&self, mode: PositionMode) -> bool {
+        match mode {
+            PositionMode::OneWay => self.position != 0,
+            PositionMode::Hedge => self.long_position != 0 || self.short_position != 0,
+        }
+    }
+
+    pub fn reduction(&self, mode: PositionMode) -> Option<(Side, PositionSide, i64)> {
+        match mode {
+            PositionMode::OneWay if self.position > 0 => {
+                Some((Side::Sell, PositionSide::Both, self.position))
+            }
+            PositionMode::OneWay if self.position < 0 => {
+                Some((Side::Buy, PositionSide::Both, self.position.checked_abs()?))
+            }
+            PositionMode::OneWay => None,
+            // A single order cannot safely flatten both hedge legs. Fail closed and
+            // require the authoritative executor to issue two separately audited orders.
+            PositionMode::Hedge if self.long_position > 0 && self.short_position == 0 => {
+                Some((Side::Sell, PositionSide::Long, self.long_position))
+            }
+            PositionMode::Hedge if self.short_position > 0 && self.long_position == 0 => {
+                Some((Side::Buy, PositionSide::Short, self.short_position))
+            }
+            PositionMode::Hedge => None,
+        }
+    }
+
+    pub fn leg_quantity(
+        &self,
+        mode: PositionMode,
+        side: Side,
+        position_side: PositionSide,
+    ) -> Option<i64> {
+        match mode {
+            PositionMode::OneWay if position_side == PositionSide::Both => {
+                let remaining = match side {
+                    Side::Buy => i128::from(self.max_position) - i128::from(self.position),
+                    Side::Sell => i128::from(self.max_position) + i128::from(self.position),
+                };
+                (remaining >= 0)
+                    .then(|| i64::try_from(remaining).ok())
+                    .flatten()
+            }
+            PositionMode::Hedge => match position_side {
+                PositionSide::Long if side == Side::Buy => {
+                    self.max_position.checked_sub(self.long_position)
+                }
+                PositionSide::Long if side == Side::Sell => Some(self.long_position),
+                PositionSide::Short if side == Side::Sell => {
+                    self.max_position.checked_sub(self.short_position)
+                }
+                PositionSide::Short if side == Side::Buy => Some(self.short_position),
+                PositionSide::Both | PositionSide::Long | PositionSide::Short => None,
+            },
+            PositionMode::OneWay => None,
+        }
+    }
+
+    pub fn validate_at(&self, now_ms: u64) -> Result<(), ModelError> {
+        self.validate()?;
+        if self.observed_at_ms == 0
+            || self.max_age_ms == 0
+            || now_ms < self.observed_at_ms
+            || now_ms - self.observed_at_ms > self.max_age_ms
+            || self.source_digest.is_empty()
+        {
+            return Err(ModelError::InvalidAccount);
+        }
+        Ok(())
+    }
+
+    pub fn validate_for(&self, mode: PositionMode, now_ms: u64) -> Result<(), ModelError> {
+        self.validate_at(now_ms)?;
+        match mode {
+            PositionMode::OneWay if self.long_position == 0 && self.short_position == 0 => Ok(()),
+            PositionMode::Hedge if self.position == 0 => Ok(()),
+            _ => Err(ModelError::InvalidAccount),
+        }
     }
 }
 
@@ -641,6 +836,8 @@ pub struct ExecutionCycle {
     pub exit_filled_quantity: i64,
     pub entry_queue_ahead_quantity: i64,
     pub exit_queue_ahead_quantity: i64,
+    pub entry_traded_through_quantity: i64,
+    pub exit_traded_through_quantity: i64,
     pub entry_latency_ms: u64,
     pub exit_latency_ms: u64,
     pub entry_fee_pico_bps: i64,
@@ -659,12 +856,14 @@ impl ExecutionCycle {
             || self.entry_price.0 <= 0
             || self.exit_price.0 <= 0
             || self.requested_quantity.0 <= 0
-            || self.entry_filled_quantity < 0
+            || self.entry_filled_quantity <= 0
             || self.exit_filled_quantity < 0
             || self.entry_filled_quantity > self.requested_quantity.0
             || self.exit_filled_quantity > self.entry_filled_quantity
             || self.entry_queue_ahead_quantity < 0
             || self.exit_queue_ahead_quantity < 0
+            || self.entry_traded_through_quantity < 0
+            || self.exit_traded_through_quantity < 0
             || self.entry_at_ms == 0
             || self.exit_at_ms <= self.entry_at_ms
             || self.deadline_ms <= self.exit_at_ms
@@ -676,6 +875,26 @@ impl ExecutionCycle {
         {
             return None;
         }
+        let entry_causal_fill = QueueFillEstimate {
+            queue_ahead_quantity: self.entry_queue_ahead_quantity,
+            order_quantity: self.requested_quantity.0,
+            traded_through_quantity: self.entry_traded_through_quantity,
+            observed_latency_ms: self.entry_latency_ms,
+        }
+        .causal_fill_quantity()?;
+        if self.entry_filled_quantity > entry_causal_fill {
+            return None;
+        }
+        let exit_causal_fill = QueueFillEstimate {
+            queue_ahead_quantity: self.exit_queue_ahead_quantity,
+            order_quantity: self.entry_filled_quantity,
+            traded_through_quantity: self.exit_traded_through_quantity,
+            observed_latency_ms: self.exit_latency_ms,
+        }
+        .causal_fill_quantity()?;
+        if self.exit_filled_quantity > exit_causal_fill {
+            return None;
+        }
         Some(())
     }
 
@@ -685,8 +904,8 @@ impl ExecutionCycle {
 
     pub fn gross_anchor_pnl_pico_bps(&self) -> Option<i128> {
         self.validate()?;
-        let signed_delta =
-            i128::from(self.exit_price.0 - self.entry_price.0) * i128::from(self.side.sign());
+        let signed_delta = (i128::from(self.exit_price.0) - i128::from(self.entry_price.0))
+            * i128::from(self.side.sign());
         let numerator = signed_delta
             .checked_mul(PICO_BPS_SCALE)?
             .checked_mul(i128::from(self.exit_filled_quantity))?;
@@ -837,14 +1056,37 @@ impl OutcomeDistribution {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClosureEvidence {
+    pub event_id: String,
+    pub closed_at_ms: u64,
+    pub observed_at_ms: u64,
+    pub calendar_known: bool,
+    pub source_digest: String,
+}
+
+impl ClosureEvidence {
+    pub fn valid_for(&self, expected_closed_at_ms: u64, now_ms: u64) -> bool {
+        !self.event_id.is_empty()
+            && self.closed_at_ms == expected_closed_at_ms
+            && self.closed_at_ms > 0
+            && self.observed_at_ms >= self.closed_at_ms
+            && self.observed_at_ms <= now_ms
+            && self.calendar_known
+            && !self.source_digest.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceFrame {
     pub now_ms: u64,
     pub episode: AnchorEpisode,
     pub contract: BinanceContract,
     pub market: MarketSnapshot,
     pub account: AccountSnapshot,
-    pub external_closed: bool,
-    pub calendar_known: bool,
+    pub portfolio: crate::portfolio::PortfolioSnapshot,
+    pub entry_margin_quote_ticks: i128,
+    pub entry_stress_quote_ticks: i128,
+    pub closure: ClosureEvidence,
     pub model_version: String,
     pub calibration: crate::calibration::CalibrationSnapshot,
     pub buy_outcome: OutcomeDistribution,
@@ -853,11 +1095,30 @@ pub struct EvidenceFrame {
 }
 
 impl EvidenceFrame {
+    pub fn structurally_valid(&self) -> bool {
+        self.now_ms > 0
+            && self.entry_margin_quote_ticks >= 0
+            && self.entry_stress_quote_ticks >= 0
+            && !self.episode.id.is_empty()
+            && self.contract.symbol == self.episode.anchor.instrument
+            && self.calibration.instrument == self.contract.symbol
+            && self
+                .closure
+                .valid_for(self.episode.window.closed_at_ms, self.now_ms)
+    }
+
     pub fn complete_for_entry(&self) -> bool {
-        self.calendar_known
-            && self.external_closed
+        self.structurally_valid()
+            && self.calibration.phase == crate::calibration::CalibrationPhase::Admitted
+            && self.episode.anchor.valid_at(self.now_ms)
             && self.episode.funding_valid_at(self.now_ms)
             && self.account.reconciled
+            && self
+                .account
+                .validate_for(self.contract.position_mode, self.now_ms)
+                .is_ok()
+            && self.portfolio.validate_at(self.now_ms).is_ok()
+            && self.market.validate(self.now_ms).is_ok()
             && !self.model_version.is_empty()
             && self.calibration.validate().is_ok()
             && self.wait_outcome.lower_value().is_some()
@@ -881,6 +1142,7 @@ pub enum ModelError {
     PositionLimit,
     InvalidOrderSemantics,
     InvalidAccount,
+    InsufficientMargin,
     RateLimit,
     IncompleteEvidence,
 }
@@ -906,6 +1168,7 @@ mod tests {
                     step: 1,
                 },
                 min_notional_ticks: 1,
+                max_notional_ticks: None,
                 position_mode: PositionMode::OneWay,
                 post_only_supported: true,
                 reduce_only_supported: true,
@@ -913,6 +1176,9 @@ mod tests {
                 conditional_orders_supported: false,
                 trigger_protect_bps: 0,
                 rate_limit_remaining: 10,
+                max_open_orders: 100,
+                open_orders: 0,
+                self_trade_prevention_enabled: true,
                 observed_at_ms: 1,
                 max_age_ms: 100,
                 digest: "contract-digest".into(),
@@ -927,9 +1193,14 @@ mod tests {
             },
             AccountSnapshot {
                 position: 0,
+                long_position: 0,
+                short_position: 0,
                 max_position: 100,
                 reconciled: true,
                 margin_available_ppm: 1_000_000,
+                observed_at_ms: 1,
+                max_age_ms: 100,
+                source_digest: "account-digest".into(),
             },
             CandidateOrder {
                 symbol: "BTCUSDT".into(),
@@ -950,27 +1221,159 @@ mod tests {
     #[test]
     fn binance_order_semantics_are_hard_gates() {
         let (contract, book, account, order) = fixtures();
-        assert!(contract.validate(order.clone(), book, account, 1).is_ok());
+        assert!(contract.validate(order.clone(), book, &account, 1).is_ok());
 
         let mut non_post_only = order.clone();
         non_post_only.time_in_force = TimeInForce::Gtc;
         assert_eq!(
-            contract.validate(non_post_only, book, account, 1),
+            contract.validate(non_post_only, book, &account, 1),
             Err(ModelError::InvalidOrderSemantics)
         );
 
         let mut wrong_position_side = order.clone();
         wrong_position_side.position_side = PositionSide::Long;
         assert_eq!(
-            contract.validate(wrong_position_side, book, account, 1),
+            contract.validate(wrong_position_side, book, &account, 1),
             Err(ModelError::InvalidOrderSemantics)
         );
 
         let mut unsupported_trigger = order;
         unsupported_trigger.trigger_price = Some(PriceTicks(100));
         assert_eq!(
-            contract.validate(unsupported_trigger, book, account, 1),
+            contract.validate(unsupported_trigger, book, &account, 1),
             Err(ModelError::InvalidOrderSemantics)
+        );
+    }
+    #[test]
+    fn price_filter_uses_exchange_tick_origin() {
+        let (mut contract, book, account, mut order) = fixtures();
+        contract.price_filter = PriceFilter {
+            min: PriceTicks(99),
+            max: PriceTicks(1_000_000),
+            tick: 10,
+        };
+        order.price = PriceTicks(99);
+        assert_eq!(
+            contract.validate(order.clone(), book, &account, 1),
+            Err(ModelError::PriceFilter)
+        );
+        order.price = PriceTicks(100);
+        assert!(contract.validate(order, book, &account, 1).is_ok());
+    }
+
+    #[test]
+    fn entry_rejects_full_open_order_capacity_and_missing_stp() {
+        let (mut contract, book, account, order) = fixtures();
+        contract.open_orders = contract.max_open_orders;
+        assert_eq!(
+            contract.validate(order.clone(), book, &account, 1),
+            Err(ModelError::ContractUnavailable)
+        );
+        contract.open_orders = 0;
+        contract.self_trade_prevention_enabled = false;
+        assert_eq!(
+            contract.validate(order, book, &account, 1),
+            Err(ModelError::ContractUnavailable)
+        );
+    }
+
+    #[test]
+    fn entry_rejects_notional_above_exchange_maximum() {
+        let (mut contract, book, account, mut order) = fixtures();
+        contract.max_notional_ticks = Some(99);
+        order.quantity = Quantity(2);
+        assert_eq!(
+            contract.validate(order, book, &account, 1),
+            Err(ModelError::NotionalFilter)
+        );
+    }
+
+    #[test]
+    fn entry_rejects_zero_available_margin() {
+        let (contract, book, mut account, order) = fixtures();
+        account.margin_available_ppm = 0;
+        assert_eq!(
+            contract.validate(order, book, &account, 1),
+            Err(ModelError::InsufficientMargin)
+        );
+    }
+
+    #[test]
+    fn contract_rejects_a_stale_account_snapshot() {
+        let (contract, book, mut account, order) = fixtures();
+        account.observed_at_ms = 0;
+        assert_eq!(
+            contract.validate(order, book, &account, 1),
+            Err(ModelError::InvalidAccount)
+        );
+    }
+
+    #[test]
+    fn contract_rejects_an_unreconciled_account() {
+        let (contract, book, mut account, order) = fixtures();
+        account.reconciled = false;
+        assert_eq!(
+            contract.validate(order, book, &account, 1),
+            Err(ModelError::IncompleteEvidence)
+        );
+    }
+    #[test]
+    fn book_rejects_locked_or_crossed_quotes() {
+        let book = Book {
+            bid: PriceTicks(100),
+            ask: PriceTicks(100),
+            bid_quantity: Quantity(10),
+            ask_quantity: Quantity(10),
+            observed_at_ms: 1,
+            sequence: 1,
+        };
+        assert_eq!(book.validate(), Err(ModelError::InvalidMarket));
+    }
+
+    #[test]
+    fn account_position_representation_must_match_contract_mode() {
+        let (mut contract, book, mut account, order) = fixtures();
+        account.long_position = 1;
+        assert_eq!(
+            contract.validate(order.clone(), book, &account, 1),
+            Err(ModelError::InvalidAccount)
+        );
+
+        contract.position_mode = PositionMode::Hedge;
+        account.long_position = 0;
+        account.position = 1;
+        assert_eq!(
+            contract.validate(order, book, &account, 1),
+            Err(ModelError::InvalidAccount)
+        );
+    }
+
+    #[test]
+    fn hedge_mode_tracks_legs_and_rejects_ambiguous_emergency_flatten() {
+        let (mut contract, book, mut account, mut order) = fixtures();
+        contract.position_mode = PositionMode::Hedge;
+        account.position = 0;
+        account.long_position = 3;
+        account.short_position = 2;
+        order.side = Side::Sell;
+        order.price = PriceTicks(101);
+        order.quantity = Quantity(1);
+        order.reduce_only = false;
+        order.position_side = PositionSide::Long;
+
+        let validated = contract
+            .validate(order.clone(), book, &account, 1)
+            .expect("single hedge-leg reduction is valid");
+        assert_eq!(validated.route, OrderRoute::PassiveReduceOnly);
+
+        let emergency = CandidateOrder {
+            time_in_force: TimeInForce::Ioc,
+            price: book.ask,
+            ..order
+        };
+        assert_eq!(
+            contract.validate_emergency_reduce_only(emergency, book, &account, 1),
+            Err(ModelError::InvalidReduceOnly)
         );
     }
 }
@@ -999,6 +1402,8 @@ mod outcome_tests {
                 exit_filled_quantity,
                 entry_queue_ahead_quantity: 0,
                 exit_queue_ahead_quantity: 0,
+                entry_traded_through_quantity: entry_filled_quantity,
+                exit_traded_through_quantity: exit_filled_quantity,
                 entry_latency_ms: 0,
                 exit_latency_ms: 0,
                 entry_fee_pico_bps,
@@ -1011,6 +1416,37 @@ mod outcome_tests {
                 deadline_ms: 3,
             },
         )
+    }
+
+    #[test]
+    fn execution_cycle_rejects_fill_without_causal_queue_throughput() {
+        let scenario = OutcomeScenario::cycle(
+            10_000,
+            ExecutionCycle {
+                side: Side::Buy,
+                anchor_price: PriceTicks(1_000),
+                entry_price: PriceTicks(990),
+                exit_price: PriceTicks(1_000),
+                requested_quantity: Quantity(1),
+                entry_filled_quantity: 1,
+                exit_filled_quantity: 1,
+                entry_queue_ahead_quantity: 100,
+                exit_queue_ahead_quantity: 100,
+                entry_traded_through_quantity: 100,
+                exit_traded_through_quantity: 100,
+                entry_latency_ms: 10,
+                exit_latency_ms: 10,
+                entry_fee_pico_bps: 0,
+                exit_fee_pico_bps: 0,
+                exit_cost_pico_bps: 0,
+                funding_cost_pico_bps: 0,
+                deadline_risk_pico_bps: 0,
+                entry_at_ms: 1,
+                exit_at_ms: 2,
+                deadline_ms: 3,
+            },
+        );
+        assert_eq!(scenario.net_value(), None);
     }
 
     #[test]
@@ -1107,5 +1543,53 @@ mod outcome_tests {
             anchor.residual_pico_bps(PriceTicks(120)),
             Some(-90_909_090_910)
         );
+    }
+
+    #[test]
+    fn market_rejects_a_stale_mark_even_when_book_is_fresh() {
+        let market = MarketSnapshot {
+            book: Book {
+                bid: PriceTicks(99),
+                ask: PriceTicks(101),
+                bid_quantity: Quantity(10),
+                ask_quantity: Quantity(10),
+                observed_at_ms: 100,
+                sequence: 1,
+            },
+            index: PriceTicks(100),
+            index_observed_at_ms: 100,
+            index_max_age_ms: 10,
+            mark: PriceTicks(100),
+            mark_observed_at_ms: 1,
+            mark_max_age_ms: 10,
+            server_time_ms: 100,
+            max_age_ms: 10,
+            source_digest: "market-digest".into(),
+        };
+        assert_eq!(market.validate(100), Err(ModelError::StaleMarket));
+    }
+
+    #[test]
+    fn market_rejects_a_stale_book_even_when_server_time_is_fresh() {
+        let market = MarketSnapshot {
+            book: Book {
+                bid: PriceTicks(99),
+                ask: PriceTicks(101),
+                bid_quantity: Quantity(10),
+                ask_quantity: Quantity(10),
+                observed_at_ms: 1,
+                sequence: 1,
+            },
+            index: PriceTicks(100),
+            index_observed_at_ms: 100,
+            index_max_age_ms: 10,
+            mark: PriceTicks(100),
+            mark_observed_at_ms: 100,
+            mark_max_age_ms: 10,
+            server_time_ms: 100,
+            max_age_ms: 10,
+            source_digest: "market-digest".into(),
+        };
+        assert_eq!(market.validate(100), Err(ModelError::StaleMarket));
     }
 }
